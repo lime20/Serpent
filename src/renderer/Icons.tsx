@@ -13,6 +13,7 @@ export type IconName =
   | "close"
   | "code"
   | "collection"
+  | "contrast"
   | "collapse-left"
   | "collapse-right"
   | "panel-left"
@@ -166,6 +167,14 @@ const iconPaths: Record<IconName, ReactNode> = {
     <>
       <rect x="4" y="5" width="16" height="14" rx="1.5" />
       <path d="m8 14 3-3 5 5 2-2 2 2" />
+    </>
+  ),
+  // Lucide `contrast` (https://lucide.dev/icons/contrast): the two backdrop
+  // halves a mirage-tank texture swaps between.
+  contrast: (
+    <>
+      <circle cx="12" cy="12" r="10" />
+      <path d="M12 18a6 6 0 0 0 0-12v12z" />
     </>
   ),
   "collapse-left": (

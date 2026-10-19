@@ -147,9 +147,19 @@ const aiApiFormatSchema = z.enum([
   'openai_responses',
   'anthropic',
   'gemini_native',
+  'local_openai',
 ]);
 const aiLanguageIdSchema = z.enum(['zh-CN', 'en', 'ja', 'ko']);
 const aiLanguagesSchema = z.array(aiLanguageIdSchema).min(1).max(8);
+/**
+ * Ephemeral plaintext key on the Main→Worker channel.
+ *
+ * A keyless local runtime (`local_openai`) sends an empty string, so blank is
+ * a legitimate value — but whitespace-only input stays invalid, and a cloud
+ * format that reaches the provider without a key still fails authentication
+ * there rather than silently succeeding.
+ */
+const aiApiKeySchema = z.union([z.literal(''), nonBlankString]);
 const aiEnabledFieldsSchema = z.strictObject({
   description: z.boolean(),
   tags: z.boolean(),
@@ -1342,6 +1352,14 @@ export const rendererRequestSchema = z.discriminatedUnion('type', [
     apiKey: z.string().max(512).optional(),
     baseUrl: z.string().max(2048).optional(),
   }),
+  /**
+   * Serpent local-model support: enumerate local OpenAI-compatible runtimes
+   * (Ollama / LM Studio / llama.cpp / vLLM) reachable from this machine,
+   * including servers running inside a WSL distribution on Windows.
+   */
+  z.strictObject({
+    type: z.literal('ai.local-endpoints.request'),
+  }),
   z.strictObject({
     type: z.literal('ai.clear-content.request'),
     libraryId: identifierSchema,
@@ -2512,7 +2530,7 @@ export const workerCommandSchema = z.discriminatedUnion('type', [
     assetId: identifierSchema,
     apiFormat: aiApiFormatSchema,
     model: nonBlankString,
-    apiKey: nonBlankString,
+    apiKey: aiApiKeySchema,
     baseUrl: z.string().max(2048).optional(),
     enabledFields: aiEnabledFieldsSchema,
     analysisSettings: aiAnalysisSettingsSchema,
@@ -2849,7 +2867,7 @@ export const workerCommandSchema = z.discriminatedUnion('type', [
     type: z.literal('ai.test-connection'),
     apiFormat: aiApiFormatSchema,
     /** Ephemeral plaintext key on the private Main→Worker channel (same as asset.analyze). */
-    apiKey: nonBlankString,
+    apiKey: aiApiKeySchema,
     model: nonBlankString,
     baseUrl: z.string().max(2048).optional(),
   }),
@@ -2874,7 +2892,7 @@ export const workerCommandSchema = z.discriminatedUnion('type', [
     libraryId: identifierSchema,
     apiFormat: aiApiFormatSchema,
     model: nonBlankString,
-    apiKey: nonBlankString,
+    apiKey: aiApiKeySchema,
     baseUrl: z.string().max(2048).optional(),
     enabledFields: aiEnabledFieldsSchema,
     analysisSettings: aiAnalysisSettingsSchema,

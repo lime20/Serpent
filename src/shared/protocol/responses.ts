@@ -2602,11 +2602,13 @@ const rendererSuccessResultSchema = z.discriminatedUnion('type', [
   z.strictObject({
     ok: z.literal(true),
     type: z.literal('ai.config.got'),
-    apiFormat: z.enum(['dashscope_native', 'openai_chat', 'openai_responses', 'anthropic', 'gemini_native']).nullable(),
+    apiFormat: z.enum(['dashscope_native', 'openai_chat', 'openai_responses', 'anthropic', 'gemini_native', 'local_openai']).nullable(),
     model: nonBlankString.nullable(),
     /** Empty string means official default for the selected API format. */
     baseUrl: z.string().max(2048),
     hasKey: z.boolean(),
+    /** False for keyless local runtimes, where `hasKey` stays false by design. */
+    requiresApiKey: z.boolean(),
     enabledFields: z.strictObject({
       description: z.boolean(),
       tags: z.boolean(),
@@ -2655,14 +2657,40 @@ const rendererSuccessResultSchema = z.discriminatedUnion('type', [
     ok: z.literal(true),
     type: z.literal('ai.list-models.result'),
     models: z.array(nonBlankString),
+    /** Models the endpoint itself declared vision/multimodal. */
+    visionModels: z.array(nonBlankString).optional(),
+    capabilitiesReported: z.boolean().optional(),
     errorKind: nonBlankString.optional(),
     reason: nonBlankString.optional(),
   }),
   z.strictObject({
     ok: z.literal(true),
+    type: z.literal('ai.local-endpoints.result'),
+    endpoints: z.array(z.strictObject({
+      presetId: z.enum(['ollama', 'lmstudio', 'llamacpp', 'vllm']),
+      label: nonBlankString,
+      baseUrl: nonBlankString,
+      host: nonBlankString,
+      port: z.number().int().min(0).max(65_535),
+      /** `loopback` reached via 127.0.0.1, `wsl` via a distribution address. */
+      source: z.enum(['loopback', 'wsl']),
+      models: z.array(nonBlankString),
+      /** Models the runtime itself declared vision/multimodal. */
+      visionModels: z.array(nonBlankString).optional(),
+      capabilitiesReported: z.boolean().optional(),
+      /** Runtime that answered, e.g. `llama.cpp`; absent when unidentified. */
+      runtime: nonBlankString.optional(),
+      wslDistro: nonBlankString.optional(),
+    })),
+    wslAvailable: z.boolean(),
+    wslDistros: z.array(nonBlankString),
+    wslError: nonBlankString.optional(),
+  }),
+  z.strictObject({
+    ok: z.literal(true),
     type: z.literal('ai.search-plan.result'),
     plan: aiSearchPlanSchema,
-    apiFormat: z.enum(['dashscope_native', 'openai_chat', 'openai_responses', 'anthropic', 'gemini_native']),
+    apiFormat: z.enum(['dashscope_native', 'openai_chat', 'openai_responses', 'anthropic', 'gemini_native', 'local_openai']),
     model: nonBlankString,
   }),
   z.strictObject({

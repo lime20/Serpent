@@ -12,10 +12,13 @@ import { normalizeAiAnalysisImageEdgePx } from "../../shared/ai-analysis-image";
 import { normalizeAiReliabilitySettings, type AiReliabilitySettings } from "../../shared/ai-reliability";
 import {
   DEFAULT_AI_LANGUAGES,
+  aiConfigHasCredentials,
+  aiApiFormatRequiresApiKey,
   listAiModels,
   normalizeAiLanguages,
   type AiApiFormat,
 } from "../../shared/ai-endpoints";
+import type { LocalAiDiscoveryResult } from "../ai-local-endpoint-probe";
 import { aiSearchFailureReason, planAiSearch } from "../ai-search-planner";
 
 export type AiOwnedConfig = {
@@ -45,6 +48,8 @@ export type AiOwnedRequestRuntime = {
   workerAvailable: () => boolean;
   requestWorker: (command: WorkerCommand) => Promise<WorkerResult>;
   processAiQueue: (libraryId: string) => void;
+  /** Probes loopback + WSL distribution addresses for local model servers. */
+  discoverLocalEndpoints: () => Promise<LocalAiDiscoveryResult>;
   logInfo: (scope: string, message: string, context?: Record<string, unknown>) => void;
   logError: (scope: string, error: unknown, context?: Record<string, unknown>) => void;
 };
@@ -61,7 +66,14 @@ export async function tryHandleAiOwnedRequest(
   switch (request.type) {
     case "assets.analyze.request": {
       const config = runtime.loadAiConfig();
-      if (!config.hasKey || !config.apiFormat) {
+      // `hasKey` alone is not the gate: a keyless local runtime has nothing to
+      // store, so readiness comes from the shared credential helper.
+      if (
+        !aiConfigHasCredentials({
+          hasKey: config.hasKey,
+          apiFormat: config.apiFormat,
+        })
+      ) {
         return {
           ok: false,
           error: createPublicError("AI_ANALYSIS_FAILED", "AI_NOT_CONFIGURED"),
@@ -112,7 +124,14 @@ export async function tryHandleAiOwnedRequest(
     }
     case "asset.analyze.request": {
       const config = runtime.loadAiConfig();
-      if (!config.hasKey || !config.apiFormat) {
+      // `hasKey` alone is not the gate: a keyless local runtime has nothing to
+      // store, so readiness comes from the shared credential helper.
+      if (
+        !aiConfigHasCredentials({
+          hasKey: config.hasKey,
+          apiFormat: config.apiFormat,
+        })
+      ) {
         return {
           ok: false,
           error: createPublicError("AI_ANALYSIS_FAILED", "AI_NOT_CONFIGURED"),
@@ -192,6 +211,7 @@ export async function tryHandleAiOwnedRequest(
         model: config.model,
         baseUrl: config.baseUrl ?? "",
         hasKey: config.hasKey,
+        requiresApiKey: aiApiFormatRequiresApiKey(config.apiFormat),
         enabledFields: {
           description: config.descriptionEnabled,
           tags: config.tagEnabled,
@@ -214,7 +234,13 @@ export async function tryHandleAiOwnedRequest(
           error: createPublicError("CONFIRMATION_REQUIRED"),
         } satisfies RendererResult;
       }
-      if (!request.apiKey && !currentConfig.hasKey) {
+      if (
+        !request.apiKey &&
+        !aiConfigHasCredentials({
+          hasKey: currentConfig.hasKey,
+          apiFormat: request.apiFormat,
+        })
+      ) {
         return {
           ok: false,
           error: createPublicError("AI_SETTINGS_INCOMPLETE"),
@@ -283,10 +309,17 @@ export async function tryHandleAiOwnedRequest(
         try {
           apiKey = runtime.getDecryptedApiKey();
         } catch {
-          return {
-            ok: false,
-            error: createPublicError("AI_ANALYSIS_FAILED", "AI_NOT_CONFIGURED"),
-          } satisfies RendererResult;
+          // The request tests the *draft* profile, which may be a keyless local
+          // endpoint that has never been saved. Demanding a stored key here
+          // would report "AI_ANALYSIS_FAILED" for a perfectly reachable server
+          // just because the stored profile is still a cloud format.
+          if (aiApiFormatRequiresApiKey(request.apiFormat)) {
+            return {
+              ok: false,
+              error: createPublicError("AI_ANALYSIS_FAILED", "AI_NOT_CONFIGURED"),
+            } satisfies RendererResult;
+          }
+          apiKey = "";
         }
       }
       if (!runtime.workerAvailable()) throw new Error("Library Worker is unavailable.");
@@ -324,16 +357,19 @@ export async function tryHandleAiOwnedRequest(
     case "ai.list-models.request": {
       let apiKey = request.apiKey?.trim() ?? "";
       if (!apiKey) {
+        const keyless = !aiApiFormatRequiresApiKey(request.apiFormat);
         try {
           apiKey = runtime.getDecryptedApiKey();
         } catch {
-          return {
-            ok: true,
-            type: "ai.list-models.result",
-            models: [],
-            errorKind: "auth",
-            reason: "API key is required to list models.",
-          } satisfies RendererResult;
+          if (!keyless) {
+            return {
+              ok: true,
+              type: "ai.list-models.result",
+              models: [],
+              errorKind: "auth",
+              reason: "API key is required to list models.",
+            } satisfies RendererResult;
+          }
         }
       }
       const listed = await listAiModels({
@@ -354,11 +390,39 @@ export async function tryHandleAiOwnedRequest(
         ok: true,
         type: "ai.list-models.result",
         models: listed.models,
+        ...(listed.visionModels
+          ? { visionModels: listed.visionModels }
+          : {}),
+        ...(listed.capabilitiesReported === undefined
+          ? {}
+          : { capabilitiesReported: listed.capabilitiesReported }),
+      } satisfies RendererResult;
+    }
+    case "ai.local-endpoints.request": {
+      const discovery = await runtime.discoverLocalEndpoints();
+      runtime.logInfo("ai.local-endpoints.discovered", "Probed local AI endpoints.", {
+        endpointCount: discovery.endpoints.length,
+        wslAvailable: discovery.wslAvailable,
+        wslDistroCount: discovery.wslDistros.length,
+      });
+      return {
+        ok: true,
+        type: "ai.local-endpoints.result",
+        endpoints: discovery.endpoints,
+        wslAvailable: discovery.wslAvailable,
+        wslDistros: discovery.wslDistros,
+        ...(discovery.wslError ? { wslError: discovery.wslError } : {}),
       } satisfies RendererResult;
     }
     case "ai.search-plan.request": {
       const config = runtime.loadAiConfig();
-      if (!config.hasKey || !config.disclaimerAccepted) {
+      if (
+        !aiConfigHasCredentials({
+          hasKey: config.hasKey,
+          apiFormat: config.apiFormat,
+        }) ||
+        !config.disclaimerAccepted
+      ) {
         runtime.logInfo(
           "ai.search-plan.unavailable",
           "AI search requires configured credentials and accepted disclosure.",

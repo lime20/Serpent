@@ -36,8 +36,25 @@ describe('artifact protocol byte ranges', () => {
     expect(response.status).toBe(206);
     expect(response.headers.get('accept-ranges')).toBe('bytes');
     expect(response.headers.get('content-range')).toBe('bytes 3-6/10');
+    // The renderer samples media pixels (viewer chrome contrast, mirage-tank
+    // texture detection); a cross-origin response without this header taints the
+    // canvas and those reads silently return nothing.
+    expect(response.headers.get('access-control-allow-origin')).toBe('*');
     expect(Buffer.from(await response.arrayBuffer()).toString()).toBe('3456');
     expect(JSON.stringify([...response.headers])).not.toContain(filePath);
+  });
+
+  it('allows cross-origin canvas reads on full responses', async () => {
+    const root = mkdtempSync(path.join(tmpdir(), 'serpent-artifact-response-'));
+    roots.push(root);
+    const filePath = path.join(root, 'thumbnail.webp');
+    writeFileSync(filePath, Buffer.from('webp'));
+
+    const response = await createArtifactResponse(filePath, 'image/webp');
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get('access-control-allow-origin')).toBe('*');
+    expect(response.headers.get('content-type')).toBe('image/webp');
   });
 
   it('returns 416 for an unsatisfiable range', async () => {

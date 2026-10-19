@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+  AI_CONTENT_INTEGRITY_RULES,
+  AI_RATING_NEUTRALITY_RULE,
   buildAiAnalysisSystemPrompt,
   DEFAULT_AI_ANALYSIS_SETTINGS,
   normalizeAiAnalysisSettings,
@@ -120,6 +122,58 @@ describe('buildAiAnalysisSystemPrompt', () => {
     expect(prompt).toContain('标签语言硬约束');
     expect(prompt).toContain('禁止输出纯拉丁字母的英文标签');
     expect(prompt).toContain('每一个标签都必须使用该语言');
+  });
+
+  /**
+   * A catalogue entry that says "private content" instead of naming what is on
+   * screen is worthless, and it is a real model behaviour whenever the subject
+   * matter looks sensitive. The rule is deliberately field-independent, so it
+   * must survive every field toggle.
+   */
+  it('always states the content-integrity rules, even with no fields enabled', () => {
+    const prompt = buildAiAnalysisSystemPrompt({
+      language: 'Chinese (zh-CN)',
+      settings: DEFAULT_AI_ANALYSIS_SETTINGS,
+      enabledFields: { description: false, tags: false, rating: false },
+      existingTagNames: [],
+    });
+    for (const rule of AI_CONTENT_INTEGRITY_RULES) {
+      expect(prompt).toContain(rule);
+    }
+  });
+
+  it('forbids vague stand-ins for sensitive subject matter', () => {
+    const prompt = buildAiAnalysisSystemPrompt({
+      language: 'Chinese (zh-CN)',
+      settings: DEFAULT_AI_ANALYSIS_SETTINGS,
+      enabledFields: { description: true, tags: true, rating: true },
+      existingTagNames: [],
+    });
+    // Name what is on screen, do not substitute a category label.
+    expect(prompt).toContain('画面呈现什么就描述什么');
+    expect(prompt).toContain('「隐私内容」「敏感图片」「不便描述」');
+    expect(prompt).toContain('不得省略、代称、规避或拒绝输出');
+    // No moralising, no disclaimers leaking into the description.
+    expect(prompt).toContain('不作道德、合规或合法性评判');
+    expect(prompt).toContain('不追加免责声明、内容警告');
+  });
+
+  it('keeps the rating rubric independent of subject matter', () => {
+    const enabled = buildAiAnalysisSystemPrompt({
+      language: 'Chinese (zh-CN)',
+      settings: DEFAULT_AI_ANALYSIS_SETTINGS,
+      enabledFields: { description: true, tags: false, rating: true },
+      existingTagNames: [],
+    });
+    expect(enabled).toContain(AI_RATING_NEUTRALITY_RULE);
+
+    const disabled = buildAiAnalysisSystemPrompt({
+      language: 'Chinese (zh-CN)',
+      settings: DEFAULT_AI_ANALYSIS_SETTINGS,
+      enabledFields: { description: true, tags: false, rating: false },
+      existingTagNames: [],
+    });
+    expect(disabled).not.toContain(AI_RATING_NEUTRALITY_RULE);
   });
 });
 

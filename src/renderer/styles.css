@@ -84,6 +84,14 @@
   --viewer-stage: var(--ui-surface-canvas, #16171a);
   /* PDF page paper stays white in both themes (document content, not chrome). */
   --viewer-document-page: #fff;
+  /* Mirage-tank (幻影坦克) image backdrops. The encoding is defined against
+     exact black and white, so these are content colors, not theme chrome: they
+     stay identical in both themes on purpose. */
+  --viewer-image-backdrop-black: #000;
+  --viewer-image-backdrop-white: #fff;
+  --viewer-image-backdrop-gray: #808080;
+  --viewer-image-backdrop-checker-a: #fff;
+  --viewer-image-backdrop-checker-b: #c9c9c9;
   /* Serpent-627: viewer bottom chrome (zoom bar / video transport /
      fullscreen chip) is semi-transparent rather than near-opaque —
      moderate enough to still read clearly over any media, in both themes. */
@@ -5818,6 +5826,27 @@ body.serpent-modal-open .app-shell {
   -webkit-user-drag: none;
   will-change: transform;
 }
+/* Mirage-tank (幻影坦克) backdrops. The matte is painted on the image box, which
+   always matches the bitmap's aspect ratio, so partial-alpha pixels composite
+   over a known color instead of the stage/wallpaper. `auto` adds no class and
+   keeps every pre-existing transparency behavior. */
+.preview-image.is-backdrop-black {
+  background: var(--viewer-image-backdrop-black);
+}
+.preview-image.is-backdrop-white {
+  background: var(--viewer-image-backdrop-white);
+}
+.preview-image.is-backdrop-gray {
+  background: var(--viewer-image-backdrop-gray);
+}
+.preview-image.is-backdrop-checkerboard {
+  background-color: var(--viewer-image-backdrop-checker-a);
+  background-image: repeating-conic-gradient(
+    var(--viewer-image-backdrop-checker-b) 0% 25%,
+    var(--viewer-image-backdrop-checker-a) 0% 50%
+  );
+  background-size: 16px 16px;
+}
 .preview-image-error {
   position: absolute;
   inset: 0;
@@ -6299,6 +6328,70 @@ body.serpent-modal-open .app-shell {
 .preview-color-space-control:focus-within {
   border-radius: calc(4px * var(--ui-radius-scale, 1));
   box-shadow: 0 0 0 2px var(--accent);
+}
+.preview-backdrop-control {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--secondary);
+  font-size: calc(11px * var(--ui-font-scale));
+  white-space: nowrap;
+}
+.preview-backdrop-control select {
+  max-width: min(160px, 20vw);
+  padding: 2px 3px;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  cursor: pointer;
+}
+.preview-backdrop-control:focus-within {
+  border-radius: calc(4px * var(--ui-radius-scale, 1));
+  box-shadow: 0 0 0 2px var(--accent);
+}
+/* Mirage-tank hint: anchored above the zoom bar so it never competes with the
+   zoom slider for horizontal space. */
+.preview-mirage-hint {
+  position: absolute;
+  bottom: calc(100% + 8px);
+  left: 50%;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 8px;
+  border: 1px solid var(--divider);
+  border-radius: calc(8px * var(--ui-radius-scale, 1));
+  background: var(--viewer-chrome-bg);
+  box-shadow: 0 1px 6px rgb(0 0 0 / 10%);
+  color: var(--secondary);
+  font-size: calc(11px * var(--ui-font-scale));
+  white-space: nowrap;
+  transform: translateX(-50%);
+  backdrop-filter: blur(10px);
+}
+.preview-mirage-hint .icon {
+  color: var(--accent);
+}
+/* Beats `.preview-zoom-controls button` (icon-button box) — this hint button
+   carries a label, not a glyph. */
+.preview-zoom-controls .preview-mirage-hint button {
+  display: inline-flex;
+  width: auto;
+  height: auto;
+  padding: 2px 7px;
+  align-items: center;
+  border-radius: calc(5px * var(--ui-radius-scale, 1));
+  background: color-mix(in srgb, var(--accent) 18%, transparent);
+  color: var(--text);
+  font-size: inherit;
+  line-height: 1.4;
+}
+.preview-zoom-controls .preview-mirage-hint button:hover,
+.preview-zoom-controls .preview-mirage-hint button:focus-visible {
+  background: color-mix(in srgb, var(--accent) 32%, transparent);
+  color: var(--text);
 }
 .preview-zoom-controls .preview-zoom-label,
 .preview-zoom-controls button {
@@ -7991,6 +8084,80 @@ body.serpent-modal-open .app-shell {
   color: var(--tertiary);
   font-size: calc(11px * var(--ui-font-scale));
   line-height: 1.45;
+}
+
+.ai-config-model-picker-warning {
+  display: block;
+  color: var(--tertiary);
+  font-size: calc(10px * var(--ui-font-scale));
+  line-height: 1.3;
+}
+
+.ai-config-local {
+  display: grid;
+  gap: 8px;
+  margin: 0 0 4px;
+  padding: 10px;
+  border: 1px solid var(--divider);
+  border-radius: calc(8px * var(--ui-radius-scale, 1));
+  background: var(--pane);
+}
+
+.ai-config-local-intro {
+  margin: 0;
+}
+
+.ai-config-local-presets {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.ai-config-local-preset,
+.ai-config-local-discover {
+  font-size: calc(11px * var(--ui-font-scale));
+}
+
+.ai-config-local-endpoints {
+  display: grid;
+  gap: 4px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.ai-config-local-endpoint {
+  display: flex;
+  width: 100%;
+  flex-direction: column;
+  gap: 2px;
+  padding: 6px 8px;
+  border: 1px solid var(--divider);
+  border-radius: calc(6px * var(--ui-radius-scale, 1));
+  background: transparent;
+  color: var(--text);
+  cursor: pointer;
+  font: inherit;
+  text-align: left;
+}
+
+.ai-config-local-endpoint:hover {
+  background: var(--hover);
+}
+
+.ai-config-local-endpoint-main {
+  font-size: calc(11px * var(--ui-font-scale));
+  word-break: break-all;
+}
+
+.ai-config-local-endpoint-meta {
+  color: var(--tertiary);
+  font-size: calc(10px * var(--ui-font-scale));
+}
+
+.ai-config-local-warning,
+.ai-config-local-troubleshoot {
+  color: var(--warning, var(--tertiary));
 }
 
 select.ai-config-input {

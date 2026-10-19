@@ -52,6 +52,33 @@ describe('AI natural-language search planner', () => {
     expect(String(init?.headers)).not.toContain('secret');
   });
 
+  /**
+   * Local runtimes generally reject OpenAI's `json_schema` envelope, and they
+   * have no credential to present.
+   */
+  it('asks a local runtime for a plain JSON object without credentials', async () => {
+    const fetchFn = vi.fn<typeof fetch>().mockResolvedValue(jsonResponse({
+      choices: [{ message: { content: JSON.stringify(rawPlan) } }],
+    }));
+
+    await planAiSearch({
+      apiFormat: 'local_openai', model: 'qwen2.5vl:7b', apiKey: '',
+      naturalQuery: 'night city', fetchFn,
+    });
+
+    const [url, init] = fetchFn.mock.calls[0]!;
+    expect(String(url)).toBe('http://127.0.0.1:11434/v1/chat/completions');
+    expect(init?.headers).not.toHaveProperty('Authorization');
+    const request = JSON.parse(String(init?.body)) as Record<string, unknown>;
+    expect(request.response_format).toEqual({ type: 'json_object' });
+    const messages = request.messages as Array<{ role: string; content: string }>;
+    expect(messages[0]!.content).toContain('keywords');
+    // Field names in the hint must match the wire schema the plan is parsed
+    // with; `direction` instead of `order` would fail every local plan.
+    expect(messages[0]!.content).toContain('order');
+    expect(messages[0]!.content).not.toContain('direction');
+  });
+
   it('uses a Gemini API-key header rather than putting credentials in the URL', async () => {
     const fetchFn = vi.fn<typeof fetch>().mockResolvedValue(jsonResponse({
       candidates: [{ content: { parts: [{ text: JSON.stringify(rawPlan) }] } }],

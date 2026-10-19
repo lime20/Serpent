@@ -16,6 +16,8 @@ import { summarizePluginJobs } from '../../shared/plugin-job-status';
 import type { RecentLibraryEntry } from '../../shared/recent-libraries';
 import type { EmbeddingHttpAdapter } from '../../shared/embedding/http-service';
 import type { AiApiFormat } from '../../shared/ai-endpoints';
+import type { AiLocalEndpointDiscovery } from '../../shared/ai-local-endpoints';
+import type { AiModelListResult } from '../../shared/library-api';
 import type { AiReliabilitySettings } from '../../shared/ai-reliability';
 import { searchQuerySchema } from '../../shared/asset-types';
 import type { EntityAppearance, EntityAppearanceTarget } from '../../shared/entity-appearance';
@@ -1856,6 +1858,8 @@ export const library: SerpentLibraryApi = Object.freeze({
     model: string | null;
     baseUrl: string;
     hasKey: boolean;
+    /** False for keyless local runtimes; readiness is `hasKey || !requiresApiKey`. */
+    requiresApiKey: boolean;
     enabledFields: { description: boolean; tags: boolean; rating: boolean };
     analysisSettings: {
       forceExistingTags: boolean;
@@ -2670,7 +2674,7 @@ export const library: SerpentLibraryApi = Object.freeze({
     apiFormat: AiApiFormat;
     apiKey?: string;
     baseUrl?: string;
-  }): Promise<LibraryApiResult<{ models: string[]; errorKind?: string; reason?: string }>> {
+  }): Promise<LibraryApiResult<AiModelListResult>> {
     const result = await request({
       type: 'ai.list-models.request',
       apiFormat,
@@ -2683,8 +2687,29 @@ export const library: SerpentLibraryApi = Object.freeze({
       ok: true,
       value: {
         models: result.models,
+        ...(result.visionModels ? { visionModels: result.visionModels } : {}),
+        ...(result.capabilitiesReported === undefined
+          ? {}
+          : { capabilitiesReported: result.capabilitiesReported }),
         errorKind: result.errorKind,
         reason: result.reason,
+      },
+    };
+  },
+
+  async listAiLocalEndpoints(): Promise<LibraryApiResult<AiLocalEndpointDiscovery>> {
+    const result = await request({ type: 'ai.local-endpoints.request' });
+    if (!result.ok) return failure(result);
+    if (result.type !== 'ai.local-endpoints.result') {
+      throw new Error('Unexpected local-endpoints response.');
+    }
+    return {
+      ok: true,
+      value: {
+        endpoints: result.endpoints,
+        wslAvailable: result.wslAvailable,
+        wslDistros: result.wslDistros,
+        ...(result.wslError ? { wslError: result.wslError } : {}),
       },
     };
   },

@@ -10,7 +10,11 @@ import {
   DEFAULT_AI_ANALYSIS_SETTINGS,
   normalizeAiAnalysisSettings,
 } from '../../shared/ai-analysis-settings';
-import { apiFormatLimiterKey, formatAiLanguagesForPrompt } from '../../shared/ai-endpoints';
+import {
+  apiFormatLimiterKey,
+  effectiveAiRequestBaseUrl,
+  formatAiLanguagesForPrompt,
+} from '../../shared/ai-endpoints';
 import { VendorAdapterError } from '../ai/vendor-adapter';
 import type { VendorAdapter } from '../ai/vendor-adapter';
 import { applyAiOutputPolicy, type AiAnalysisRequest } from '../ai/protocol';
@@ -149,7 +153,7 @@ export async function executeAiWorkerCommand(
         baseUrl,
         maxAnalysisImageEdgePx: rawMaxEdge,
       } = request.command;
-      const resolvedBaseUrl = baseUrl?.trim() || undefined;
+      const resolvedBaseUrl = effectiveAiRequestBaseUrl(apiFormat, baseUrl);
       const language = formatAiLanguagesForPrompt(languages);
       const maxAnalysisImageEdgePx = normalizeAiAnalysisImageEdgePx(
         rawMaxEdge ?? DEFAULT_AI_ANALYSIS_IMAGE_EDGE_PX,
@@ -336,6 +340,17 @@ export async function executeAiWorkerCommand(
             'openai_chat',
           );
           break;
+        // Local runtimes speak the same Chat Completions wire protocol; the
+        // only differences are the loopback default and the absent credential.
+        case 'local_openai':
+          adapter = new OpenAIVendorAdapter(
+            apiKey,
+            model,
+            undefined,
+            resolvedBaseUrl,
+            'openai_chat',
+          );
+          break;
         case 'openai_responses':
           adapter = new OpenAIVendorAdapter(
             apiKey,
@@ -514,7 +529,7 @@ export async function executeAiWorkerCommand(
       // Main already decrypted via safeStorage; Worker receives ephemeral plaintext
       // (same trust boundary as asset.analyze / ai.process-queue).
       const { apiFormat, model, apiKey, baseUrl } = request.command;
-      const resolvedBaseUrl = baseUrl?.trim() || undefined;
+      const resolvedBaseUrl = effectiveAiRequestBaseUrl(apiFormat, baseUrl);
 
       // Build a minimal adapter and try a request.
       let testAdapter: VendorAdapter;
@@ -523,6 +538,7 @@ export async function executeAiWorkerCommand(
           testAdapter = new DashScopeVendorAdapter(apiKey, model, undefined, resolvedBaseUrl);
           break;
         case 'openai_chat':
+        case 'local_openai':
           testAdapter = new OpenAIVendorAdapter(
             apiKey,
             model,

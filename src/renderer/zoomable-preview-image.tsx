@@ -11,6 +11,19 @@ import {
 import { Icon } from "./Icons";
 import { iconActionAttrs } from "./icon-action-attrs";
 import { useT } from "./i18n";
+import {
+  analyzeMirageTexture,
+  MIRAGE_DETECTION_SAMPLE_EDGE,
+  viewerImageBackdropClass,
+  type MirageTextureAnalysis,
+  type ViewerImageBackdrop,
+} from "./mirage-texture";
+import { MirageBackdropControl } from "./MirageBackdropControl";
+import { readMediaImageData } from "./viewer-chrome-contrast";
+import {
+  loadViewerBackdropPreferences,
+  setStoredViewerBackdrop,
+} from "./viewer-backdrop-preferences";
 import { useViewerZoomPan } from "./use-viewer-zoom-pan";
 import { VIEWER_CHROME_TAB_INDEX } from "./viewer-focus-policy";
 import {
@@ -91,6 +104,13 @@ export const ZoomableImage = forwardRef<
     placeholderSrc?: string;
     /** Suppress animated full-source playback while this surface preloads. */
     preloadOnly?: boolean;
+    /**
+     * Mirage-tank backdrop controls (matte selector + detection hint). The
+     * sequence player owns its own transport bar and opts out.
+     */
+    imageBackdropControls?: boolean;
+    /** Source format can carry alpha (fallback when pixels cannot be sampled). */
+    alphaCapable?: boolean;
     src: string;
   }
 >(function ZoomableImage(
@@ -113,6 +133,8 @@ export const ZoomableImage = forwardRef<
     isAnimated = false,
     placeholderSrc,
     preloadOnly = false,
+    imageBackdropControls = true,
+    alphaCapable = false,
     src,
   },
   ref,
@@ -125,6 +147,12 @@ export const ZoomableImage = forwardRef<
   const decodeRequestRef = useRef(0);
   const [sourceNatural, setSourceNatural] = useState({ w: 0, h: 0 });
   const sourceNaturalRef = useRef({ w: 0, h: 0 });
+  const [texture, setTexture] = useState<MirageTextureAnalysis | null>(null);
+  const [textureSamplingUnavailable, setTextureSamplingUnavailable] =
+    useState(false);
+  const [backdrop, setBackdrop] = useState<ViewerImageBackdrop>(
+    () => loadViewerBackdropPreferences().backdrop,
+  );
   const previousQuarterTurnsRef = useRef(displayTransform.quarterTurns);
   const useAnimatedPlaceholder = Boolean(
     preloadOnly && isAnimated && placeholderSrc,
@@ -190,6 +218,33 @@ export const ZoomableImage = forwardRef<
     if (fitRequestToken === undefined) return;
     fitToWindow();
   }, [fitRequestToken, fitToWindow]);
+
+  const changeBackdrop = useCallback((next: ViewerImageBackdrop) => {
+    setStoredViewerBackdrop(next);
+    setBackdrop(next);
+  }, []);
+
+  // Classify the decoded pixels once per load so the backdrop control only
+  // appears for alpha-bearing assets and the mirage hint only when the frame
+  // really looks like a mirage-tank encoding. `sourceNatural` is part of the
+  // dependency list on purpose: `<img>` load handlers publish the decoded size
+  // through it, which is the only signal that fresh pixels are available.
+  //
+  // Until the first successful sample the control stays hidden (no flicker for
+  // opaque files). When sampling is impossible — a canvas the browser refuses
+  // to read — the format-level `alphaCapable` fallback keeps the selector
+  // reachable, because the user's need (pick a matte) does not depend on our
+  // detector.
+  useEffect(() => {
+    const image = imageRef.current;
+    if (imageError || !image || !isDecodedImage(image)) {
+      setTexture(null);
+      return;
+    }
+    const sampled = readMediaImageData(image, MIRAGE_DETECTION_SAMPLE_EDGE);
+    setTextureSamplingUnavailable(sampled === null);
+    setTexture(sampled ? analyzeMirageTexture(sampled) : null);
+  }, [decodedSource, fullSource, imageError, sourceNatural]);
 
   const promoteDecodedImage = useCallback(
     (image: HTMLImageElement, source: string) => {
@@ -320,11 +375,25 @@ export const ZoomableImage = forwardRef<
     sourceNatural.w > 0 ? sourceNatural.w * view.scale : undefined;
   const displayH =
     sourceNatural.h > 0 ? sourceNatural.h * view.scale : undefined;
+  // The matte is painted on the image box itself. That box always keeps the
+  // bitmap's aspect ratio, so it hugs the pixels exactly and rotates with them.
+  const backdropClass = viewerImageBackdropClass(backdrop);
+  const imageClassName = (base: string) =>
+    backdropClass ? `${base} ${backdropClass}` : base;
+  // Keep the control reachable when a non-auto backdrop is still stored, even
+  // if the current asset has no alpha: otherwise the viewer would keep an
+  // invisible display preference the user cannot turn off here.
+  const showBackdropControl =
+    imageBackdropControls &&
+    (backdrop !== "auto" ||
+      texture?.hasAlpha === true ||
+      (textureSamplingUnavailable && alphaCapable));
 
   return (
     <>
       <div
         className="preview-image-viewport is-pannable"
+        data-viewer-backdrop={backdrop}
         data-viewer-layer={display.layer}
         data-viewer-upgrading={display.upgrading ? "true" : "false"}
         ref={viewportRef}
@@ -344,7 +413,10 @@ export const ZoomableImage = forwardRef<
             <img
               alt={fullLayerDecoded ? "" : alt}
               aria-hidden={fullLayerDecoded ? true : undefined}
-              className={`preview-image preview-image-placeholder${fullLayerDecoded ? " is-hidden" : ""}`}
+              className={imageClassName(
+                `preview-image preview-image-placeholder${fullLayerDecoded ? " is-hidden" : ""}`,
+              )}
+              crossOrigin="anonymous"
               decoding="async"
               draggable={false}
               onError={handleImageError}
@@ -367,7 +439,10 @@ export const ZoomableImage = forwardRef<
             <img
               alt={fullLayerDecoded ? alt : ""}
               aria-hidden={!fullLayerDecoded ? true : undefined}
-              className={`preview-image preview-image-full${fullLayerDecoded ? " is-visible" : " is-hidden"}`}
+              className={imageClassName(
+                `preview-image preview-image-full${fullLayerDecoded ? " is-visible" : " is-hidden"}`,
+              )}
+              crossOrigin="anonymous"
               decoding="async"
               draggable={false}
               onError={handleImageError}
@@ -393,7 +468,8 @@ export const ZoomableImage = forwardRef<
         ) : (
           <img
             alt={alt}
-            className="preview-image"
+            className={imageClassName("preview-image")}
+            crossOrigin="anonymous"
             draggable={false}
             onError={handleImageError}
             onLoad={(event) => {
@@ -499,6 +575,13 @@ export const ZoomableImage = forwardRef<
             />
           </button>
         )}
+        {showBackdropControl ? (
+          <MirageBackdropControl
+            backdrop={backdrop}
+            onChange={changeBackdrop}
+            suggestMirage={texture?.isMirage === true}
+          />
+        ) : null}
       </div>
     </>
   );

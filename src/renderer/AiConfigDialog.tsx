@@ -17,9 +17,17 @@ import {
   AI_LANGUAGE_OPTIONS,
   DEFAULT_AI_BASE_URLS,
   DEFAULT_AI_MODELS,
+  aiApiFormatRequiresApiKey,
   type AiApiFormat,
   type AiLanguageId,
 } from "../shared/ai-endpoints";
+import {
+  LOCAL_AI_PROVIDER_PRESETS,
+  localModelLikelySupportsVision,
+  type AiLocalEndpointDescriptor,
+  type AiLocalEndpointDiscovery,
+  type LocalAiProviderPreset,
+} from "../shared/ai-local-endpoints";
 import { Icon } from "./Icons";
 import { AiConfigNumberInput } from "./ai-config-number-input";
 import { iconActionAttrs } from "./icon-action-attrs";
@@ -82,8 +90,12 @@ export interface AiConfigDialogProps {
   }>;
   onFetchModels: () => Promise<{
     models: string[];
+    visionModels?: string[];
+    capabilitiesReported?: boolean;
     reason?: string;
   }>;
+  /** Probe loopback ports and WSL addresses for local OpenAI-compatible servers. */
+  onDiscoverLocalEndpoints: () => Promise<AiLocalEndpointDiscovery & { reason?: string }>;
 }
 
 const OUTPUT_STYLE_LABEL_KEY: Record<
@@ -135,11 +147,25 @@ export function AiConfigDialog({
   onSave,
   onTestConnection,
   onFetchModels,
+  onDiscoverLocalEndpoints,
 }: AiConfigDialogProps) {
   const t = useT();
   const [modelOptions, setModelOptions] = useState<string[]>([]);
-  const [busyAction, setBusyAction] = useState<"test" | "models" | null>(null);
+  /**
+   * Vision capability as *reported by the endpoint* (llama.cpp and newer
+   * Ollama list `capabilities`). When the server answers this question we must
+   * not second-guess it with a name heuristic — that produced false "may not
+   * accept images" warnings for perfectly multimodal GGUF models.
+   */
+  const [visionModels, setVisionModels] = useState<string[]>([]);
+  const [capabilitiesReported, setCapabilitiesReported] = useState(false);
+  const [busyAction, setBusyAction] = useState<"test" | "models" | "local" | null>(
+    null,
+  );
   const [modelsMessage, setModelsMessage] = useState<string | null>(null);
+  const [localDiscovery, setLocalDiscovery] =
+    useState<AiLocalEndpointDiscovery | null>(null);
+  const [localMessage, setLocalMessage] = useState<string | null>(null);
   const [testInline, setTestInline] = useState<{
     ok: boolean;
     text: string;
@@ -159,8 +185,33 @@ export function AiConfigDialog({
   const fetchedForRef = useRef<string | null>(null);
 
   const canUseKey = Boolean(apiKey.trim()) || hasKey;
+  /**
+   * A local runtime is keyless: the API key field stays optional and none of
+   * the credential gates may block test / save / model listing.
+   */
+  const keylessFormat = !aiApiFormatRequiresApiKey(apiFormat);
+  const canUseCredentials = canUseKey || keylessFormat;
   const language = languages[0] ?? "zh-CN";
   const modelsFetchKey = `${apiFormat}|${baseUrl.trim()}|${apiKey.trim() ? "typed" : hasKey ? "stored" : "none"}`;
+  const localFailed =
+    apiFormat === "local_openai" &&
+    (testInline?.ok === false || connectionState === "error");
+
+  /**
+   * `vision` — the endpoint (or a known model family) accepts images.
+   * `no-vision` — the endpoint reported capabilities and omitted vision.
+   * `unknown` — nobody said anything; the name looks text-only.
+   */
+  function visionVerdict(modelId: string): "vision" | "no-vision" | "unknown" {
+    if (visionModels.includes(modelId)) return "vision";
+    if (capabilitiesReported) return "no-vision";
+    return localModelLikelySupportsVision(modelId) ? "vision" : "unknown";
+  }
+
+  /** Warn only when there is a reason to: reported text-only, or an unknown name. */
+  function showsVisionWarning(modelId: string): boolean {
+    return visionVerdict(modelId) !== "vision";
+  }
 
   function patchSettings(patch: Partial<AiAnalysisSettingsWire>) {
     onAnalysisSettingsChange({ ...analysisSettings, ...patch });
@@ -191,13 +242,15 @@ export function AiConfigDialog({
   }
 
   async function runFetchModels(options?: { quiet?: boolean }) {
-    if (!canUseKey || modelsFetchInFlightRef.current) return;
+    if (!canUseCredentials || modelsFetchInFlightRef.current) return;
     modelsFetchInFlightRef.current = true;
     setBusyAction("models");
     if (!options?.quiet) setModelsMessage(null);
     try {
       const result = await onFetchModels();
       fetchedForRef.current = modelsFetchKey;
+      setVisionModels(result.visionModels ?? []);
+      setCapabilitiesReported(result.capabilitiesReported === true);
       if (result.models.length > 0) {
         setModelOptions(result.models);
         setModelsMessage(
@@ -214,6 +267,78 @@ export function AiConfigDialog({
       }
     } finally {
       modelsFetchInFlightRef.current = false;
+      setBusyAction(null);
+    }
+  }
+
+  /**
+   * Point the draft at a discovered server. Only a model that the endpoint
+   * does not actually serve is replaced, so a deliberate choice survives.
+   */
+  function applyLocalEndpoint(endpoint: AiLocalEndpointDescriptor) {
+    onBaseUrlChange(endpoint.baseUrl);
+    const currentModel = model.trim();
+    // Trust the runtime's own capability report for the model we auto-pick.
+    const declaredVision = endpoint.visionModels ?? [];
+    const capabilitiesKnown = endpoint.capabilitiesReported === true;
+    setVisionModels(declaredVision);
+    setCapabilitiesReported(capabilitiesKnown);
+    if (!currentModel || !endpoint.models.includes(currentModel)) {
+      const preferred =
+        declaredVision[0] ??
+        endpoint.models.find((id) => localModelLikelySupportsVision(id)) ??
+        endpoint.models[0];
+      if (preferred) onModelChange(preferred);
+    }
+    setModelOptions(endpoint.models);
+    setModelsMessage(null);
+    setTestInline(null);
+    fetchedForRef.current = null;
+  }
+
+  function applyLocalPreset(preset: LocalAiProviderPreset) {
+    onBaseUrlChange(preset.baseUrl);
+    if (!model.trim()) onModelChange(preset.suggestedModel);
+    setModelOptions([]);
+    setModelsMessage(null);
+    setTestInline(null);
+    fetchedForRef.current = null;
+  }
+
+  async function runDiscoverLocalEndpoints(options?: {
+    /** Fill the draft automatically when exactly one server answers. */
+    autoApplySingle?: boolean;
+  }) {
+    setBusyAction("local");
+    setLocalMessage(null);
+    try {
+      const result = await onDiscoverLocalEndpoints();
+      setLocalDiscovery({
+        endpoints: result.endpoints,
+        wslAvailable: result.wslAvailable,
+        wslDistros: result.wslDistros,
+        ...(result.wslError ? { wslError: result.wslError } : {}),
+      });
+      if (result.reason) {
+        setLocalMessage(result.reason);
+      } else if (result.endpoints.length === 0) {
+        setLocalMessage(
+          result.wslAvailable
+            ? t("aiConfig.localDiscoverEmptyWsl")
+            : t("aiConfig.localDiscoverEmpty"),
+        );
+      } else {
+        if (options?.autoApplySingle && result.endpoints.length === 1) {
+          applyLocalEndpoint(result.endpoints[0]!);
+        }
+        setLocalMessage(
+          t("aiConfig.localDiscoverOk").replace(
+            "{count}",
+            String(result.endpoints.length),
+          ),
+        );
+      }
+    } finally {
       setBusyAction(null);
     }
   }
@@ -237,7 +362,7 @@ export function AiConfigDialog({
   }
 
   async function toggleModelPicker() {
-    if (!canUseKey) return;
+    if (!canUseCredentials) return;
     if (modelPickerOpen) {
       setModelPickerOpen(false);
       setModelPickerMenuBox(null);
@@ -257,16 +382,28 @@ export function AiConfigDialog({
   function handleApiFormatChange(next: AiApiFormat) {
     const previousDefault = DEFAULT_AI_BASE_URLS[apiFormat];
     const current = baseUrl.trim();
+    const usedDefaultEndpoint = !current || current === previousDefault;
     onApiFormatChange(next);
-    if (!current || current === previousDefault) {
-      onBaseUrlChange("");
+    if (usedDefaultEndpoint) {
+      // A local endpoint has no cloud default to fall back to, so show the
+      // stock Ollama root instead of an empty field.
+      onBaseUrlChange(next === "local_openai" ? DEFAULT_AI_BASE_URLS[next] : "");
     }
     setModelOptions([]);
+    setVisionModels([]);
+    setCapabilitiesReported(false);
     setModelsMessage(null);
+    setLocalDiscovery(null);
+    setLocalMessage(null);
     setTestInline(null);
     setModelPickerOpen(false);
     setModelPickerMenuBox(null);
     fetchedForRef.current = null;
+    if (next === "local_openai" && usedDefaultEndpoint) {
+      // The stock default is Ollama's port. Rather than leave the user on an
+      // endpoint that may not exist, probe once and fill in a single answer.
+      void runDiscoverLocalEndpoints({ autoApplySingle: true });
+    }
   }
 
   // Prefetch so the first dropdown open usually already has options.
@@ -278,13 +415,13 @@ export function AiConfigDialog({
       });
       return;
     }
-    if (!canUseKey) return;
+    if (!canUseCredentials) return;
     if (fetchedForRef.current === modelsFetchKey && modelOptions.length > 0) {
       return;
     }
     void runFetchModels({ quiet: true });
     // eslint-disable-next-line react-hooks/exhaustive-deps -- fingerprint-driven
-  }, [open, modelsFetchKey, canUseKey]);
+  }, [open, modelsFetchKey, canUseCredentials]);
 
   useEffect(() => {
     if (!modelPickerOpen) return;
@@ -411,9 +548,82 @@ export function AiConfigDialog({
             <p className="ai-config-hint">
               {apiFormat === "dashscope_native"
                 ? t("aiConfig.dashscopeBaseUrlHint")
-                : t("aiConfig.baseUrlHint")}
+                : apiFormat === "local_openai"
+                  ? t("aiConfig.localBaseUrlHint")
+                  : t("aiConfig.baseUrlHint")}
             </p>
           </div>
+          {apiFormat === "local_openai" ? (
+            <div className="ai-config-local">
+              <p className="ai-config-hint ai-config-local-intro">
+                {t("aiConfig.localIntro")}
+              </p>
+              <div className="ai-config-local-presets">
+                {LOCAL_AI_PROVIDER_PRESETS.map((preset) => (
+                  <button
+                    className="secondary-button ai-config-local-preset"
+                    key={preset.id}
+                    onClick={() => applyLocalPreset(preset)}
+                    type="button"
+                  >
+                    {preset.label}
+                  </button>
+                ))}
+                <button
+                  className="secondary-button ai-config-local-discover"
+                  disabled={busy}
+                  onClick={() => void runDiscoverLocalEndpoints()}
+                  type="button"
+                >
+                  {busyAction === "local"
+                    ? t("aiConfig.localDiscovering")
+                    : t("aiConfig.localDiscover")}
+                </button>
+              </div>
+              {localMessage ? (
+                <p className="ai-config-hint" role="status">
+                  {localMessage}
+                </p>
+              ) : null}
+              {localDiscovery && localDiscovery.endpoints.length > 0 ? (
+                <ul
+                  aria-label={t("aiConfig.localDiscoveredLabel")}
+                  className="ai-config-local-endpoints"
+                >
+                  {localDiscovery.endpoints.map((endpoint) => (
+                    <li key={endpoint.baseUrl}>
+                      <button
+                        className="ai-config-local-endpoint"
+                        onClick={() => applyLocalEndpoint(endpoint)}
+                        type="button"
+                      >
+                        <span className="ai-config-local-endpoint-main">
+                          {endpoint.runtime ??
+                            t("aiConfig.localRuntimeUnknown")}{" "}
+                          · {endpoint.baseUrl}
+                        </span>
+                        <span className="ai-config-local-endpoint-meta">
+                          {endpoint.source === "wsl"
+                            ? t("aiConfig.localSourceWsl")
+                            : t("aiConfig.localSourceLoopback")}
+                          {" · "}
+                          {t("aiConfig.localModelCount").replace(
+                            "{count}",
+                            String(endpoint.models.length),
+                          )}
+                        </span>
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+              ) : null}
+              {localFailed ? (
+                <p className="ai-config-hint ai-config-local-troubleshoot">
+                  {t("aiConfig.localTroubleshoot")}
+                </p>
+              ) : null}
+            </div>
+          ) : null}
           <div className="editor-field ai-config-field">
             <label className="micro-label" htmlFor="ai-config-api-key">
               {t("aiConfig.apiKey")}
@@ -428,7 +638,11 @@ export function AiConfigDialog({
                   setTestInline(null);
                 }}
                 placeholder={
-                  hasKey ? t("aiConfig.apiKeyConfigured") : "sk-…"
+                  keylessFormat
+                    ? t("aiConfig.localApiKeyPlaceholder")
+                    : hasKey
+                      ? t("aiConfig.apiKeyConfigured")
+                      : "sk-…"
                 }
                 type={showApiKey ? "text" : "password"}
                 value={apiKey}
@@ -446,6 +660,9 @@ export function AiConfigDialog({
                 <Icon name={showApiKey ? "eye-off" : "eye"} size={14} />
               </button>
             </div>
+            {keylessFormat ? (
+              <p className="ai-config-hint">{t("aiConfig.localApiKeyHint")}</p>
+            ) : null}
           </div>
           <div className="editor-field ai-config-field">
             <label className="micro-label" htmlFor="ai-config-model">
@@ -472,11 +689,11 @@ export function AiConfigDialog({
                   aria-haspopup="listbox"
                   aria-label={t("aiConfig.modelPick")}
                   className="text-field ai-config-input ai-config-model-picker-trigger"
-                  disabled={!canUseKey}
+                  disabled={!canUseCredentials}
                   onClick={() => void toggleModelPicker()}
                   ref={modelPickerTriggerRef}
                   data-hover-tip={
-                    !canUseKey
+                    !canUseCredentials
                       ? t("aiConfig.modelPickEmpty")
                       : t("aiConfig.modelPick")
                   }
@@ -536,6 +753,12 @@ export function AiConfigDialog({
                                 type="button"
                               >
                                 {id}
+                                {apiFormat === "local_openai" &&
+                                showsVisionWarning(id) ? (
+                                  <span className="ai-config-model-picker-warning">
+                                    {t("aiConfig.localTextOnlyModel")}
+                                  </span>
+                                ) : null}
                               </button>
                             </li>
                           ))
@@ -549,6 +772,13 @@ export function AiConfigDialog({
             {modelsMessage ? (
               <p className="ai-config-hint" role="status">
                 {modelsMessage}
+              </p>
+            ) : null}
+            {apiFormat === "local_openai" &&
+            model.trim() &&
+            showsVisionWarning(model.trim()) ? (
+              <p className="ai-config-hint ai-config-local-warning" role="status">
+                {t("aiConfig.localTextOnlyWarning")}
               </p>
             ) : null}
           </div>
@@ -815,7 +1045,7 @@ export function AiConfigDialog({
           <div className="ai-config-test-cluster">
             <button
               className="secondary-button"
-              disabled={!canUseKey || !model.trim() || busy}
+              disabled={!canUseCredentials || !model.trim() || busy}
               onClick={() => void runTest()}
               type="button"
             >
@@ -835,7 +1065,7 @@ export function AiConfigDialog({
           </div>
           <button
             className="primary-button"
-            disabled={!canUseKey || !model.trim() || busy}
+            disabled={!canUseCredentials || !model.trim() || busy}
             onClick={() => void onSave()}
             type="button"
           >

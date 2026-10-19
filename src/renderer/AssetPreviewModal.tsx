@@ -57,6 +57,7 @@ import { HtmlViewerSurface } from "./HtmlViewerSurface";
 import { FontViewerSurface } from "./FontViewerSurface";
 import { useViewerVolume } from "./use-viewer-volume";
 import { ZoomableImage } from "./zoomable-preview-image";
+import { imageFormatMayCarryAlpha } from "./mirage-texture";
 import { useViewerChromeContrast } from "./use-viewer-chrome-contrast";
 import { VIEWER_CHROME_TAB_INDEX } from "./viewer-focus-policy";
 import { ImageSequencePlayer } from "./ImageSequencePlayer";
@@ -1417,6 +1418,11 @@ const AssetPreviewModalContent = forwardRef<
           ) : showImage && imageSrc ? (
             <ZoomableImage
               alt={asset.displayName}
+              alphaCapable={
+                asset.mediaType === "image" &&
+                (imageFormatMayCarryAlpha(resolution?.sourceMimeType) ||
+                  imageFormatMayCarryAlpha(asset.displayName))
+              }
               displayTransform={displayTransform}
               fitRequestToken={fitRequestToken}
               colorSpaceOptions={resolution?.colorSpace?.options}

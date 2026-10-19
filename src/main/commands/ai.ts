@@ -1,7 +1,11 @@
 import type { RendererRequest, WorkerCommand } from "../../shared/protocol/requests";
 import { toWireAiAnalysisSettings } from "../../shared/ai-analysis-settings";
 import type { AiAnalysisSettings } from "../../shared/ai-analysis-settings";
-import type { AiApiFormat } from "../../shared/ai-endpoints";
+import {
+  aiApiFormatRequiresApiKey,
+  aiConfigHasCredentials,
+  type AiApiFormat,
+} from "../../shared/ai-endpoints";
 
 export type AiCommandConfig = {
   hasKey: boolean;
@@ -40,7 +44,11 @@ export function executeAiMainCommand(
         try {
           apiKey = runtime.getDecryptedApiKey();
         } catch {
-          return undefined;
+          // The request tests the *draft* profile, which may be a keyless local
+          // endpoint that has never been saved. Mirrors the Main-owned request
+          // path: only a credential-requiring format fails here.
+          if (aiApiFormatRequiresApiKey(request.apiFormat)) return undefined;
+          apiKey = "";
         }
       }
       return {
@@ -99,8 +107,17 @@ export function executeAiMainCommand(
       };
     case "asset.analyze.request": {
       const config = runtime.loadAiConfig();
-      if (!config.hasKey) return undefined; // Will be handled as error downstream.
       if (!config.apiFormat) return undefined;
+      // Keyless local runtimes have no stored key, so readiness is the shared
+      // credential decision rather than `hasKey` alone.
+      if (
+        !aiConfigHasCredentials({
+          hasKey: config.hasKey,
+          apiFormat: config.apiFormat,
+        })
+      ) {
+        return undefined; // Will be handled as error downstream.
+      }
       let apiKey: string;
       try {
         apiKey = runtime.getDecryptedApiKey();

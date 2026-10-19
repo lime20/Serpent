@@ -1,4 +1,5 @@
 import {
+  effectiveAiRequestBaseUrl,
   formatAiLanguagesForPrompt,
   resolveAnthropicMessagesUrl,
   resolveDashScopeMultimodalGenerationUrl,
@@ -180,6 +181,26 @@ Only add a sort when the user explicitly asks for ordering. The ordinary paramet
 
 type Fetch = typeof globalThis.fetch;
 
+/**
+ * Local runtimes rarely implement OpenAI's `json_schema` response format, and
+ * a rejected envelope would fail the whole search plan. `json_object` plus an
+ * explicit field list has the widest support across Ollama / LM Studio /
+ * llama.cpp / vLLM.
+ */
+const LOCAL_SEARCH_PLAN_HINT = [
+  'Return exactly one JSON object with these keys:',
+  'keywords (string[]), synonyms (string[]), exclusions (string[]),',
+  'filters (array of {kind: "categorical"|"numeric", field: string,',
+  'values: string[], ranges: [{min: number|null, max: number|null}], exclude: boolean}),',
+  // Field names must match AI_SEARCH_PLAN_JSON_SCHEMA: sort uses `order`.
+  'sort (optional {field: string, order: "asc"|"desc"}).',
+  'Unused arrays must be empty. Output JSON only, with no Markdown fences.',
+].join(' ');
+
+function localSearchPlanSystemPrompt(system: string): string {
+  return `${system}\n${LOCAL_SEARCH_PLAN_HINT}`;
+}
+
 function resolveSearchApiFormat(
   input: { apiFormat?: AiApiFormat; provider?: AiSearchProvider },
 ): AiApiFormat {
@@ -250,6 +271,27 @@ function providerRequest(
   signal: AbortSignal,
 ): Parameters<Fetch> {
   const system = searchSystemPrompt(input.languages);
+  if (input.apiFormat === 'local_openai') {
+    // A local runtime is keyless; send no Authorization header at all.
+    return [resolveOpenAiChatCompletionsUrl(
+      effectiveAiRequestBaseUrl('local_openai', input.baseUrl),
+    ), {
+      method: 'POST', signal,
+      headers: {
+        ...(input.apiKey ? { Authorization: `Bearer ${input.apiKey}` } : {}),
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: input.model,
+        temperature: 0,
+        messages: [
+          { role: 'system', content: localSearchPlanSystemPrompt(system) },
+          { role: 'user', content: input.naturalQuery },
+        ],
+        response_format: { type: 'json_object' },
+      }),
+    }];
+  }
   if (input.apiFormat === 'openai_chat') {
     return [resolveOpenAiChatCompletionsUrl(input.baseUrl), {
       method: 'POST', signal,
@@ -384,7 +426,7 @@ function extractProviderOutput(apiFormat: AiApiFormat, body: unknown): unknown {
       'OpenAI Responses output was empty.',
     );
   }
-  if (apiFormat === 'openai_chat') {
+  if (apiFormat === 'openai_chat' || apiFormat === 'local_openai') {
     const message = asRecord(asRecord(asArray(record.choices)[0]).message);
     if (typeof message.refusal === 'string' && message.refusal.trim()) {
       throw new AiSearchPlannerError('AI_REFUSED', 'The provider refused to prepare this search.');

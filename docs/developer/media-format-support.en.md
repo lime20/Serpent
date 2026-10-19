@@ -29,6 +29,19 @@ Use `rg` to search for the old extensions, MIME strings, `endsWith`, `includes`,
 
 Chromium native rendering is an optimization, not sufficient proof of product support. Formats Chromium cannot render should use bounded thumbnails and a separate full-resolution decoder path.
 
+### Transparency and "mirage-tank" textures
+
+Images with alpha have two viewing semantics, and every newly added image format must be checked against both:
+
+- **Ordinary transparent images**: the viewer keeps alpha and composites semi-transparent pixels over the stage color. Thumbnail/preview derivatives must keep alpha (the Worker emits WebP when `hasAlpha` is set, otherwise JPEG); flattening alpha onto an opaque color destroys the original.
+- **Mirage-tank textures**: the same PNG shows two different pictures over white and black backgrounds (encoding: `alpha = 1 − (white target − black target)`, `color = black target / alpha`). The viewer offers an **Image background** selector in the toolbar and hints to switch backgrounds when the sampled frame matches that encoding. Detection and backdrop models live in `src/renderer/mirage-texture.ts`; they only heuristically inspect downsampled frames and never affect decode correctness.
+
+Both the source passthrough and derived-image paths must therefore preserve alpha; a lossy or alpha-less container degrades a mirage-tank texture into an ordinary image.
+
+### Pixel-sampling prerequisites (cross-origin)
+
+The viewer needs to read media pixels: mirage detection and the previous/next button contrast both rely on `canvas.getImageData`. `serpent://` declares `corsEnabled` in `src/main/serpent-protocol-privileges.ts`, so every media response (the common headers in `artifact-response.ts`) must carry `Access-Control-Allow-Origin`, and viewer `<img>` elements must use `crossOrigin="anonymous"`. If either is missing, the canvas is cross-origin tainted and sampling silently returns nothing — the detection hint never appears and contrast stays at its default rather than raising an error. Keep both conditions in place when adding media response paths.
+
 ## 3. Implementation order
 
 1. Decide whether the addition is a codec, container, or alias extension; record MIME, decoder, and fallback semantics.

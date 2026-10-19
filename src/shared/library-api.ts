@@ -115,6 +115,18 @@ import type {
 } from './protocol/requests';
 import type { RecentLibraryEntry } from './recent-libraries';
 import type { AiApiFormat } from './ai-endpoints';
+import type { AiLocalEndpointDiscovery } from './ai-local-endpoints';
+
+/** Model list reply, including the endpoint's own vision-capability report. */
+export interface AiModelListResult {
+  models: string[];
+  /** Models the endpoint declared vision/multimodal (llama.cpp, newer Ollama). */
+  visionModels?: string[];
+  /** True when the endpoint reported capabilities at all. */
+  capabilitiesReported?: boolean;
+  errorKind?: string;
+  reason?: string;
+}
 import type { AiReliabilitySettings } from './ai-reliability';
 import type { FbxConversionResult } from './fbx-conversion';
 import type { ModelCompanionAsset } from './model-companions';
@@ -682,6 +694,8 @@ export interface SerpentLibraryApi {
     model: string | null;
     baseUrl: string;
     hasKey: boolean;
+    /** False for keyless local runtimes; readiness is `hasKey || !requiresApiKey`. */
+    requiresApiKey: boolean;
     enabledFields: { description: boolean; tags: boolean; rating: boolean };
     analysisSettings: {
       forceExistingTags: boolean;
@@ -956,7 +970,9 @@ export interface SerpentLibraryApi {
     apiFormat: AiApiFormat;
     apiKey?: string;
     baseUrl?: string;
-  }): Promise<LibraryApiResult<{ models: string[]; errorKind?: string; reason?: string }>>;
+  }): Promise<LibraryApiResult<AiModelListResult>>;
+  /** Probes loopback ports and WSL distribution addresses for local runtimes. */
+  listAiLocalEndpoints(): Promise<LibraryApiResult<AiLocalEndpointDiscovery>>;
   clearAiContent(input: { libraryId: string; scope: { kind: 'asset' | 'selection' | 'folder' | 'library'; assetIds?: string[]; folderId?: string }; confirm: boolean; fields?: Array<'description' | 'rating' | 'tags'> }): Promise<LibraryApiResult<{ clearedCount: number }>>;
   pauseAiJobs(input: { libraryId: string; jobIds?: string[] }): Promise<LibraryApiResult<{ pausedCount: number }>>;
   resumeAiJobs(input: { libraryId: string; jobIds?: string[] }): Promise<LibraryApiResult<{ resumedCount: number }>>;

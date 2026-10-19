@@ -466,10 +466,13 @@ import {
   DEFAULT_AI_API_FORMAT,
   DEFAULT_AI_LANGUAGES,
   DEFAULT_AI_MODELS,
+  aiApiFormatRequiresApiKey,
+  aiConfigHasCredentials,
   migrateLegacyProviderToApiFormat,
   normalizeAiLanguages,
   type AiApiFormat,
 } from "../shared/ai-endpoints";
+import { discoverLocalAiEndpoints } from "./ai-local-endpoint-probe";
 import { createArtifactResponse } from "./artifact-response";
 import { PreviewCache } from "./preview-cache";
 import {
@@ -1479,8 +1482,14 @@ function getDecryptedApiKey(): string {
   try {
     const encrypted = readFileSync(aiKeyPath());
     return safeStorage.decryptString(encrypted);
-  } catch {
-    throw new Error("AI API key not configured or could not be decrypted.");
+  } catch (error) {
+    // Keyless local runtimes (Ollama / llama.cpp / …) have no credential to
+    // decrypt. Returning an empty key keeps every existing call site working:
+    // adapters omit the Authorization header instead of failing the request.
+    if (!aiApiFormatRequiresApiKey(loadAiConfig().apiFormat)) return "";
+    throw new Error("AI API key not configured or could not be decrypted.", {
+      cause: error,
+    });
   }
 }
 
@@ -2730,7 +2739,12 @@ async function enqueueAutoAnalyzeAfterImport(
   folderId?: string,
 ): Promise<void> {
   const config = loadAiConfig();
-  if (!config.autoAnalyzeEnabled || !config.hasKey || !config.apiFormat) return;
+  if (
+    !config.autoAnalyzeEnabled ||
+    !aiConfigHasCredentials({ hasKey: config.hasKey, apiFormat: config.apiFormat })
+  ) {
+    return;
+  }
   if ((importedAssetIds.length === 0 && !folderId) || !workerClient) return;
 
   try {
@@ -2816,7 +2830,12 @@ async function processAiQueueBatch(
   maxJobs: number,
 ): Promise<{ processed: number; requeued: number }> {
   const config = loadAiConfig();
-  if (!config.hasKey || !workerClient) return { processed: 0, requeued: 0 };
+  if (
+    !aiConfigHasCredentials({ hasKey: config.hasKey, apiFormat: config.apiFormat }) ||
+    !workerClient
+  ) {
+    return { processed: 0, requeued: 0 };
+  }
   try {
     const apiKey = getDecryptedApiKey();
     // Keep each Worker admission bounded. A 32-job batch with 16 external
@@ -3162,6 +3181,7 @@ async function commandFor(
     case "ai.config.get.request":
     case "ai.config.set.request":
     case "ai.list-models.request":
+    case "ai.local-endpoints.request":
     case "ai.test-connection.request":
     case "ai.clear-content.request": {
       return executeAiMainCommand(request, {
@@ -3435,6 +3455,7 @@ async function handleLibraryRequest(
         return workerClient.request(command);
       },
       processAiQueue,
+      discoverLocalEndpoints: () => discoverLocalAiEndpoints(),
       logInfo: (scope, message, context) => {
         logger?.info(scope, message, context);
       },

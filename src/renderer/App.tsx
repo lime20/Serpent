@@ -189,7 +189,12 @@ import {
 import { resolveSearchFolderResults } from "./search-folder-results";
 import { useT, useLocale, translateForLocale, type AppLocale } from "./i18n";
 import type { AiApiFormat } from "../shared/ai-endpoints";
-import { DEFAULT_AI_API_FORMAT, DEFAULT_AI_MODELS } from "../shared/ai-endpoints";
+import {
+  DEFAULT_AI_API_FORMAT,
+  DEFAULT_AI_MODELS,
+  aiApiFormatRequiresApiKey,
+} from "../shared/ai-endpoints";
+import type { AiLocalEndpointDiscovery } from "../shared/ai-local-endpoints";
 import type { SerpentMcpSettingsApi } from "../shared/mcp";
 import type { HistoryStatus } from "../shared/protocol/responses";
 import { isEditableTextTarget } from "../shared/edit-context-menu";
@@ -2191,6 +2196,12 @@ function AppInner() {
     string | undefined
   >(undefined);
   const [aiSaveVerifying, setAiSaveVerifying] = useState(false);
+  /**
+   * Whether the *stored* format still needs an API key. False for a keyless
+   * local runtime, where an empty key store is the expected state rather than
+   * an unconfigured profile.
+   */
+  const [aiRequiresApiKey, setAiRequiresApiKey] = useState(true);
   const aiAutoConnectAttemptedRef = useRef(false);
   /** Fingerprint of credentials last proven by a successful probe. */
   const aiVerifiedFingerprintRef = useRef<string | null>(null);
@@ -12399,6 +12410,9 @@ function AppInner() {
     setAiModel(result.value.model ?? DEFAULT_AI_MODELS[DEFAULT_AI_API_FORMAT]);
     setAiBaseUrl(result.value.baseUrl ?? "");
     setAiHasKey(result.value.hasKey);
+    // Keyless local runtimes never store a key, so the stored format — not
+    // `hasKey` — decides whether the heartbeat and analyze affordance run.
+    setAiRequiresApiKey(result.value.requiresApiKey ?? true);
     setAiDescriptionEnabled(result.value.enabledFields.description);
     setAiTagsEnabled(result.value.enabledFields.tags);
     setAiRatingEnabled(result.value.enabledFields.rating);
@@ -12428,12 +12442,23 @@ function AppInner() {
     ].join("\u0001");
   }
 
+  /**
+   * Stored-config readiness. A keyless local runtime is ready with an empty
+   * key store, so the analyze affordance, heartbeat and context menu all read
+   * this instead of `aiHasKey` alone.
+   */
+  const aiCredentialsReady = aiHasKey || !aiRequiresApiKey;
+
   const testAiConnectionFromDialog = useCallback(async (): Promise<{
     success: boolean;
     reason?: string;
   }> => {
     if (!api) return { success: false, reason: t("aiConfig.testFailed") };
-    if (!aiApiKey.trim() && !aiHasKey) {
+    if (
+      !aiApiKey.trim() &&
+      !aiHasKey &&
+      aiApiFormatRequiresApiKey(aiApiFormat)
+    ) {
       setAiConnectionState("disconnected");
       setAiConnectionReason(t("aiConfig.testFailed"));
       aiVerifiedFingerprintRef.current = null;
@@ -12468,11 +12493,10 @@ function AppInner() {
       setAiConnectionState("connected");
       setAiConnectionReason(undefined);
       aiVerifiedFingerprintRef.current = fingerprint;
-      // Typed key is not on disk until save — only mark ready when stored.
-      if (aiHasKey || !aiApiKey.trim()) {
-        setAiHasKey(true);
-      } else {
-        // Probe OK with unsaved key: refresh from disk (still false until save).
+      // Only a stored key makes a cloud profile ready. A typed key is not on
+      // disk until save, and a keyless local profile never stores one — a
+      // successful probe must not be mistaken for a stored credential.
+      if (!aiHasKey) {
         void api.getAiConfig().then((cfg) => {
           if (cfg.ok) setAiHasKey(cfg.value.hasKey);
         });
@@ -12516,7 +12540,13 @@ function AppInner() {
     } = options;
     if (!api) return false;
     const draft = aiConfigPersistDraftRef.current;
-    if (!draft.apiKey.trim() && !draft.hasKey) {
+    // A keyless local endpoint saves without a credential; every other format
+    // still needs a typed or previously stored key.
+    if (
+      !draft.apiKey.trim() &&
+      !draft.hasKey &&
+      aiApiFormatRequiresApiKey(draft.apiFormat)
+    ) {
       if (showNotice) {
         setError(t("toast.aiConfigSaveFailed"));
       }
@@ -12549,7 +12579,8 @@ function AppInner() {
       }
       return false;
     }
-    setAiHasKey(true);
+    setAiHasKey(Boolean(draft.apiKey.trim()) || draft.hasKey);
+    setAiRequiresApiKey(aiApiFormatRequiresApiKey(draft.apiFormat));
     if (clearApiKeyDraft) setAiApiKey("");
     if (showNotice) setNotice(t("toast.aiConfigSaved"));
     if (verifyConnection) {
@@ -12588,7 +12619,9 @@ function AppInner() {
   }
 
   async function saveAiConfig() {
-    if (!api || (!aiApiKey.trim() && !aiHasKey)) return;
+    if (!api || (!aiApiKey.trim() && !aiHasKey && aiApiFormatRequiresApiKey(aiApiFormat))) {
+      return;
+    }
     const alreadyVerified =
       aiVerifiedFingerprintRef.current === aiCredentialFingerprint() &&
       aiConnectionState === "connected";
@@ -12614,13 +12647,13 @@ function AppInner() {
       aiAutoConnectAttemptedRef.current = false;
       return;
     }
-    if (!aiHasKey || aiAutoConnectAttemptedRef.current) return;
+    if (!aiCredentialsReady || aiAutoConnectAttemptedRef.current) return;
     aiAutoConnectAttemptedRef.current = true;
     void testAiConnectionFromDialog();
   }, [
     appSettingsOpen,
     appSettingsCategory,
-    aiHasKey,
+    aiCredentialsReady,
     testAiConnectionFromDialog,
   ]);
 
@@ -12641,7 +12674,7 @@ function AppInner() {
 
   const probeStoredAiConnection = useCallback(async () => {
     if (!api) return;
-    if (!shouldRunAiConnectionHeartbeat(aiHasKey)) {
+    if (!shouldRunAiConnectionHeartbeat(aiCredentialsReady)) {
       setAiConnectionState("disconnected");
       setAiConnectionReason(undefined);
       aiVerifiedFingerprintRef.current = null;
@@ -12651,7 +12684,16 @@ function AppInner() {
       prev === "connected" || prev === "connecting" ? prev : "connecting",
     );
     const cfg = await api.getAiConfig();
-    if (!cfg.ok || !cfg.value.hasKey || !cfg.value.apiFormat || !cfg.value.model) {
+    // The stored format decides readiness, not the key file: a keyless local
+    // runtime is configured with no key at all.
+    const storedReady =
+      cfg.ok && (cfg.value.hasKey || cfg.value.requiresApiKey === false);
+    if (
+      !cfg.ok ||
+      !storedReady ||
+      !cfg.value.apiFormat ||
+      !cfg.value.model
+    ) {
       setAiConnectionState("disconnected");
       setAiConnectionReason(t("aiConfig.testFailed"));
       aiVerifiedFingerprintRef.current = null;
@@ -12684,10 +12726,10 @@ function AppInner() {
     setAiConnectionState("error");
     setAiConnectionReason(result.value.reason ?? t("aiConfig.testFailed"));
     aiVerifiedFingerprintRef.current = null;
-  }, [api, aiHasKey, locale, t]);
+  }, [api, aiCredentialsReady, locale, t]);
 
   useEffect(() => {
-    if (!shouldRunAiConnectionHeartbeat(aiHasKey)) {
+    if (!shouldRunAiConnectionHeartbeat(aiCredentialsReady)) {
       return;
     }
     queueMicrotask(() => {
@@ -12704,10 +12746,12 @@ function AppInner() {
       window.clearInterval(timer);
       window.removeEventListener("focus", onFocus);
     };
-  }, [aiHasKey, probeStoredAiConnection]);
+  }, [aiCredentialsReady, probeStoredAiConnection]);
 
   async function fetchAiModelsFromDialog(): Promise<{
     models: string[];
+    visionModels?: string[];
+    capabilitiesReported?: boolean;
     reason?: string;
   }> {
     if (!api) return { models: [], reason: t("aiConfig.fetchModelsFailed") };
@@ -12728,8 +12772,35 @@ function AppInner() {
     }
     return {
       models: result.value.models,
+      ...(result.value.visionModels
+        ? { visionModels: result.value.visionModels }
+        : {}),
+      ...(result.value.capabilitiesReported === undefined
+        ? {}
+        : { capabilitiesReported: result.value.capabilitiesReported }),
       reason: result.value.reason,
     };
+  }
+
+  async function fetchAiLocalEndpointsFromDialog(): Promise<
+    AiLocalEndpointDiscovery & { reason?: string }
+  > {
+    const empty = { endpoints: [], wslAvailable: false, wslDistros: [] };
+    if (!api) {
+      return { ...empty, reason: t("aiConfig.localDiscoverFailed") };
+    }
+    const result = await api.listAiLocalEndpoints();
+    if (!result.ok) {
+      return {
+        ...empty,
+        reason: toMessage(
+          result.error,
+          t("aiConfig.localDiscoverFailed"),
+          locale,
+        ),
+      };
+    }
+    return result.value;
   }
 
   async function handleAnalyzeClick(
@@ -12754,7 +12825,7 @@ function AppInner() {
       setError(t("toast.aiAnalyzeNoAsset"));
       return;
     }
-    if (!aiHasKey) {
+    if (!aiCredentialsReady) {
       setError(t("command.reason.aiNotConfigured"));
       void loadAiConfig();
       return;
@@ -15912,6 +15983,7 @@ function AppInner() {
             onSave={() => void saveAiConfig()}
             onTestConnection={testAiConnectionFromDialog}
             onFetchModels={fetchAiModelsFromDialog}
+            onDiscoverLocalEndpoints={fetchAiLocalEndpointsFromDialog}
           />
         }
         aiUiPrefs={aiUiPrefs}
@@ -16643,10 +16715,11 @@ function AppInner() {
         }}
         onClearAiContent={(assetIds) => { void handleClearAiContent(assetIds); }}
         canAnalyze={
-          aiAnalyzeConnectionReady(aiHasKey, aiConnectionState) && !aiAnalyzing
+          aiAnalyzeConnectionReady(aiCredentialsReady, aiConnectionState) &&
+          !aiAnalyzing
         }
         aiDisconnected={aiAnalyzeShowsDisconnectGlyph(
-          aiHasKey,
+          aiCredentialsReady,
           aiConnectionState,
         )}
         onCopyToLinked={(folder, assetIds) => { void copyManagedSelectionToLinked(folder, assetIds); }}

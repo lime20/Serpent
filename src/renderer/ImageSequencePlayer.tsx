@@ -205,6 +205,7 @@ export function ImageSequencePlayer({
           displayTransform={displayTransform}
           fitRequestToken={fitRequestToken}
           fitKeybinds="f-only"
+          imageBackdropControls={false}
           isFullscreen={isFullscreen}
           keyboardShortcutsDisabled={keyboardShortcutsDisabled}
           onPresentationReady={onPresentationReady}

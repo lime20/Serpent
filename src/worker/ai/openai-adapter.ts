@@ -214,16 +214,27 @@ export class OpenAIVendorAdapter implements VendorAdapter {
     return this.#analyzeChatCompletions(request, signal);
   }
 
+  /**
+   * Local runtimes (Ollama, llama.cpp, …) are keyless. An empty key must send
+   * no Authorization header at all: some of them reject a bare `Bearer ` and
+   * it also keeps a meaningless credential out of the request.
+   */
+  #jsonHeaders(): Record<string, string> {
+    return this.apiKey
+      ? {
+          Authorization: `Bearer ${this.apiKey}`,
+          'Content-Type': 'application/json',
+        }
+      : { 'Content-Type': 'application/json' };
+  }
+
   async probeConnection(signal?: AbortSignal): Promise<void> {
     let response: Response;
     try {
       if (this.wireFormat === 'openai_responses') {
         response = await this._fetch(resolveOpenAiResponsesUrl(this.baseUrl), {
           method: 'POST',
-          headers: {
-            Authorization: `Bearer ${this.apiKey}`,
-            'Content-Type': 'application/json',
-          },
+          headers: this.#jsonHeaders(),
           body: JSON.stringify({
             model: this.model,
             input: 'Reply with the single word OK.',
@@ -237,10 +248,7 @@ export class OpenAIVendorAdapter implements VendorAdapter {
           resolveOpenAiChatCompletionsUrl(this.baseUrl),
           {
             method: 'POST',
-            headers: {
-              Authorization: `Bearer ${this.apiKey}`,
-              'Content-Type': 'application/json',
-            },
+            headers: this.#jsonHeaders(),
             body: JSON.stringify({
               model: this.model,
               messages: [
@@ -308,10 +316,7 @@ export class OpenAIVendorAdapter implements VendorAdapter {
         try {
           response = await this._fetch(endpoint, {
             method: 'POST',
-            headers: {
-              Authorization: `Bearer ${this.apiKey}`,
-              'Content-Type': 'application/json',
-            },
+            headers: this.#jsonHeaders(),
             body: JSON.stringify(body),
             signal,
           });
@@ -476,10 +481,7 @@ export class OpenAIVendorAdapter implements VendorAdapter {
         try {
           response = await this._fetch(endpoint, {
             method: 'POST',
-            headers: {
-              Authorization: `Bearer ${this.apiKey}`,
-              'Content-Type': 'application/json',
-            },
+            headers: this.#jsonHeaders(),
             body: JSON.stringify(requestBody),
             signal,
           });

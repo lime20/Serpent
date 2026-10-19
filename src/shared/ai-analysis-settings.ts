@@ -171,6 +171,25 @@ export function normalizeAiMaxDescriptionWordsEn(raw: unknown): number {
   return clampInt(raw, 10, 200, DEFAULT_AI_ANALYSIS_SETTINGS.maxDescriptionWordsEn);
 }
 
+/**
+ * Content-integrity rules shared by every vendor.
+ *
+ * Analysis is a factual cataloguing task, not a moderation pass: a model that
+ * answers "private content" instead of naming what is on screen produces a
+ * useless asset record, and a rating docked for subject matter makes the score
+ * incomparable across a library. Kept as data so the prompt text and its tests
+ * cannot drift apart.
+ */
+export const AI_CONTENT_INTEGRITY_RULES: readonly string[] = [
+  '内容准确性优先：description 与 tags 必须如实陈述画面中实际存在的内容（主体、场景、动作、物件、文字、材质、视觉特征），画面呈现什么就描述什么',
+  '不因题材敏感而模糊化：画面涉及隐私、成人、暴力、医疗、证件、个人信息等敏感内容时同样如实描述；不得以「隐私内容」「敏感图片」「不便描述」等笼统措辞代替，不得省略、代称、规避或拒绝输出',
+  '保持中性表述：仅作事实陈述，不作道德、合规或合法性评判，不追加免责声明、内容警告或与画面无关的推测',
+] as const;
+
+/** Rating must follow the rubric only, never the subject matter. */
+export const AI_RATING_NEUTRALITY_RULE =
+  '评分只依据该标准判断，不因题材敏感而抬高或压低。';
+
 const STYLE_LABEL: Record<AiOutputStyle, string> = {
   normal: '正常',
   concise: '精简',
@@ -223,6 +242,9 @@ export function buildAiAnalysisSystemPrompt(input: {
   prompt += `未启用的字段请输出 null 或空数组（tags 用 []）。\n\n`;
   prompt += `你必须严格遵守：\n`;
   prompt += `+ 以「${STYLE_LABEL[settings.outputStyle]}」风格输出所有内容\n`;
+  for (const rule of AI_CONTENT_INTEGRITY_RULES) {
+    prompt += `+ ${rule}\n`;
+  }
   prompt += `+ 目标语言：${language}。description 与 tags[] 中每一个标签都必须使用该语言书写（Serpent-sbnt）\n`;
   prompt += `+ ${languageRule}\n`;
   prompt += `+ 只输出纯 JSON 对象，不要 Markdown 代码围栏，不要 XML/HTML 标签（例如不要写 </description>）\n`;
@@ -233,7 +255,7 @@ export function buildAiAnalysisSystemPrompt(input: {
   }
 
   if (enabledFields.rating) {
-    prompt += `+ 关于评分。必须给出 1 到 5 的整数（尽量不要 null）。评分标准：${settings.ratingRubric}\n`;
+    prompt += `+ 关于评分。必须给出 1 到 5 的整数（尽量不要 null）。评分标准：${settings.ratingRubric} ${AI_RATING_NEUTRALITY_RULE}\n`;
   }
 
   if (enabledFields.description) {

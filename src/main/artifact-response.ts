@@ -129,6 +129,14 @@ export async function createArtifactResponse(
       const size = fileStat.size;
       const commonHeaders = {
         'Accept-Ranges': 'bytes',
+        // The `serpent` scheme is registered with `corsEnabled: true`
+        // (serpent-protocol-privileges.ts), but without an allow-origin header
+        // every artifact/source response stayed cross-origin: Chromium tainted
+        // any canvas that drew them, so the renderer's pixel reads
+        // (viewer chrome contrast, mirage-tank texture detection) silently fell
+        // back to "no data". No credentials are involved — media is read with
+        // plain GET/Range and identified only by opaque artifact ids.
+        'Access-Control-Allow-Origin': '*',
         'Cache-Control': 'public, max-age=31536000, immutable',
         'Content-Type': mimeType,
       };

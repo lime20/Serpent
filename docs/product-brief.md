@@ -335,16 +335,16 @@ MVP 只支持导出整个资源库，不提供按合集导出。
 
 MVP：
 
-- 只连接云端 AI 模型。
-- 用户填写并自行承担第三方模型 API Key 与费用。
+- 以连接云端 AI 模型为默认路径，同时支持用户自己启动的本地模型服务。
+- 云端由用户填写并自行承担第三方模型 API Key 与费用；本地端点不需要 API Key。
 - Serpent 不提供官方代理、账号额度或商业化 AI 服务。
 - 内置 DashScope、OpenAI Chat Completions、OpenAI Responses、Anthropic Messages 和 Gemini Native 适配器；它们使用统一的 Serpent 内部请求与结构化输出协议，但分别处理各供应商 API 差异。
+- 支持连接用户自行启动的本地模型服务（Ollama / LM Studio / llama.cpp / vLLM），包括运行在 WSL 中的服务：本地端点免 API Key，可自动探测本机回环端口与 `wsl hostname -I` 给出的发行版地址，并复用同一套 OpenAI 兼容请求路径与结构化输出回退。
 
 后续：
 
 - 自动下载和管理推荐本地模型。
 - 允许用户选择本地模型文件。
-- 连接 Ollama 等本地模型服务。
 - 继续支持用户 API Key；是否提供官方代理服务在商业化阶段再决定。
 
 ## 实现与原型验证项

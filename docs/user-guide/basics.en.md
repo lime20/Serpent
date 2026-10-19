@@ -116,6 +116,7 @@ Double-click an asset to open the fullscreen viewer (press `Esc` to exit):
   - Images and videos can be panned by dragging with the left or middle mouse button;
   - 3D models support mouse drag rotation, zoom, and HDRI lighting switching;
   - The toolbar provides 90° clockwise rotation, horizontal/vertical flip, fit-to-view (numpad `.`), and fullscreen.
+- **Transparent images and "mirage-tank" textures**: images with transparency (PNG, WebP, …) gain an **Image background** selector in the viewer toolbar (Default / Black / White / Gray / Checkerboard) so semi-transparent pixels composite over a known matte. When the sampled frame matches a mirage-tank encoding, a hint appears and **Switch background** flips between the black- and white-backed pictures. The choice is remembered and applied to images opened later.
 
 ![3D viewer and Inspector](../assets/ui/3D-inspector.png)
 
