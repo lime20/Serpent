@@ -9,6 +9,7 @@ import {
 } from 'node:fs';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
+import { isDeepStrictEqual } from 'node:util';
 
 export const SUPPORTED_PLATFORMS = new Set([
   'darwin-arm64',
@@ -81,6 +82,16 @@ export function sha256File(filePath) {
   const hash = createHash('sha256');
   hash.update(readFileSync(filePath));
   return hash.digest('hex');
+}
+
+export function assertSourceLocksMatch(localSourceLock, archiveSourceLock, platform) {
+  assertPlatform(platform);
+  // Adding another target must not invalidate an already promoted bundle.
+  // Keep every shared pin and all metadata for this target in the comparison.
+  const forPlatform = (lock) => ({ ...lock, platforms: lock.platforms?.[platform] ?? null });
+  if (!isDeepStrictEqual(forPlatform(localSourceLock), forPlatform(archiveSourceLock))) {
+    throw new Error(`Media bundle source-lock.json does not match this checkout for ${platform}; update trust metadata separately.`);
+  }
 }
 
 function assertSha256(value, description) {

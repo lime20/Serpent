@@ -2,17 +2,25 @@
 
 ## 基础命令
 
+在当前仓库根目录执行。使用 Node.js 24（`package.json` 要求 `>=24 <25`；`.nvmrc` 固定为 24.15.0），首次克隆或复制到新目录后，先按锁文件安装依赖：
+
+```bash
+npm ci --include=dev     # 安装运行时及构建依赖，保留 package-lock.json
+```
+
+不同目录的 `node_modules` 不共享。若 `prepackage` 提示 `Cannot find package 'adm-zip'`，应在报错对应的仓库目录执行上述命令；只安装单个包不能保证其他构建依赖完整。Windows PowerShell 若限制运行 `npm.ps1`，可将命令中的 `npm` 换成 `npm.cmd`。
+
 ```bash
 npm run package          # 打包应用（含构建）→ out/Serpent-<platform>-<arch>/
 npm run make             # 生成安装包 → out/make/（macOS dmg / Windows zip；Linux 用 npm run make:appimage）
 npm run verify:package   # 校验打包产物（ASAR、native 模块、媒体组件）
 ```
 
-`package`/`make` 的 prepackage/premake 钩子会先确保媒体依赖可用：
+`package`/`make` 的 prepackage/premake 钩子会先确保媒体依赖可用；Forge 的 postPackage 钩子再校验生成的应用包：
 
 - 媒体二进制（`media-binaries ensure`，必要时从锁定 release 恢复后校验来源与哈希）
 - ufbx WASM 产物（`verify-ufbx-wasm`，哈希锁 `scripts/ufbx-wasm-lock.json`）
-- 打包产物完整性（`verify:package`：ASAR、better_sqlite3.node、Host utilities）
+- 打包产物完整性（`verify:package`：ASAR、better_sqlite3.node、Host utilities，以及工作区自动化 API 声明的版本和命令覆盖情况）
 
 `package`/`make` 会更新 dev 的 Electron binary，跑完执行 `npm run rebuild:native` 恢复。
 
@@ -24,6 +32,47 @@ npm run media:ensure
 ```
 
 离线环境可设置 `SERPENT_MEDIA_AUTO_ACQUIRE=0`，此时校验失败会直接报错，不会联网下载。
+
+### 媒体包的 source-lock 不一致
+
+`resources/media-binaries/bundle-lock.json` 固定发布包 URL、压缩包 SHA-256 和清单 SHA-256；`source-lock.json` 固定组件来源、版本及构建元数据。获取媒体包时，`assertSourceLocksMatch` 比较全部共享字段和目标平台的 `platforms[platform]` 配置，不比较其他平台条目；JSON 对象键顺序不影响结果。
+
+旧脚本比较整份 JSON：仓库新增 Linux 配置后，即使 Windows 组件未变，也会拒绝已有 Windows 发布包。当前修复保留共享组件、registry、工具链和目标平台元数据检查，并继续校验发布包、清单和文件哈希。出现 `source-lock.json does not match this checkout for win32-x64` 时，说明这些参与比对的字段仍有差异，需要对齐仓库配置与已晋升的发布包；不要通过改哈希或跳过校验解决。
+
+### 缺少自动化 API 声明
+
+`verify:package` 还读取工作区的 `docs/internal/skills/serpent-automation/automation-api.d.ts`，检查其 `AUTOMATION_API_VERSION` 及命令集合与 `src/automation/command-registry.ts` 一致。当前打包钩子不会自动生成此文件；即使已出现 `out/Serpent-win32-x64/Serpent.exe`，postPackage 失败也表示打包尚未通过完整校验。
+
+若报 `Workspace is missing generated automation declarations`，优先恢复与当前源码配套的声明文件。文件确实缺失时，可在仓库根目录通过以下 PowerShell 命令生成；它从当前注册表读取版本、命令 ID 和脚本类型，不覆盖已有文件：
+
+```powershell
+@'
+const fs = require('node:fs');
+const path = require('node:path');
+const Module = require('node:module');
+const ts = require('typescript');
+Module._extensions['.ts'] = (mod, file) => mod._compile(
+  ts.transpileModule(fs.readFileSync(file, 'utf8'), {
+    compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022, esModuleInterop: true },
+  }).outputText, file);
+const registry = require('./src/automation/command-registry.ts');
+const metadata = registry.describeAutomationCommands();
+const commands = metadata.commands.map(c => "  | '" + c.commandId + "'").join('\n');
+const header = '// Generated from src/automation/command-registry.ts.\n'
+  + 'export declare const AUTOMATION_API_VERSION: ' + metadata.apiVersion + ';\n'
+  + 'export type AutomationCommandId =\n' + commands + ';\n\n';
+const target = path.resolve('docs/internal/skills/serpent-automation/automation-api.d.ts');
+if (fs.existsSync(target)) throw new Error('Declaration file already exists; review it before updating.');
+fs.mkdirSync(path.dirname(target), { recursive: true });
+fs.writeFileSync(target, header + registry.generateAutomationTypeDeclaration(), { encoding: 'utf8', flag: 'wx' });
+'@ | node
+```
+
+生成后重新运行 `npm run package`；已有应用包可先用 `npm run verify:package` 检查。不要只添加版本标记或空声明来通过门禁。
+
+### Windows 验证记录（2026-10-19）
+
+在 Windows x64、Node.js 24.14.1 / npm 11.11.0 下完成依赖安装和上述修复：相关单测 20 项通过、5 项因平台跳过，类型检查通过；`npm run package` 完整退出成功，`npm run verify:package` 通过。应用输出为 `out/Serpent-win32-x64/Serpent.exe`。本记录不代表已验证安装器、安装/卸载流程或 macOS/Linux 打包。
 
 ## 发布流水线（release:local）
 
@@ -47,7 +96,7 @@ npm run release:local
 跳过慢阶段的选项：`--skip-verify` / `--skip-media` / `--skip-e2e`。单独跑某阶段：`npm run release:<phase>`（e2e 阶段为 `npm run release:e2e:packaged`）。
 
 ```mermaid
-flowchart LR
+flowchart TD
     C[代码变更] --> L[Lint + typecheck]
     L --> U[Unit tests]
     U --> W[Worker integration]

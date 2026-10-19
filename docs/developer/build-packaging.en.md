@@ -2,17 +2,25 @@
 
 ## Basic commands
 
+Run commands from the current repository root. Use Node.js 24 (`package.json` requires `>=24 <25`; `.nvmrc` pins 24.15.0). After cloning or copying the repository to a new directory, install dependencies from the lockfile first:
+
+```bash
+npm ci --include=dev     # install runtime and build dependencies; preserve package-lock.json
+```
+
+Separate checkouts do not share `node_modules`. If `prepackage` reports `Cannot find package 'adm-zip'`, run the command above in the checkout named in the error; installing only that package does not ensure all build dependencies are present. On Windows PowerShell, use `npm.cmd` instead of `npm` if execution policy blocks `npm.ps1`.
+
 ```bash
 npm run package          # package the app (includes build) → out/Serpent-<platform>-<arch>/
 npm run make             # build installers → out/make/ (macOS dmg / Windows zip; Windows setup built with Inno Setup)
 npm run verify:package   # verify the packaged output (ASAR, native modules, media)
 ```
 
-`package`/`make` run pre-hooks that ensure the media dependencies are available:
+`package`/`make` run prepackage/premake hooks to ensure media dependencies are available; Forge's postPackage hook then validates the resulting application:
 
 - Media binaries (`media-binaries ensure` — recover from the pinned release when needed, then verify provenance and hashes)
 - ufbx WASM (`verify-ufbx-wasm` — hash-locked via `scripts/ufbx-wasm-lock.json`)
-- Packaged output (`verify:package`: ASAR, better_sqlite3.node, Host utilities)
+- Packaged output (`verify:package`: ASAR, better_sqlite3.node, Host utilities, and the workspace automation API declaration's version and command coverage)
 
 `package`/`make` update the dev Electron binary — run `npm run rebuild:native` afterwards.
 
@@ -26,6 +34,47 @@ npm run media:ensure
 
 Set `SERPENT_MEDIA_AUTO_ACQUIRE=0` in an offline environment to make a failed
 verification stop immediately instead of downloading.
+
+### Media bundle source-lock mismatch
+
+`resources/media-binaries/bundle-lock.json` pins the release URL, archive SHA-256, and manifest SHA-256; `source-lock.json` pins component sources, versions, and build metadata. During acquisition, `assertSourceLocksMatch` compares all shared fields and the target's `platforms[platform]` configuration, excluding other platform entries. JSON object key order does not affect equality.
+
+The old script compared the entire JSON object: adding Linux configuration to the checkout could reject an existing Windows release even when its components were unchanged. The fix retains checks for shared components, registry, toolchain, and target metadata, as well as archive, manifest, and file hashes. If `source-lock.json does not match this checkout for win32-x64` still appears, those compared fields differ; align the checkout with the promoted bundle. Do not change hashes or skip verification to suppress the error.
+
+### Missing automation API declarations
+
+`verify:package` also reads the workspace file `docs/internal/skills/serpent-automation/automation-api.d.ts` and checks its `AUTOMATION_API_VERSION` and command coverage against `src/automation/command-registry.ts`. Packaging hooks do not currently generate this file. An existing `out/Serpent-win32-x64/Serpent.exe` does not mean validation succeeded if postPackage failed.
+
+For `Workspace is missing generated automation declarations`, first restore declarations that match the current source. If the file is absent, the following PowerShell command generates it from the registry's version, command IDs, and script types. Run it from the repository root; it refuses to overwrite an existing file:
+
+```powershell
+@'
+const fs = require('node:fs');
+const path = require('node:path');
+const Module = require('node:module');
+const ts = require('typescript');
+Module._extensions['.ts'] = (mod, file) => mod._compile(
+  ts.transpileModule(fs.readFileSync(file, 'utf8'), {
+    compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022, esModuleInterop: true },
+  }).outputText, file);
+const registry = require('./src/automation/command-registry.ts');
+const metadata = registry.describeAutomationCommands();
+const commands = metadata.commands.map(c => "  | '" + c.commandId + "'").join('\n');
+const header = '// Generated from src/automation/command-registry.ts.\n'
+  + 'export declare const AUTOMATION_API_VERSION: ' + metadata.apiVersion + ';\n'
+  + 'export type AutomationCommandId =\n' + commands + ';\n\n';
+const target = path.resolve('docs/internal/skills/serpent-automation/automation-api.d.ts');
+if (fs.existsSync(target)) throw new Error('Declaration file already exists; review it before updating.');
+fs.mkdirSync(path.dirname(target), { recursive: true });
+fs.writeFileSync(target, header + registry.generateAutomationTypeDeclaration(), { encoding: 'utf8', flag: 'wx' });
+'@ | node
+```
+
+Run `npm run package` again after generation; an existing package can first be checked with `npm run verify:package`. Adding only a version marker or empty declarations does not establish API compatibility.
+
+### Windows validation record (2026-10-19)
+
+Dependency installation and these fixes were validated on Windows x64 with Node.js 24.14.1 / npm 11.11.0: 20 related tests passed, 5 were skipped for platform reasons, and type checking passed. `npm run package` completed successfully and `npm run verify:package` passed. The executable is `out/Serpent-win32-x64/Serpent.exe`. This record does not cover installers, installation/uninstallation, or macOS/Linux packaging.
 
 ## Release pipeline (release:local)
 
@@ -49,7 +98,7 @@ Phases: `verify` → `media` → `package` → `e2e` → `make` → `checksums`
 Skip slow phases with `--skip-verify` / `--skip-media` / `--skip-e2e`. Run one phase with `npm run release:<phase>` (the e2e phase is `npm run release:e2e:packaged`).
 
 ```mermaid
-flowchart LR
+flowchart TD
     C[Change] --> L[Lint + typecheck]
     L --> U[Unit tests]
     U --> W[Worker integration]
