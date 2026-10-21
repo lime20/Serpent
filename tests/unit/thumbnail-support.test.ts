@@ -41,6 +41,12 @@ describe("assetSupportsThumbnail", () => {
     expect(
       assetSupportsThumbnail({ mediaType: "image", displayName: "light.exr" }),
     ).toBe(true);
+    expect(
+      assetSupportsThumbnail({ mediaType: "other", displayName: "deck.pptx" }),
+    ).toBe(true);
+    expect(
+      assetSupportsThumbnail({ mediaType: "other", displayName: "deck.ppt" }),
+    ).toBe(true);
   });
 });
 
@@ -96,6 +102,11 @@ describe("shouldShowThumbnailFailureBadge", () => {
 });
 
 describe("isBenignThumbnailErrorCode", () => {
+  it("treats missing embedded presentation covers and legacy converter failures as benign", () => {
+    expect(isBenignThumbnailErrorCode("PRESENTATION_THUMBNAIL_UNAVAILABLE")).toBe(true);
+    expect(isBenignThumbnailErrorCode("LIBREOFFICE_REQUIRED")).toBe(true);
+  });
+
   it("treats unsupported format as benign", () => {
     expect(isBenignThumbnailErrorCode("UNSUPPORTED_FORMAT")).toBe(true);
     expect(isBenignThumbnailErrorCode("FFMPEG_REQUIRED")).toBe(false);

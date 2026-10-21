@@ -29,6 +29,7 @@ export interface AssetCommandActions {
   readonly rename: (assetId: string) => void;
   readonly aiAnalyze: (assetId: string) => void;
   readonly clearAiContent?: (assetIds: string[]) => void;
+  readonly refreshThumbnails?: (assetIds: string[]) => void;
   readonly moveToTrash: (assetIds: string[]) => void;
   readonly deleteFromDisk: (assetIds: string[]) => void;
   readonly moveToFolder: (assetIds: string[]) => void;
@@ -57,6 +58,7 @@ export interface AssetCommandContext extends CommandContext {
   readonly semanticSearchEnabled: boolean;
   /** Current encoder can consume the asset directly or through its preview. */
   readonly similarSourceSupported: boolean;
+  readonly thumbnailRefreshSupported?: boolean;
   readonly actions: AssetCommandActions;
 }
 
@@ -247,6 +249,14 @@ export const assetCommandDefinitions: readonly AssetCommandDefinition[] = [
     run: (ctx) => withPrimaryAsset(ctx, (id) => ctx.actions.rename(id)),
   },
   // ---- 元数据 ----
+  {
+    id: 'asset.refresh-thumbnail',
+    title: (ctx) => t(ctx, 'command.asset.refreshThumbnail'),
+    group: 'metadata',
+    visible: (ctx) => !ctx.assetDeleted && ctx.thumbnailRefreshSupported === true,
+    disabledReason: unavailableReason,
+    run: (ctx) => withPrimaryAsset(ctx, (id) => ctx.actions.refreshThumbnails?.([id])),
+  },
   {
     id: 'asset.ai-analyze',
     title: (ctx) => t(ctx, 'command.asset.aiAnalyze'),

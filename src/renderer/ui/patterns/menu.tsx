@@ -1,4 +1,4 @@
-import type { HTMLAttributes, ReactNode, Ref } from "react";
+import { Fragment, type HTMLAttributes, type ReactNode, type Ref } from "react";
 
 export type MenuNodeKind = "item" | "submenu" | "separator";
 
@@ -174,7 +174,9 @@ export function MenuSurface({
       data-ui-pattern="menu-surface"
       role="menu"
     >
-      {nodes.map((node) => renderNode(node, 0))}
+      {nodes.map((node) => (
+        <Fragment key={node.id}>{renderNode(node, 0)}</Fragment>
+      ))}
     </div>
   );
 }

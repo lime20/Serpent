@@ -114,6 +114,9 @@ export type ArtifactAdmissionDecision = Readonly<{
 /** Durable intent marker for an on-demand playback fallback job. */
 export const EXPLICIT_PROXY_FALLBACK_MARKER = 'EXPLICIT_PROXY_FALLBACK';
 
+/** Durable intent marker for a user-requested card thumbnail rebuild. */
+export const EXPLICIT_THUMBNAIL_REFRESH_MARKER = 'EXPLICIT_THUMBNAIL_REFRESH';
+
 const PROXY_JOB_KINDS = new Set<ArtifactJobKind>([
   'generate_webm_proxy',
   'generate_audio_proxy',

@@ -26,13 +26,15 @@ export interface RetryFailedConnection {
   };
 }
 
-/** Failures that retrying can never fix — the source or the format is the problem. */
+/** Failures requiring a source/configuration change or explicit user retry. */
 export const PERMANENT_DERIVED_FAILURE_CODES: ReadonlySet<string> = new Set([
   'SOURCE_NOT_FOUND',
   'FBX_SOURCE_NOT_FOUND',
   'LIMIT_EXCEEDED',
   'FBX_LIMIT_EXCEEDED',
   'UNSUPPORTED_FORMAT',
+  'PRESENTATION_THUMBNAIL_UNAVAILABLE',
+  'LIBREOFFICE_REQUIRED', // Historical converter failures remain terminal.
   'MIME_TYPE_UNSUPPORTED',
   'FBX_NOT_FBX',
   'FBX_NO_MESHES',

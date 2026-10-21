@@ -11,6 +11,7 @@
 
 import { FBX_CONVERT_ERROR_CODES } from './fbx-conversion';
 import { MODEL_THUMBNAIL_ERROR_CODES } from './model-thumbnail-protocol';
+import { isSupportedPresentationExtension } from './media-formats';
 
 export type ThumbnailSupportMediaType =
   | "image"
@@ -27,6 +28,7 @@ export function assetSupportsThumbnail(asset: {
   displayName: string;
 }): boolean {
   if (asset.mediaType === "text") return false;
+  if (asset.mediaType === "other" && isSupportedPresentationExtension(asset.displayName)) return true;
   // Documents (PDF etc.) get a first-page thumbnail; HTML thumbnails render
   // offscreen in Main (Serpent-8ca259).
   if (asset.mediaType === "document") return true;
@@ -39,6 +41,8 @@ export function assetSupportsThumbnail(asset: {
  * Error codes that mean "no thumbnail expected" rather than a user-actionable
  * failure. Covers:
  * - `UNSUPPORTED_FORMAT` — no generator exists for the format;
+ * - presentation cover unavailable (including historical converter failures)
+ *   — the card keeps its generic file icon;
  * - MODEL_* — the offscreen render failed (context lost/parse error…);
  *   spec 3D-16 says a failed model thumbnail degrades to the generic 3D icon,
  *   never a failure badge, so these are suppressed exactly like
@@ -50,6 +54,8 @@ export function assetSupportsThumbnail(asset: {
 export function isBenignThumbnailErrorCode(errorCode: string | undefined): boolean {
   return (
     errorCode === "UNSUPPORTED_FORMAT"
+    || errorCode === "PRESENTATION_THUMBNAIL_UNAVAILABLE"
+    || errorCode === "LIBREOFFICE_REQUIRED"
     || (errorCode !== undefined && MODEL_THUMBNAIL_ERROR_CODES.has(errorCode))
     || (errorCode !== undefined && FBX_CONVERT_ERROR_CODES.has(errorCode))
   );

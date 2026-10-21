@@ -83,6 +83,9 @@ export function MediaJobsDialog({
   const t = useT();
   const { locale } = useLocale();
   if (!open) return null;
+  const failedAiJobIds = aiJobs?.jobs
+    .filter((job) => job.status === "failed")
+    .map((job) => job.jobId) ?? [];
 
   return (
     <div className="dialog-backdrop" role="presentation">
@@ -149,14 +152,7 @@ export function MediaJobsDialog({
               <button
                 className="secondary-button"
                 disabled={mediaJobs.failed === 0}
-                onClick={() =>
-                  void onControlMediaJobs(
-                    "retry",
-                    mediaJobs.jobs
-                      .filter((job) => job.status === "failed")
-                      .map((job) => job.jobId),
-                  )
-                }
+                onClick={() => void onControlMediaJobs("retry")}
                 type="button"
               >
                 {t("dialog.mediaJobs.retryFailed")}
@@ -201,9 +197,13 @@ export function MediaJobsDialog({
                       <strong className="media-jobs-grid-cell">{job.status}</strong>
                       <span
                         className="media-jobs-grid-cell"
-                        data-hover-tip={job.errorCode ?? undefined}
+                        data-hover-tip={job.errorCode === "PRESENTATION_THUMBNAIL_UNAVAILABLE" || job.errorCode === "LIBREOFFICE_REQUIRED"
+                          ? t("preview.presentationThumbnailUnavailable")
+                          : job.errorCode ?? undefined}
                       >
-                        {job.errorDetail ??
+                        {job.errorCode === "PRESENTATION_THUMBNAIL_UNAVAILABLE" || job.errorCode === "LIBREOFFICE_REQUIRED"
+                          ? t("preview.presentationThumbnailUnavailable")
+                          : job.errorDetail ??
                           job.errorCode ??
                           `${Math.round(job.progress * 100)}%`}
                       </span>
@@ -322,14 +322,9 @@ export function MediaJobsDialog({
                   </button>
                   <button
                     className="secondary-button"
-                    disabled={aiJobs.failed === 0}
+                    disabled={failedAiJobIds.length === 0}
                     onClick={() =>
-                      void onControlAiJobs(
-                        "retry",
-                        aiJobs.jobs
-                          .filter((job) => job.status === "failed")
-                          .map((job) => job.jobId),
-                      )
+                      void onControlAiJobs("retry", failedAiJobIds)
                     }
                     type="button"
                   >

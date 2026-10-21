@@ -533,6 +533,7 @@ export const en = {
       rename: "Rename…",
       aiAnalyze: "AI analyze",
       clearAiContent: "Clear AI info",
+      refreshThumbnail: "Refresh thumbnail",
       moveToTrash: "Move to Trash",
       deleteFromDisk: "Delete from disk…",
       // Linked assets keep exactly one delete action (2026-09-15 decision):
@@ -565,6 +566,7 @@ export const en = {
       removeTag: "Remove tags…",
       aiAnalyzeMissing: "AI analyze missing ({count})",
       aiAnalyze: "AI analyze ({count})",
+      refreshThumbnails: "Refresh thumbnails ({count})",
       copy: "Copy ({count})",
       // Serpent-d7acfa: batch items that act on selected folder cards.
       appearance: "Set icon & color… ({count})",
@@ -2132,6 +2134,7 @@ export const en = {
   },
   preview: {
     ffmpegRequired: "This install is missing the media component needed for a video playback proxy. Reinstall or repair Serpent and try again.",
+    presentationThumbnailUnavailable: 'This presentation has no usable embedded thumbnail, so a thumbnail cannot be generated.',
     oiioRequired: "This install is missing OpenImageIO, so this image format cannot be decoded. Install or configure oiiotool and try again.",
     sharpUnavailable: "The image decoder is unavailable, so a preview cannot be generated. Reinstall the app and try again.",
     mediaProcessingFailed: "Media processing failed. The source file may be damaged or use an unsupported codec.",
@@ -2426,6 +2429,12 @@ export const en = {
     bridgeUnavailable: "Cannot connect to the Serpent desktop service. Please restart the app.",
     workspaceRestoreFailed: "Could not restore the workspace.",
     thumbnailFailed: "Thumbnail generation failed. Check the source file and try again.",
+    thumbnailRefreshQueued: "Queued {count} thumbnail refresh task(s).",
+    thumbnailRefreshPartial: "Queued {count} thumbnail refresh task(s); {failedCount} could not be submitted and {skippedCount} were skipped.",
+    thumbnailRefreshSkipped: "Queued {count} thumbnail refresh task(s); {skippedCount} were skipped.",
+    thumbnailRefreshNone: "The selection contains no assets with refreshable thumbnails.",
+    thumbnailRefreshFailed: "Could not queue thumbnail refresh.",
+    thumbnailRefreshStateFailed: "Could not load the refreshed thumbnail state. Try again later.",
     aiAnalyzeDoneFields: "AI analysis finished: wrote {fieldCount} fields and {tagCount} tags.",
     aiContentCleared: "Cleared AI content for {count} assets.",
     aiContentClearFailed: "Failed to clear AI content.",
@@ -2714,6 +2723,9 @@ export const en = {
     code: {
       CANCELLED: "Cancelled; nothing was changed.",
       INTERNAL_ERROR: "Serpent hit an unexpected error and could not finish. Open Diagnostics to inspect this session’s log, then retry. If you were opening a library, copy the whole library folder onto a local disk and open it from there.",
+      PRESENTATION_THUMBNAIL_UNAVAILABLE: 'This presentation has no usable embedded thumbnail, so a thumbnail cannot be generated.',
+      // Compatibility with historical error codes.
+      LIBREOFFICE_REQUIRED: 'This presentation has no usable embedded thumbnail, so a thumbnail cannot be generated.',
       INVALID_LIBRARY_NAME: "Enter a library name that is safe across platforms.",
       INVALID_LIBRARY_PATH: "The selected location is not a usable folder for a library. Choose an existing writable folder — not a file, and not a disconnected drive.",
       INVALID_FOLDER_NAME: "The name contains unsupported characters.",
@@ -2820,6 +2832,9 @@ export const en = {
       IO_ERROR: "The operating system reported a disk I/O error.",
       SHARP_UNAVAILABLE: "The Sharp image engine is unavailable.",
       FFMPEG_REQUIRED: "The media component was not found in this install; video thumbnails are unavailable.",
+      PRESENTATION_THUMBNAIL_UNAVAILABLE: 'This presentation has no usable embedded thumbnail, so a thumbnail cannot be generated.',
+      // Compatibility with historical error codes.
+      LIBREOFFICE_REQUIRED: 'This presentation has no usable embedded thumbnail, so a thumbnail cannot be generated.',
       OIIO_REQUIRED: "OpenImageIO was not found in this install; EXR/TGA decoding is unavailable.",
       MEDIA_PROCESSING_FAILED: "Media processing failed. Check whether the source file is damaged, and see the app logs for details.",
       PALETTE_SOURCE_NOT_READY: "The thumbnail or video poster for this revision is not ready yet.",

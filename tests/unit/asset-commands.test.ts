@@ -13,6 +13,33 @@ import type { ResolvedMenuItem } from '../../src/renderer/commands/command-types
 
 const registry = createCommandRegistry(assetCommandDefinitions);
 
+describe('manual thumbnail refresh', () => {
+  it('offers refresh for supported ready or missing thumbnails', () => {
+    const { ctx } = makeCtx({ thumbnailRefreshSupported: true });
+    expect(resolveIds(ctx)).toContain('asset.refresh-thumbnail');
+    const item = findItem(registry.resolveMenu(ctx), 'asset.refresh-thumbnail');
+    expect(item.label).toBe('刷新缩略图');
+    expect(item.disabled).toBe(false);
+  });
+
+  it('hides unsupported and deleted assets and disables missing sources', () => {
+    expect(resolveIds(makeCtx({ thumbnailRefreshSupported: false }).ctx))
+      .not.toContain('asset.refresh-thumbnail');
+    expect(resolveIds(makeCtx({ thumbnailRefreshSupported: true, assetDeleted: true }).ctx))
+      .not.toContain('asset.refresh-thumbnail');
+    const { ctx } = makeCtx({ thumbnailRefreshSupported: true, assetAvailable: false });
+    expect(findItem(registry.resolveMenu(ctx), 'asset.refresh-thumbnail').disabled).toBe(true);
+  });
+
+  it('routes the current asset to the refresh action', () => {
+    const ids: string[][] = [];
+    const { ctx } = makeCtx({ thumbnailRefreshSupported: true });
+    const refreshContext = { ...ctx, actions: { ...ctx.actions, refreshThumbnails: (assetIds: string[]) => { ids.push(assetIds); } } };
+    registry.get('asset.refresh-thumbnail')?.run(refreshContext);
+    expect(ids).toEqual([['asset-1']]);
+  });
+});
+
 interface RecordedCall {
   readonly action: string;
   readonly args: readonly unknown[];
@@ -491,7 +518,7 @@ describe('run 委托到 actions 回调包', () => {
 });
 
 describe('注册表完整性', () => {
-  it('18 条定义全部注册且 id 唯一（createCommandRegistry 未抛错）', () => {
+  it('19 条定义全部注册且 id 唯一（createCommandRegistry 未抛错）', () => {
     expect(registry.list().map((def) => def.id)).toEqual([
       'asset.restore',
       'asset.delete-permanent',
@@ -507,6 +534,7 @@ describe('注册表完整性', () => {
       'asset.paste',
       'asset.copy-file-path',
       'asset.rename',
+      'asset.refresh-thumbnail',
       'asset.ai-analyze',
       'asset.clear-ai-content',
       'asset.move-to-trash',

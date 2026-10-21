@@ -1,4 +1,5 @@
 import path from "node:path";
+import { randomBytes } from "node:crypto";
 import { fileURLToPath } from "node:url";
 
 import react from "@vitejs/plugin-react";
@@ -90,21 +91,34 @@ function harmonyosFontFacePatchPlugin(): Plugin {
 }
 
 /**
- * Vite 8 dev client uses blob: SharedWorkers and WebSocket module runner; the
- * production CSP meta in index.html blocks those under Electron. Strip the meta
- * during `vite serve` only — packaged / `vite build` output keeps strict CSP.
+ * Permit Vite's inline React preamble with a nonce and its blob SharedWorker
+ * without removing CSP. Vite also applies the nonce to injected scripts/styles
+ * and its HMR client. Build output retains the production policy unchanged.
  */
 function devRelaxCspPlugin(): Plugin {
+  const nonce = randomBytes(18).toString("base64");
   return {
     name: "serpent-dev-relax-csp",
     apply: "serve",
+    config: () => ({ html: { cspNonce: nonce } }),
     transformIndexHtml: {
-      order: "pre",
+      order: "post",
       handler(html) {
-        return html.replace(
-          /<meta\s+http-equiv="Content-Security-Policy"[^>]*>\s*/iu,
-          "",
-        );
+        const policyMeta = /<meta\s+http-equiv="Content-Security-Policy"\s+content="([^"]+)"\s*\/?\s*>\s*/iu;
+        const policy = html.match(policyMeta)?.[1];
+        if (!policy) return html;
+        return {
+          html: html.replace(policyMeta, ""),
+          tags: [{
+            tag: "meta",
+            attrs: {
+              "http-equiv": "Content-Security-Policy",
+              content: `${policy.replace(/script-src\s+'self'/u, `script-src 'self' 'nonce-${nonce}'`)}; worker-src 'self' blob:`,
+            },
+            // Apply CSP before the scripts injected by Vite and React.
+            injectTo: "head-prepend",
+          }],
+        };
       },
     },
   };

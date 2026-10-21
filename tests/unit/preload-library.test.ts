@@ -21,6 +21,57 @@ vi.mock('../../src/preload/transport', () => ({
 import { failure, request } from '../../src/preload/transport';
 import { library } from '../../src/preload/bridge/library';
 
+test('library.retryMediaJobs keeps an explicit empty selection out of IPC', async () => {
+  vi.mocked(request).mockClear();
+  vi.mocked(request).mockResolvedValue({ ok: true, type: 'media.jobs.retried', retriedCount: 0 } as never);
+  await expect(library.retryMediaJobs({ libraryId: 'lib-1', jobIds: [] })).resolves.toEqual({
+    ok: true,
+    value: { retriedCount: 0 },
+  });
+  expect(request).not.toHaveBeenCalled();
+});
+
+test('library.retryMediaJobs forwards a nonempty selection through IPC', async () => {
+  vi.mocked(request).mockClear();
+  vi.mocked(request).mockResolvedValue({ ok: true, type: 'media.jobs.retried', retriedCount: 2 } as never);
+  await expect(library.retryMediaJobs({ libraryId: 'lib-1', jobIds: ['job-1', 'job-2'] })).resolves.toEqual({
+    ok: true,
+    value: { retriedCount: 2 },
+  });
+  expect(request).toHaveBeenCalledExactlyOnceWith({
+    type: 'media.retry-jobs.request',
+    libraryId: 'lib-1',
+    jobIds: ['job-1', 'job-2'],
+  });
+});
+
+test('library.retryAiJobs keeps an explicit empty selection out of IPC', async () => {
+  vi.mocked(request).mockClear();
+  vi.mocked(request).mockResolvedValue({ ok: true, type: 'ai.jobs.retried', retriedCount: 0 } as never);
+  await expect(library.retryAiJobs({ libraryId: 'lib-1', jobIds: [] })).resolves.toEqual({
+    ok: true,
+    value: { retriedCount: 0 },
+  });
+  expect(request).not.toHaveBeenCalled();
+});
+
+test.each([
+  ['pauseMediaJobs', 'pausedCount', 'media.jobs.paused'],
+  ['resumeMediaJobs', 'resumedCount', 'media.jobs.resumed'],
+  ['cancelMediaJobs', 'cancelledCount', 'media.jobs.cancelled'],
+  ['pauseAiJobs', 'pausedCount', 'ai.jobs.paused'],
+  ['resumeAiJobs', 'resumedCount', 'ai.jobs.resumed'],
+  ['cancelAiJobs', 'cancelledCount', 'ai.jobs.cancelled'],
+] as const)('library.%s does not treat an empty selection as all jobs', async (method, countKey, type) => {
+  vi.mocked(request).mockClear();
+  vi.mocked(request).mockResolvedValue({ ok: true, type, [countKey]: 0 } as never);
+  await expect(library[method]({ libraryId: 'lib-1', jobIds: [] })).resolves.toEqual({
+    ok: true,
+    value: { [countKey]: 0 },
+  });
+  expect(request).not.toHaveBeenCalled();
+});
+
 test('library.create sends the owned create request through transport', async () => {
   const opened = {
     ok: true as const,

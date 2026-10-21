@@ -258,9 +258,10 @@ const libraryService = new LibraryService({
         failAt: e2eTerminateProcessAt,
         terminateProcessAt: e2eTerminateProcessAt,
       }),
-  onDiagnostic: ({ scope, error, context }) => {
+  onDiagnostic: ({ scope, error, context, level }) => {
     try {
-      console.error(JSON.stringify({
+      const write = level === 'info' ? console.log : console.error;
+      write(JSON.stringify({
         timestamp: new Date().toISOString(),
         scope: `worker.${scope}`,
         context,

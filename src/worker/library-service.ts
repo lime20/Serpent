@@ -596,6 +596,9 @@ function safeMediaJobErrorDetail(errorCode: string): string {
       return 'The media component needed for video thumbnails is unavailable. Reinstall or repair Serpent.';
     case 'OIIO_REQUIRED':
       return 'The OpenImageIO component is unavailable. Reinstall or repair Serpent.';
+    case 'LIBREOFFICE_REQUIRED': // Historical stored failures use the current explanation.
+    case 'PRESENTATION_THUMBNAIL_UNAVAILABLE':
+      return 'This presentation does not contain a usable embedded cover image.';
     case 'STALE_REVISION':
       return 'The source changed before media processing finished. Retry the current revision.';
     case 'RAW_METADATA_EXTRACTION_FAILED':
@@ -818,6 +821,7 @@ import {
   VIDEO_EXTENSIONS,
   MODEL_EXTENSIONS,
   DOCUMENT_EXTENSIONS,
+  PRESENTATION_EXTENSIONS,
   FONT_EXTENSIONS,
   directImageMimeForExtension,
   imageDecoderForExtension,
@@ -826,6 +830,7 @@ import {
   isSupportedImageExtension,
   isSupportedModelExtension,
   isSupportedDocumentExtension,
+  isSupportedPresentationExtension,
   isSupportedFontExtension,
   fontMimeForExtension,
   isSupportedVideoExtension,
@@ -848,6 +853,7 @@ import {
   artifactKindForJob,
   artifactIdentityForPersistedRow,
   EXPLICIT_PROXY_FALLBACK_MARKER,
+  EXPLICIT_THUMBNAIL_REFRESH_MARKER,
   type ArtifactJobKind,
 } from './artifact-policy';
 import {
@@ -881,6 +887,11 @@ import {
   fontSampleQuerySuffix,
   readFontMetadata,
 } from './font-file-metadata';
+import {
+  extractPptxEmbeddedThumbnail,
+  isPresentationThumbnailGenerator,
+  PRESENTATION_EMBEDDED_THUMBNAIL_GENERATOR,
+} from './presentation-thumbnail';
 import {
   COMMON_IMAGE_COLOR_SPACE_OPTIONS,
   colorSpaceInfoFromName,
@@ -5075,6 +5086,8 @@ export interface LibraryServiceOptions {
 }
 
 export interface LibraryServiceDiagnostic {
+  /** Expected interruptions and unavailable optional features are informational. */
+  level?: 'info' | 'error';
   context?: Record<string, unknown>;
   error: unknown;
   scope: string;
@@ -7862,9 +7875,9 @@ export class LibraryService {
     );
   }
 
-  private diagnose(scope: string, error: unknown, context?: Record<string, unknown>): void {
+  private diagnose(scope: string, error: unknown, context?: Record<string, unknown>, level?: 'info' | 'error'): void {
     try {
-      this.options.onDiagnostic?.({ scope, error, context });
+      this.options.onDiagnostic?.({ scope, error, context, ...(level ? { level } : {}) });
     } catch {
       // Diagnostics are strictly best effort and must never replace the primary failure.
     }
@@ -22428,6 +22441,9 @@ export class LibraryService {
           WHEN kind = 'generate_thumbnail'
             AND error_code = '${IMPORTED_THUMBNAIL_NORMALIZATION_JOB}'
           THEN '${IMPORTED_THUMBNAIL_NORMALIZATION_JOB}'
+          WHEN kind = 'generate_thumbnail'
+            AND error_code = '${EXPLICIT_THUMBNAIL_REFRESH_MARKER}'
+          THEN '${EXPLICIT_THUMBNAIL_REFRESH_MARKER}'
           WHEN kind IN ('generate_webm_proxy', 'generate_audio_proxy')
             AND error_code = '${EXPLICIT_PROXY_FALLBACK_MARKER}'
           THEN '${EXPLICIT_PROXY_FALLBACK_MARKER}'
@@ -23164,28 +23180,55 @@ export class LibraryService {
   retryMediaJobs(libraryId: string, jobIds: string[]): { retriedCount: number } {
     if (jobIds.length === 0) return { retriedCount: 0 };
     const openLibrary = this.requireOpenLibrary(libraryId);
-    const retriedCount = sqliteRunInChunks({
-      connection: openLibrary.connection,
-      values: jobIds,
-      buildSql: (placeholders) =>
-        `UPDATE jobs SET status = 'queued', progress = 0.0, attempt_count = 0,
-                error_code = CASE
-                  WHEN error_code = '${IMPORTED_THUMBNAIL_NORMALIZATION_JOB}'
-                  THEN '${IMPORTED_THUMBNAIL_NORMALIZATION_JOB}'
-                  ELSE NULL
-                END,
-                error_detail = NULL, updated_at = ?
-          WHERE library_id = ?
-            AND kind IN (${MEDIA_JOB_KINDS.map(() => '?').join(',')})
-            AND status = 'failed'
-            AND job_id IN (${placeholders})`,
-      bind: (chunk) => [
-        new Date().toISOString(),
-        openLibrary.summary.libraryId,
-        ...MEDIA_JOB_KINDS,
-        ...chunk,
-      ],
-    });
+    this.assertLibraryWritable(openLibrary);
+    const now = new Date().toISOString();
+    const retriedCount = openLibrary.connection.transaction(() => {
+      // Task-panel retries are explicit requests too. A failed thumbnail may
+      // have replaced its original intent marker with a useful decoder error,
+      // so restore refresh intent from the user action and retire its terminal
+      // artifact before the replacement runs. Normalization keeps its cover.
+      sqliteRunInChunks({
+        connection: openLibrary.connection,
+        values: jobIds,
+        buildSql: (placeholders) =>
+          `UPDATE revision_artifacts SET invalidated_at = ?
+            WHERE kind = 'thumbnail' AND invalidated_at IS NULL
+              AND revision_id IN (
+                SELECT jobs.revision_id FROM jobs
+                JOIN assets ON assets.asset_id = jobs.asset_id
+                  AND assets.current_revision_id = jobs.revision_id
+                WHERE jobs.library_id = ? AND jobs.kind = 'generate_thumbnail'
+                  AND jobs.status = 'failed'
+                  AND COALESCE(jobs.error_code, '') <> '${IMPORTED_THUMBNAIL_NORMALIZATION_JOB}'
+                  AND jobs.job_id IN (${placeholders})
+              )`,
+        bind: (chunk) => [now, openLibrary.summary.libraryId, ...chunk],
+      });
+      return sqliteRunInChunks({
+        connection: openLibrary.connection,
+        values: jobIds,
+        buildSql: (placeholders) =>
+          `UPDATE jobs SET status = 'queued', progress = 0.0, attempt_count = 0,
+                  error_code = CASE
+                    WHEN error_code = '${IMPORTED_THUMBNAIL_NORMALIZATION_JOB}'
+                    THEN '${IMPORTED_THUMBNAIL_NORMALIZATION_JOB}'
+                    WHEN kind = 'generate_thumbnail'
+                    THEN '${EXPLICIT_THUMBNAIL_REFRESH_MARKER}'
+                    ELSE NULL
+                  END,
+                  error_detail = NULL, updated_at = ?
+            WHERE library_id = ?
+              AND kind IN (${MEDIA_JOB_KINDS.map(() => '?').join(',')})
+              AND status = 'failed'
+              AND job_id IN (${placeholders})`,
+        bind: (chunk) => [
+          now,
+          openLibrary.summary.libraryId,
+          ...MEDIA_JOB_KINDS,
+          ...chunk,
+        ],
+      });
+    })();
     if (retriedCount > 0) this.mediaJobSummaryCache.invalidate(libraryId);
     return { retriedCount };
   }
@@ -23808,10 +23851,12 @@ export class LibraryService {
 
   private thumbnailEligible(libraryId: string, relativePath: string): boolean {
     return this.claimsPluginThumbnail(libraryId, relativePath)
+      || isSupportedPresentationExtension(relativePath)
       || LibraryService.supportsThumbnail(relativePath);
   }
 
   static supportsThumbnail(filename: string): boolean {
+    if (isSupportedPresentationExtension(filename)) return true;
     return assetSupportsThumbnail({
       mediaType: LibraryService.toSummaryMediaType(
         LibraryService.detectMediaType(filename),
@@ -23891,6 +23936,9 @@ export class LibraryService {
     const ext = path.extname(assetPath).toLowerCase();
     const imageDecoder = imageDecoderForExtension(ext);
     const viewerDecoder = imageViewerDecoderForExtension(ext);
+    if (isSupportedPresentationExtension(ext)) {
+      return this.generatePresentationThumbnail(input, openLibrary, assetPath, revisionId, execution);
+    }
     if (mediaType === 'other' || (mediaType === 'image' && !imageDecoder)) {
       throw new LibraryServiceError('UNSUPPORTED_MEDIA_TYPE');
     }
@@ -24084,7 +24132,7 @@ export class LibraryService {
       throw new DOMException('Model thumbnail cancelled during render.', 'AbortError');
     }
     if (outcome.status === 'failed') {
-      this.writeModelThumbnailFailure(openLibrary, input.revisionId, outcome.errorCode);
+      this.writeThumbnailFailure(openLibrary, input.revisionId, outcome.errorCode, MODEL_THUMBNAIL_GENERATOR_VERSION);
       // The typed code lives on the failed artifact (the job's error_code);
       // the throw only routes into the queue's failure path.
       throw new LibraryServiceError('INTERNAL_ERROR', {
@@ -24236,15 +24284,15 @@ export class LibraryService {
   }
 
   /**
-   * Terminal failed-artifact row for a model (dedupes re-enqueue and feeds
+   * Terminal failed-artifact row for a thumbnail (dedupes re-enqueue and feeds
    * the thumbnailStatus map). No file is written; failed artifacts are never
    * served.
    */
-  private writeModelThumbnailFailure(
+  private writeThumbnailFailure(
     openLibrary: OpenLibrary,
     revisionId: string,
     errorCode: string,
-    generatorVersion: string = MODEL_THUMBNAIL_GENERATOR_VERSION,
+    generatorVersion: string,
   ): void {
     const artifactId = randomUUID();
     openLibrary.connection
@@ -24262,6 +24310,117 @@ export class LibraryService {
         errorCode,
         new Date().toISOString(),
       );
+  }
+
+  /**
+   * Generate a presentation thumbnail without changing the source media type.
+   * Only a decodable embedded PPTX cover can produce a new thumbnail.
+   * Presentations without one fail terminally without launching a process.
+   */
+  private async generatePresentationThumbnail(
+    input: { libraryId: string; assetId: string },
+    openLibrary: OpenLibrary,
+    assetPath: string,
+    revisionId: string,
+    execution: MediaExecutionContext,
+  ): Promise<{ artifactId: string }> {
+    if (path.extname(assetPath).toLowerCase() === '.pptx') {
+      const embedded = await extractPptxEmbeddedThumbnail(assetPath);
+      if (embedded) {
+        const artifactId = randomUUID();
+        const artifactsDir = this.artifactsDir(openLibrary);
+        mkdirSync(artifactsDir, { recursive: true });
+        const artifactRelPath = `${artifactId}.jpg`;
+        const artifactAbsPath = path.join(artifactsDir, artifactRelPath);
+        let width: number | null = null;
+        let height: number | null = null;
+        let decoded = false;
+        try {
+          await runSharpDecoder(
+            execution.signal,
+            execution.lane,
+            async () => {
+              const sharp = this.options.sharpFn ?? requireSharp();
+              const metadata = await sharp(embedded.bytes, {
+                failOn: 'none',
+                limitInputPixels: false,
+              }).metadata();
+              width = metadata.width ?? null;
+              height = metadata.height ?? null;
+              await sharp(embedded.bytes, {
+                failOn: 'none',
+                limitInputPixels: false,
+              })
+                .rotate()
+                .toColourspace('srgb')
+                .resize({ width: 512, height: 512, fit: 'inside', withoutEnlargement: true })
+                .jpeg({ quality: 72 })
+                .toFile(artifactAbsPath);
+            },
+            { sourceByteSize: embedded.bytes.byteLength, width, height },
+          );
+          decoded = true;
+        } catch (error) {
+          try {
+            rmSync(artifactAbsPath, { force: true });
+          } catch {
+            // Preserve the decode/system failure if partial-output cleanup fails.
+          }
+          execution.signal?.throwIfAborted();
+          if (error instanceof DOMException && error.name === 'AbortError') throw error;
+          const resourceError = asMediaResourceExhaustedError(error, 'presentation-thumbnail');
+          if (resourceError) throw resourceError;
+          if (classifyUnknownFailure(error) || publicReasonFromError(error)) throw error;
+          this.diagnose('presentation-thumbnail.embedded', error, {
+            libraryId: input.libraryId,
+            assetId: input.assetId,
+          });
+          // A signed but undecodable package preview is unavailable too.
+        }
+        if (decoded) {
+          try {
+            execution.signal?.throwIfAborted();
+            const outputStat = statSync(artifactAbsPath);
+            openLibrary.connection
+              .prepare(
+                `INSERT INTO revision_artifacts
+                   (artifact_id, revision_id, kind, mime_type, byte_size, file_path,
+                    width, height, generator_version, status, generated_at)
+                 VALUES (?, ?, 'thumbnail', 'image/jpeg', ?, ?, ?, ?, ?, 'ready', ?)`,
+              )
+              .run(
+                artifactId,
+                revisionId,
+                outputStat.size,
+                artifactRelPath,
+                width,
+                height,
+                PRESENTATION_EMBEDDED_THUMBNAIL_GENERATOR,
+                new Date().toISOString(),
+              );
+            return { artifactId };
+          } catch (error) {
+            try {
+              rmSync(artifactAbsPath, { force: true });
+            } catch {
+              // Preserve the commit failure if partial-output cleanup fails.
+            }
+            throw error;
+          }
+        }
+      }
+    }
+
+    execution.signal?.throwIfAborted();
+    this.writeThumbnailFailure(
+      openLibrary,
+      revisionId,
+      'PRESENTATION_THUMBNAIL_UNAVAILABLE',
+      `${PRESENTATION_EMBEDDED_THUMBNAIL_GENERATOR};failed`,
+    );
+    // The terminal artifact deduplicates automatic enqueue; the throw records
+    // a failed job for direct requests and explicit retries alike.
+    throw new LibraryServiceError('PRESENTATION_THUMBNAIL_UNAVAILABLE');
   }
 
   /** Media-type lookup for a single asset (used by the direct thumbnail path). */
@@ -24433,6 +24592,7 @@ export class LibraryService {
           },
           { sourceByteSize: pngBuffer.byteLength, width, height },
         );
+        execution.signal?.throwIfAborted();
         const outputStat = statSync(artifactAbsPath);
         openLibrary.connection
           .prepare(
@@ -24456,6 +24616,13 @@ export class LibraryService {
         await loadingTask.destroy();
       }
     } catch (error) {
+      try {
+        rmSync(artifactAbsPath, { force: true });
+      } catch {
+        // Preserve the original error if partial-output cleanup fails.
+      }
+      execution.signal?.throwIfAborted();
+      if (error instanceof DOMException && error.name === 'AbortError') throw error;
       // Failed PDF artifacts must land in revision_artifacts so the card shows
       // the failure badge and repair can re-run, mirroring image failures.
       try {
@@ -30047,13 +30214,26 @@ export class LibraryService {
           ? 'text/plain'
         : 'image/webp';
     if (mediaType === 'other') {
-      if (artifact?.status === 'ready' && artifact.generatorVersion.startsWith('plugin:')) {
+      if (
+        artifact?.status === 'ready'
+        && (artifact.generatorVersion.startsWith('plugin:')
+          || isPresentationThumbnailGenerator(artifact.generatorVersion))
+      ) {
         return {
           mediaType: 'image',
           status: 'ready',
           kind: 'thumbnail',
           artifactId: artifact.artifactId,
           mimeType: artifact.mimeType,
+        };
+      }
+      if (artifact?.status === 'failed' && isPresentationThumbnailGenerator(artifact.generatorVersion)) {
+        return {
+          mediaType,
+          status: 'failed',
+          kind,
+          mimeType,
+          errorCode: artifact.errorCode ?? 'MEDIA_PROCESSING_FAILED',
         };
       }
       return {
@@ -30406,6 +30586,7 @@ export class LibraryService {
     kind: 'thumbnail' | 'webm_proxy' | 'audio_proxy';
   }): string {
     const openLibrary = this.requireOpenLibrary(input.libraryId);
+    this.assertLibraryWritable(openLibrary);
     const asset = openLibrary.connection
       .prepare(
         `SELECT relative_file_path, location_kind, linked_folder_id,
@@ -30475,26 +30656,38 @@ export class LibraryService {
     return openLibrary.connection.transaction(() => {
       const active = openLibrary.connection
         .prepare(
-          `SELECT job_id
+          `SELECT job_id, status
              FROM jobs
             WHERE asset_id = ?
+              AND revision_id = ?
               AND kind = ?
               AND status IN ('queued', 'running', 'paused')
             ORDER BY updated_at DESC
             LIMIT 1`,
         )
-        .get(input.assetId, jobKind) as { job_id: string } | undefined;
+        .get(input.assetId, asset.current_revision_id, jobKind) as {
+          job_id: string;
+          status: 'queued' | 'running' | 'paused';
+        } | undefined;
       if (active) {
         if (explicitProxyFallback) {
           openLibrary.connection.prepare(
             'UPDATE jobs SET priority = MAX(priority, 300), error_code = ?, updated_at = ? WHERE job_id = ?',
           ).run(EXPLICIT_PROXY_FALLBACK_MARKER, new Date().toISOString(), active.job_id);
-        } else {
+          return active.job_id;
+        } else if (active.status === 'running') {
+          // A claimed job already owns its decode/normalization intent. Join
+          // that work without invalidating the cover it may be replacing.
           openLibrary.connection.prepare(
             'UPDATE jobs SET priority = MAX(priority, 300), updated_at = ? WHERE job_id = ?',
           ).run(new Date().toISOString(), active.job_id);
+          return active.job_id;
+        } else {
+          openLibrary.connection.prepare(
+            `UPDATE jobs SET status = 'queued', priority = MAX(priority, 300),
+                    error_code = ?, error_detail = NULL, updated_at = ? WHERE job_id = ?`,
+          ).run(EXPLICIT_THUMBNAIL_REFRESH_MARKER, new Date().toISOString(), active.job_id);
         }
-        return active.job_id;
       }
 
       if (input.kind === 'webm_proxy' || input.kind === 'audio_proxy') {
@@ -30512,6 +30705,8 @@ export class LibraryService {
         ).run(new Date().toISOString(), asset.current_revision_id);
       }
 
+      if (active) return active.job_id;
+
       const jobId = randomUUID();
       const now = new Date().toISOString();
       openLibrary.connection
@@ -30527,7 +30722,7 @@ export class LibraryService {
           input.assetId,
           asset.current_revision_id,
           jobKind,
-          explicitProxyFallback ? EXPLICIT_PROXY_FALLBACK_MARKER : null,
+          explicitProxyFallback ? EXPLICIT_PROXY_FALLBACK_MARKER : EXPLICIT_THUMBNAIL_REFRESH_MARKER,
           now,
           now,
         );
@@ -32222,6 +32417,9 @@ export class LibraryService {
     // fallback while their low-priority normalization job is queued. The
     // queue must not invalidate the only usable card before that job runs.
     if (isImportedThumbnailGenerator(generatorVersion)) return true;
+    if (isSupportedPresentationExtension(relativeFilePath)) {
+      return isPresentationThumbnailGenerator(generatorVersion);
+    }
     const mediaType = LibraryService.detectMediaType(relativeFilePath);
     if (kind === 'video_poster') {
       return mediaType === 'audio'
@@ -32565,6 +32763,7 @@ export class LibraryService {
       ...AUDIO_EXTENSION_NAMES,
       ...MODEL_EXTENSIONS.map((extension) => extension.slice(1)),
       ...DOCUMENT_EXTENSIONS.map((extension) => extension.slice(1)),
+      ...PRESENTATION_EXTENSIONS.map((extension) => extension.slice(1)),
       // Serpent-485aeb: font cards render a real sample line offscreen in Main.
       ...FONT_EXTENSIONS.map((extension) => extension.slice(1)),
     ];
@@ -32895,7 +33094,8 @@ export class LibraryService {
       if (!schedulableIds.has(row.asset_id)) continue;
       const detectedMediaType = LibraryService.detectMediaType(row.relative_file_path);
       const mediaType = detectedMediaType === 'other'
-        && this.claimsPluginThumbnail(libraryId, row.relative_file_path)
+        && (this.claimsPluginThumbnail(libraryId, row.relative_file_path)
+          || isSupportedPresentationExtension(row.relative_file_path))
         ? 'image'
         : detectedMediaType;
       const sourceDirect = isSourceDirectPreview({
@@ -33275,6 +33475,7 @@ export class LibraryService {
                 AND status = 'queued'
                 AND kind = 'generate_thumbnail'
                 AND COALESCE(error_code, '') <> '${IMPORTED_THUMBNAIL_NORMALIZATION_JOB}'
+                AND COALESCE(error_code, '') <> '${EXPLICIT_THUMBNAIL_REFRESH_MARKER}'
                 ${assetClause}
                 AND EXISTS (
                   SELECT 1
@@ -33345,6 +33546,7 @@ export class LibraryService {
                 AND jobs.status = 'queued'
                 AND jobs.kind IN (${readyArtifactJobKinds.map(() => '?').join(',')})
                 AND COALESCE(jobs.error_code, '') <> '${IMPORTED_THUMBNAIL_NORMALIZATION_JOB}'
+                AND COALESCE(jobs.error_code, '') <> '${EXPLICIT_THUMBNAIL_REFRESH_MARKER}'
                 ${pumpAssetIds === undefined
                   ? ''
                   : pumpAssetIds.length === 0
@@ -33614,6 +33816,16 @@ export class LibraryService {
       const isImportedThumbnailNormalization =
         job.kind === 'generate_thumbnail'
         && job.error_code === IMPORTED_THUMBNAIL_NORMALIZATION_JOB;
+      const isExplicitThumbnailRefresh = job.kind === 'generate_thumbnail'
+        && job.error_code === EXPLICIT_THUMBNAIL_REFRESH_MARKER;
+      const retryIntent = isImportedThumbnailNormalization
+        ? IMPORTED_THUMBNAIL_NORMALIZATION_JOB
+        : isExplicitThumbnailRefresh
+          ? EXPLICIT_THUMBNAIL_REFRESH_MARKER
+          : (job.kind === 'generate_webm_proxy' || job.kind === 'generate_audio_proxy')
+            && job.error_code === EXPLICIT_PROXY_FALLBACK_MARKER
+            ? EXPLICIT_PROXY_FALLBACK_MARKER
+            : null;
 
       // Admission is checked again after the durable claim. Queue insertion
       // and claim are separate SQLite turns, so an ignore rule, delete, source
@@ -33648,7 +33860,8 @@ export class LibraryService {
       // Admission still needs an image thumbnail role so the provider can run.
       const claimMediaType = claimAsset
         && detectedClaimMediaType === 'other'
-        && this.claimsPluginThumbnail(libraryId, claimAsset.relative_file_path)
+        && (this.claimsPluginThumbnail(libraryId, claimAsset.relative_file_path)
+          || isSupportedPresentationExtension(claimAsset.relative_file_path))
         ? 'image'
         : detectedClaimMediaType;
       const claimSourceDirect = claimAsset
@@ -33719,12 +33932,14 @@ export class LibraryService {
         // A normalization job intentionally runs while the copied artifact is
         // still ready and while the source may qualify for source-direct
         // serving. It owns a replacement transaction, not a new primary row.
-        sourceDirect: isImportedThumbnailNormalization ? false : claimSourceDirect,
+        sourceDirect: isImportedThumbnailNormalization || isExplicitThumbnailRefresh
+          ? false
+          : claimSourceDirect,
         // A durable proxy row is created only by the explicit viewer fallback
         // path. Legacy automatic rows are rejected by the policy instead of
         // being allowed to consume another FFmpeg slot.
         explicitRequest: job.error_code === EXPLICIT_PROXY_FALLBACK_MARKER,
-        readyArtifact: isImportedThumbnailNormalization
+        readyArtifact: isImportedThumbnailNormalization || isExplicitThumbnailRefresh
           ? false
           : currentArtifact?.status === 'ready'
             && !headerOnlyImageMetadata
@@ -33777,10 +33992,7 @@ export class LibraryService {
         });
       } catch (error) {
         if (!(error instanceof LibraryWriteCoordinatorError)) throw error;
-        const retryErrorCode = job.kind === 'generate_thumbnail'
-          && job.error_code === IMPORTED_THUMBNAIL_NORMALIZATION_JOB
-          ? IMPORTED_THUMBNAIL_NORMALIZATION_JOB
-          : 'JOB_LEASE_BUSY';
+        const retryErrorCode = retryIntent ?? 'JOB_LEASE_BUSY';
         openLibrary.connection.prepare(
           'UPDATE jobs SET status = \'queued\', error_code = ?, updated_at = ? WHERE job_id = ? AND status = \'running\'',
         ).run(retryErrorCode, new Date().toISOString(), job.job_id);
@@ -34135,14 +34347,7 @@ export class LibraryService {
             preserveLateArtifacts: isImportedThumbnailNormalization,
           });
           const cooldownMs = mediaResourceGuard.recordFailure();
-          const retryErrorCode = isImportedThumbnailNormalization
-            ? IMPORTED_THUMBNAIL_NORMALIZATION_JOB
-            : (
-              (job.kind === 'generate_webm_proxy' || job.kind === 'generate_audio_proxy')
-              && job.error_code === EXPLICIT_PROXY_FALLBACK_MARKER
-            )
-              ? EXPLICIT_PROXY_FALLBACK_MARKER
-              : MEDIA_RESOURCE_EXHAUSTED_ERROR_CODE;
+          const retryErrorCode = retryIntent ?? MEDIA_RESOURCE_EXHAUSTED_ERROR_CODE;
           openLibrary.connection.prepare(
             `UPDATE jobs
                 SET status = 'queued', error_code = ?,
@@ -34173,14 +34378,7 @@ export class LibraryService {
           });
           // Lease loss must not leave the job stuck in `running`; requeue so a
           // later wave (or process restart recovery) can claim it again.
-          const retryErrorCode = isImportedThumbnailNormalization
-            ? IMPORTED_THUMBNAIL_NORMALIZATION_JOB
-            : (
-              (job.kind === 'generate_webm_proxy' || job.kind === 'generate_audio_proxy')
-              && job.error_code === EXPLICIT_PROXY_FALLBACK_MARKER
-            )
-              ? EXPLICIT_PROXY_FALLBACK_MARKER
-              : 'JOB_LEASE_LOST';
+          const retryErrorCode = retryIntent ?? 'JOB_LEASE_LOST';
           openLibrary.connection.prepare(
             "UPDATE jobs SET status = 'queued', error_code = ?, updated_at = ? WHERE job_id = ? AND status = 'running'",
           ).run(retryErrorCode, new Date().toISOString(), job.job_id);
@@ -34207,7 +34405,7 @@ export class LibraryService {
             assetId: job.asset_id,
             kind: job.kind,
             status: state,
-          });
+          }, (error instanceof Error && error.name === 'AbortError') || error === controller.signal.reason ? 'info' : 'error');
           processed += 1;
           continue;
         }
@@ -34252,7 +34450,7 @@ export class LibraryService {
             new Date().toISOString(),
             job.job_id,
           );
-        this.diagnose('media-job.failed', error, {
+        if (errorCode !== 'LIBREOFFICE_REQUIRED' && errorCode !== 'PRESENTATION_THUMBNAIL_UNAVAILABLE') this.diagnose('media-job.failed', error, {
           libraryId,
           jobId: job.job_id,
           assetId: job.asset_id,

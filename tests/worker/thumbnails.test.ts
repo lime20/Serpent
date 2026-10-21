@@ -3,6 +3,7 @@ import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 
+import AdmZip from 'adm-zip';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 const extractAuthorFromExifMock = vi.hoisted(() => vi.fn(async () => null as string | null));
@@ -22,6 +23,7 @@ import {
 } from '../../src/worker/media-concurrency';
 import { importNoConflict as sharedImportNoConflict } from './import-no-conflict';
 import { videoPosterGeneratorVersion } from '../../src/worker/video-poster-seek';
+import { EXPLICIT_THUMBNAIL_REFRESH_MARKER } from '../../src/worker/artifact-policy';
 
 const CURRENT_VIDEO_POSTER_GENERATOR = videoPosterGeneratorVersion('8.1');
 
@@ -2123,7 +2125,7 @@ describe('processThumbnailQueue', () => {
     expect(mediaJobOfKind(service, created.libraryId, 'generate_thumbnail')).toMatchObject({
       status: 'queued',
       attemptCount: 0,
-      errorCode: null,
+      errorCode: EXPLICIT_THUMBNAIL_REFRESH_MARKER,
     });
     expect(status.failed).toBe(0);
 
@@ -3094,6 +3096,87 @@ describe('visible-window header probe (Serpent-visible-window)', () => {
     expect(row.mime_type).toBe('image/jpeg');
     expect(row.generator_version).toContain('pdfjs@');
     db.close();
+
+    service.closeAll();
+  });
+
+  it('generates a thumbnail from a PPTX package thumbnail', async () => {
+    const root = temporaryRoot();
+    const service = new LibraryService();
+    const created = service.createLibrary({ displayName: 'PPTX', selectedParentPath: root });
+    const sourcePath = path.join(root, 'cover.pptx');
+    const archive = new AdmZip();
+    archive.addFile('docProps/thumbnail.png', VALID_1X1_PNG);
+    archive.writeZip(sourcePath);
+    importNoConflict(service, created.libraryId, sourcePath);
+
+    const asset = service.listAssets({ libraryId: created.libraryId, recursive: true })[0]!;
+    expect(asset.mediaType).toBe('other');
+
+    const result = (await service.generateThumbnail({ libraryId: created.libraryId, assetId: asset.assetId }))!;
+    expect(result.artifactId).toBeTruthy();
+
+    const artifactPath = path.join(created.libraryPath, '.serpent', 'artifacts', `${result.artifactId}.jpg`);
+    expect(existsSync(artifactPath)).toBe(true);
+
+    const db = new TestDatabase(path.join(created.libraryPath, '.serpent', 'library.db'));
+    const row = db.prepare('SELECT kind, status, mime_type, generator_version FROM revision_artifacts WHERE artifact_id = ?').get(result.artifactId) as { kind: string; status: string; mime_type: string; generator_version: string };
+    expect(row).toEqual({
+      kind: 'thumbnail',
+      status: 'ready',
+      mime_type: 'image/jpeg',
+      generator_version: 'pptx-embedded-thumbnail@1',
+    });
+    db.close();
+
+    service.closeAll();
+  });
+
+  it('queues PPTX presentation thumbnails without classifying them as documents', () => {
+    const root = temporaryRoot();
+    const service = new LibraryService();
+    const created = service.createLibrary({ displayName: 'PPTX queue', selectedParentPath: root });
+    const sourcePath = path.join(root, 'queue.pptx');
+    const archive = new AdmZip();
+    archive.addFile('docProps/thumbnail.png', VALID_1X1_PNG);
+    archive.writeZip(sourcePath);
+    importNoConflict(service, created.libraryId, sourcePath);
+
+    const asset = service.listAssets({ libraryId: created.libraryId, recursive: true })[0]!;
+    expect(service.enqueueThumbnailJobs(created.libraryId, {
+      assetIds: [asset.assetId],
+      skipStaleRepair: true,
+    })).toBe(1);
+
+    const db = new TestDatabase(path.join(created.libraryPath, '.serpent', 'library.db'));
+    const job = db.prepare(
+      "SELECT kind, status FROM jobs WHERE asset_id = ? AND kind = 'generate_thumbnail'",
+    ).get(asset.assetId) as { kind: string; status: string };
+    expect(job).toEqual({ kind: 'generate_thumbnail', status: 'queued' });
+    db.close();
+
+    service.closeAll();
+  });
+
+  it('fails a presentation without an embedded thumbnail without launching a process', async () => {
+    const root = temporaryRoot();
+    const spawnCalls: string[] = [];
+    const service = new LibraryService({
+      spawnFn: async (command) => {
+        spawnCalls.push(command);
+        throw new Error('unexpected process');
+      },
+    });
+    const created = service.createLibrary({ displayName: 'PPT without cover', selectedParentPath: root });
+    const sourcePath = path.join(root, 'without-cover.ppt');
+    writeFileSync(sourcePath, Buffer.from('legacy PowerPoint placeholder'));
+    importNoConflict(service, created.libraryId, sourcePath);
+
+    const asset = service.listAssets({ libraryId: created.libraryId, recursive: true })[0]!;
+    await expect(service.generateThumbnail({ libraryId: created.libraryId, assetId: asset.assetId })).rejects.toMatchObject({
+      code: 'PRESENTATION_THUMBNAIL_UNAVAILABLE',
+    });
+    expect(spawnCalls.length).toBe(0);
 
     service.closeAll();
   });

@@ -520,6 +520,7 @@ export const zhCN = {
       rename: "重命名…",
       aiAnalyze: "AI 分析",
       clearAiContent: "清除 AI 信息",
+      refreshThumbnail: "刷新缩略图",
       moveToTrash: "移入回收站",
       deleteFromDisk: "从硬盘中删除…",
       // 链接资产只有这一个删除动作（2026-09-15 用户决定）：真的从硬盘删掉源文件。
@@ -551,6 +552,7 @@ export const zhCN = {
       removeTag: "移除标签…",
       aiAnalyzeMissing: "AI 分析未分析项（{count} 项）",
       aiAnalyze: "AI 分析（{count} 项）",
+      refreshThumbnails: "刷新缩略图（{count} 项）",
       copy: "复制（{count} 项）",
       // Serpent-d7acfa：多选里对文件夹生效的批量项（计数只算真正能做的文件夹）。
       appearance: "设置图标与颜色…（{count} 项）",
@@ -2112,6 +2114,7 @@ export const zhCN = {
   },
   preview: {
     ffmpegRequired: "当前安装缺少可用的媒体组件，无法生成视频播放代理。请重新安装或修复 Serpent 后重试。",
+    presentationThumbnailUnavailable: "此演示文稿没有可用的内嵌封面，无法生成缩略图。",
     oiioRequired: "当前安装缺少 OpenImageIO，无法解码此图像格式。请安装或配置 oiiotool 后重试。",
     sharpUnavailable: "图像解码组件不可用，无法生成预览。请重新安装应用后重试。",
     mediaProcessingFailed: "媒体处理失败，源文件可能损坏或编码暂不受支持。",
@@ -2409,6 +2412,12 @@ export const zhCN = {
     bridgeUnavailable: "无法连接到 Serpent 桌面服务。请重新启动应用。",
     workspaceRestoreFailed: "无法恢复工作区。",
     thumbnailFailed: "缩略图生成失败。请检查源文件后重试。",
+    thumbnailRefreshQueued: "已提交 {count} 项缩略图刷新任务。",
+    thumbnailRefreshPartial: "已提交 {count} 项缩略图刷新任务，{failedCount} 项提交失败，{skippedCount} 项已跳过。",
+    thumbnailRefreshSkipped: "已提交 {count} 项缩略图刷新任务，{skippedCount} 项已跳过。",
+    thumbnailRefreshNone: "所选项中没有可刷新缩略图的资产。",
+    thumbnailRefreshFailed: "缩略图刷新任务提交失败。",
+    thumbnailRefreshStateFailed: "刷新后的缩略图状态暂未加载，请稍后重试。",
     aiAnalyzeDoneFields: "AI 分析完成：写入 {fieldCount} 个字段、{tagCount} 个标签。",
     aiContentCleared: "已清除 {count} 项资产的 AI 内容。",
     aiContentClearFailed: "清除 AI 信息失败。",
@@ -2696,6 +2705,9 @@ export const zhCN = {
     code: {
       CANCELLED: "操作已取消，没有做任何改动。",
       INTERNAL_ERROR: "发生了未能分类的内部错误，界面无法给出更具体的原因。请打开「诊断日志」查看本次记录后重试；如果正在打开资源库，请把整个资源库文件夹复制到本机磁盘再打开。",
+      PRESENTATION_THUMBNAIL_UNAVAILABLE: "此演示文稿没有可用的内嵌封面，无法生成缩略图。",
+      // Compatibility with historical error codes.
+      LIBREOFFICE_REQUIRED: "此演示文稿没有可用的内嵌封面，无法生成缩略图。",
       INVALID_LIBRARY_NAME: "请输入可跨平台安全使用的资源库名称。",
       INVALID_LIBRARY_PATH: "所选位置不能作为资源库文件夹。请选择已存在且可写入的文件夹，不要选择文件或已断开的磁盘。",
       INVALID_FOLDER_NAME: "名称包含不支持的字符。",
@@ -2800,6 +2812,9 @@ export const zhCN = {
       IO_ERROR: "操作系统报告了磁盘读写错误。",
       SHARP_UNAVAILABLE: "图像处理引擎 Sharp 不可用。",
       FFMPEG_REQUIRED: "当前安装缺少可用的媒体组件，暂时无法生成视频预览。",
+      PRESENTATION_THUMBNAIL_UNAVAILABLE: "此演示文稿没有可用的内嵌封面，无法生成缩略图。",
+      // Compatibility with historical error codes.
+      LIBREOFFICE_REQUIRED: "此演示文稿没有可用的内嵌封面，无法生成缩略图。",
       OIIO_REQUIRED: "当前安装中未找到 OpenImageIO，暂时无法解码 EXR/TGA。",
       MEDIA_PROCESSING_FAILED: "媒体处理失败。请检查源文件是否损坏，并查看应用日志了解详细原因。",
       PALETTE_SOURCE_NOT_READY: "当前修订的缩略图或视频封面尚未就绪。",

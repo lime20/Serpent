@@ -364,6 +364,7 @@ import {
   type MediaJobSummaryCounts,
 } from "./media-job-status-state";
 import { MEDIA_JOB_LIST_PAGE_SIZE } from "../shared/media-jobs";
+import { retryMediaJobs } from "./media-job-controls";
 import { useScrollbarActivity } from "./use-scrollbar-activity";
 import { splitFilenameForDisplay } from "./filename-display";
 
@@ -641,6 +642,7 @@ import {
   stepDiscreteCardSize,
 } from "./card-size-stops";
 import { assetGridLayoutStyle } from "./asset-grid-layout";
+import { queueThumbnailRefresh, selectThumbnailRefreshAssetIds } from "./thumbnail-refresh";
 import { JustifiedAssetRows } from "./justified-asset-rows";
 import { MasonryColumns } from "./masonry-columns";
 import {
@@ -10066,6 +10068,109 @@ function AppInner() {
     }
   }
 
+  async function refreshThumbnails(assetIds: readonly string[]) {
+    if (!api || !library) return;
+    const targetLibraryId = library.libraryId;
+    const viewSession = ensureLibraryView(targetLibraryId);
+    if (!viewSession) return;
+    const isCurrent = () => isCurrentLibraryView(viewSession);
+    const uniqueIds = [...new Set(assetIds)];
+    const resolvedAssets: AssetSummary[] = [];
+    setError(null);
+    // Resolve the entire selection, including rows outside the loaded canvas
+    // page. Default visibility excludes ignored assets at the Worker boundary.
+    try {
+      for (let offset = 0; offset < uniqueIds.length; offset += 200) {
+        if (!isCurrent()) return;
+        const summaries = await api.listAssets({
+          libraryId: targetLibraryId,
+          assetIds: uniqueIds.slice(offset, offset + 200),
+          recursive: true,
+        });
+        if (!isCurrent()) return;
+        if (!summaries.ok) throw new LibraryOperationError(summaries.error);
+        resolvedAssets.push(...summaries.value);
+      }
+    } catch (caught) {
+      if (isCurrent()) setError(toMessage(caught, t("toast.thumbnailRefreshFailed"), locale));
+      return;
+    }
+    const targets = selectThumbnailRefreshAssetIds(uniqueIds, resolvedAssets);
+    const skippedCount = uniqueIds.length - targets.length;
+    if (targets.length === 0) {
+      setNotice(t("toast.thumbnailRefreshNone"));
+      return;
+    }
+    const originalArtifactIds = new Map(resolvedAssets.map((asset) => [asset.assetId, asset.thumbnailArtifactId]));
+    const result = await queueThumbnailRefresh({ api, libraryId: targetLibraryId, assetIds: targets, isCurrent });
+    if (!isCurrent()) return;
+    const queuedCount = result.queuedAssetIds.length;
+    if (queuedCount > 0) {
+      jobStatusCoordinatorRef.current?.noteActivity("media");
+      const noticeKey = result.failures.length > 0
+        ? "toast.thumbnailRefreshPartial"
+        : skippedCount > 0 ? "toast.thumbnailRefreshSkipped" : "toast.thumbnailRefreshQueued";
+      setNotice(t(noticeKey, {
+        count: queuedCount,
+        failedCount: result.failures.length,
+        skippedCount,
+      }));
+      const accepted = new Set(result.queuedAssetIds);
+      setThumbnailFailures((current) => {
+        const next = new Map(current);
+        for (const assetId of accepted) next.delete(assetId);
+        return next;
+      });
+    }
+    const submissionError = result.failures[0]?.error;
+    if (submissionError !== undefined) {
+      setError(toMessage(submissionError, t("toast.thumbnailRefreshFailed"), locale));
+    }
+    // Only reload the accepted summaries. Completion events continue to supply
+    // newly generated IDs; do not replace a newer event with a pending snapshot.
+    try {
+      for (let offset = 0; offset < result.queuedAssetIds.length; offset += 200) {
+        if (!isCurrent()) return;
+        const summaries = await api.listAssets({
+          libraryId: targetLibraryId,
+          assetIds: result.queuedAssetIds.slice(offset, offset + 200),
+          recursive: true,
+        });
+        if (!isCurrent()) return;
+        if (!summaries.ok) throw new LibraryOperationError(summaries.error);
+        const byId = new Map(summaries.value.map((asset) => [asset.assetId, asset]));
+        setAssets((current) => current.map((asset) => {
+          const refreshed = byId.get(asset.assetId);
+          if (!refreshed || refreshed.currentRevisionId !== asset.currentRevisionId) return asset;
+          if (asset.thumbnailArtifactId !== originalArtifactIds.get(asset.assetId)
+            && asset.thumbnailArtifactId !== refreshed.thumbnailArtifactId) return asset;
+          return {
+            ...asset,
+            thumbnailStatus: refreshed.thumbnailStatus,
+            thumbnailArtifactId: refreshed.thumbnailArtifactId,
+            previewKind: refreshed.previewKind,
+            previewRevisionId: refreshed.previewRevisionId,
+          };
+        }));
+        setLayoutThumbnailArtifacts((current) => {
+          if (current.libraryId !== targetLibraryId) return current;
+          const ids = new Map(current.ids);
+          for (const refreshed of summaries.value) {
+            const previousId = ids.get(refreshed.assetId);
+            if (previousId !== undefined && previousId !== originalArtifactIds.get(refreshed.assetId)) continue;
+            if (refreshed.thumbnailArtifactId) ids.set(refreshed.assetId, refreshed.thumbnailArtifactId);
+            else ids.delete(refreshed.assetId);
+          }
+          return { libraryId: targetLibraryId, ids };
+        });
+      }
+    } catch (caught) {
+      if (isCurrent() && submissionError === undefined) {
+        setError(toMessage(caught, t("toast.thumbnailRefreshStateFailed"), locale));
+      }
+    }
+  }
+
   async function refreshAssets() {
     if (!api || !library) return;
     const startedAt = Date.now();
@@ -12932,40 +13037,46 @@ function AppInner() {
 
   async function loadMediaJobs(quiet = false) {
     if (!api || !library) return;
+    const viewSession = ensureLibraryView(library.libraryId);
+    if (!viewSession) return;
     if (!quiet) setMediaJobsLoading(true);
     try {
       const result = await api.listMediaJobs({
         libraryId: library.libraryId,
         limit: MEDIA_JOB_LIST_PAGE_SIZE,
       });
+      if (!isCurrentLibraryView(viewSession)) return;
       if (!result.ok) {
         if (!quiet) setError(toMessage(result.error, t("toast.mediaJobsLoadFailed"), locale));
         return;
       }
       setMediaJobs(replaceMediaJobListPage(result.value));
     } catch {
-      if (!quiet) setError(t("toast.mediaJobsLoadNoResponse"));
+      if (!quiet && isCurrentLibraryView(viewSession)) setError(t("toast.mediaJobsLoadNoResponse"));
     } finally {
-      if (!quiet) setMediaJobsLoading(false);
+      if (!quiet && isCurrentLibraryView(viewSession)) setMediaJobsLoading(false);
     }
   }
   loadMediaJobsRef.current = loadMediaJobs;
 
   async function loadMoreMediaJobs() {
     if (!api || !library || !mediaJobs?.nextCursor || mediaJobs.hasMore !== true) return;
+    const viewSession = ensureLibraryView(library.libraryId);
+    if (!viewSession) return;
     try {
       const result = await api.listMediaJobs({
         libraryId: library.libraryId,
         cursor: mediaJobs.nextCursor,
         limit: MEDIA_JOB_LIST_PAGE_SIZE,
       });
+      if (!isCurrentLibraryView(viewSession)) return;
       if (!result.ok) {
         setError(toMessage(result.error, t("toast.mediaJobsLoadFailed"), locale));
         return;
       }
       setMediaJobs((current) => appendMediaJobListPage(current, result.value));
     } catch {
-      setError(t("toast.mediaJobsLoadNoResponse"));
+      if (isCurrentLibraryView(viewSession)) setError(t("toast.mediaJobsLoadNoResponse"));
     }
   }
 
@@ -13212,6 +13323,9 @@ function AppInner() {
     jobIds?: string[],
   ) {
     if (!api || !library) return;
+    if (jobIds?.length === 0) return;
+    const viewSession = ensureLibraryView(library.libraryId);
+    if (!viewSession) return;
     try {
       const result =
         action === "pause"
@@ -13226,17 +13340,20 @@ function AppInner() {
                   libraryId: library.libraryId,
                   jobIds,
                 })
-              : await api.retryMediaJobs({
+              : await retryMediaJobs({
+                  api,
                   libraryId: library.libraryId,
-                  jobIds: jobIds ?? [],
+                  jobIds,
+                  isCurrentLibrary: () => isCurrentLibraryView(viewSession),
                 });
+      if (!result || !isCurrentLibraryView(viewSession)) return;
       if (!result.ok) {
         setError(toMessage(result.error, t("toast.mediaJobsOpFailed"), locale));
         return;
       }
       await loadMediaJobs(true);
     } catch {
-      setError(t("toast.mediaJobsOpNoResponse"));
+      if (isCurrentLibraryView(viewSession)) setError(t("toast.mediaJobsOpNoResponse"));
     }
   }
 
@@ -13245,6 +13362,7 @@ function AppInner() {
     jobIds?: string[],
   ) {
     if (!api || !library) return;
+    if (jobIds?.length === 0 || (action === "retry" && jobIds === undefined)) return;
     try {
       const result =
         action === "pause"
@@ -16714,6 +16832,7 @@ function AppInner() {
           void handleAnalyzeClick(assetId, batchIds);
         }}
         onClearAiContent={(assetIds) => { void handleClearAiContent(assetIds); }}
+        onRefreshThumbnails={(assetIds) => { void refreshThumbnails(assetIds); }}
         canAnalyze={
           aiAnalyzeConnectionReady(aiCredentialsReady, aiConnectionState) &&
           !aiAnalyzing

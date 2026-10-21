@@ -135,6 +135,9 @@ export type AssetPreviewModalHandle = {
 
 const PREVIEW_ERROR_KEYS: Record<string, string> = {
   FFMPEG_REQUIRED: "preview.ffmpegRequired",
+  PRESENTATION_THUMBNAIL_UNAVAILABLE: "preview.presentationThumbnailUnavailable",
+  // Historical thumbnail records can still contain this code.
+  LIBREOFFICE_REQUIRED: "preview.presentationThumbnailUnavailable",
   OIIO_REQUIRED: "preview.oiioRequired",
   SHARP_UNAVAILABLE: "preview.sharpUnavailable",
   MEDIA_PROCESSING_FAILED: "preview.mediaProcessingFailed",

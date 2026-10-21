@@ -61,6 +61,11 @@ export const DOCUMENT_EXTENSIONS = [
   '.pdf', '.html', '.htm', '.ai',
 ] as const;
 
+/** Presentation formats with a thumbnail-only path (no native viewer yet). */
+export const PRESENTATION_EXTENSIONS = [
+  '.ppt', '.pptx',
+] as const;
+
 /**
  * Serpent-485aeb: font formats with a card sample + viewer preview.
  * TTC (collection) can be loaded by Chromium when it exposes a usable face;
@@ -84,6 +89,7 @@ const videoExtensions = new Set<string>(VIDEO_EXTENSIONS);
 const chromiumDirectPlayVideoExtensions = new Set<string>(CHROMIUM_DIRECT_PLAY_VIDEO_EXTENSIONS);
 const modelExtensions = new Set<string>(MODEL_EXTENSIONS);
 const documentExtensions = new Set<string>(DOCUMENT_EXTENSIONS);
+const presentationExtensions = new Set<string>(PRESENTATION_EXTENSIONS);
 const fontExtensions = new Set<string>(FONT_EXTENSIONS);
 /** MIME types Chromium accepts for `@font-face` src. */
 const fontMimeByExtension: Record<string, string> = {
@@ -163,6 +169,10 @@ export function isSupportedModelExtension(extensionOrFilename: string): boolean 
 
 export function isSupportedDocumentExtension(extensionOrFilename: string): boolean {
   return documentExtensions.has(normalizedExtension(extensionOrFilename));
+}
+
+export function isSupportedPresentationExtension(extensionOrFilename: string): boolean {
+  return presentationExtensions.has(normalizedExtension(extensionOrFilename));
 }
 
 /** Serpent-485aeb: TTF / OTF / WOFF / WOFF2 / TTC are font assets. */

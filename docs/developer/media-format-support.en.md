@@ -42,6 +42,25 @@ Both the source passthrough and derived-image paths must therefore preserve alph
 
 The viewer needs to read media pixels: mirage detection and the previous/next button contrast both rely on `canvas.getImageData`. `serpent://` declares `corsEnabled` in `src/main/serpent-protocol-privileges.ts`, so every media response (the common headers in `artifact-response.ts`) must carry `Access-Control-Allow-Origin`, and viewer `<img>` elements must use `crossOrigin="anonymous"`. If either is missing, the canvas is cross-origin tainted and sampling silently returns nothing — the detection hint never appears and contrast stays at its default rather than raising an error. Keep both conditions in place when adding media response paths.
 
+### Thumbnail storage and loading
+
+Thumbnails use a cache first and are generated asynchronously when missing. Displaying a card does not decode the source file every time:
+
+- The `revision_artifacts` database table indexes artifact paths, status, generator versions, dimensions, and related metadata. Image bytes live under the library's `.serpent/artifacts` directory, rather than as image BLOBs in the database.
+- Lookup follows the asset's `current_revision_id` and selects a current artifact that has not been invalidated. A usable `ready` artifact is read from disk; scrolling or reopening a library normally reuses that cache.
+- Missing or invalidated thumbnails enter the Worker's background queue, with visible assets prioritized. The result is recorded and `asset.thumbnail.ready` updates the card. Successful enqueueing means the task was submitted, not that image generation has finished.
+- A source revision change, an applicable generator version change, or a manual refresh can require regeneration. Automatic work preserves valid Eagle/Billfish imported covers rather than replacing them merely because their generator differs from the built-in one.
+
+Some ordinary small images use their source directly as the card image, so automatic work does not need a separate thumbnail. `isSourceDirectPreview` in `src/shared/preview-policy.ts` owns this optimization: JPEG-family formats, PNG, WebP, AVIF, or GIF; a positive size no greater than 2 MiB; known positive integer dimensions; a longest edge no greater than 2048 pixels; and no more than 2,000,000 pixels in total. Larger images remain valid assets and use the thumbnail generation path.
+
+### Manually refreshing thumbnails
+
+Choose **Refresh thumbnail** in an asset's context menu to regenerate the cover for one or more images, documents, models, fonts, or PPT/PPTX files, including selections across pages. The action operates on available, undeleted, non-ignored assets that support refresh in the current writable library. Execution reads fresh summaries for the selected assets and skips unsupported or unavailable ones. The menu count includes candidates whose summaries have not loaded yet; result feedback counts the targets actually submitted successfully and reports partial request failures. Video and audio do not expose this action because their existing retry interface requests playback proxies.
+
+The action reuses `retryArtifact({ kind: 'thumbnail' })` to submit or promote a durable task for the current revision at elevated priority. If generation or imported-cover normalization is already running for that revision, refresh joins that task without invalidating its cover or changing its claimed processing intent. Otherwise, refresh invalidates the current thumbnail and requests generation from the source; queued or paused imported-cover normalization is also promoted to an explicit source refresh. Explicit image refresh tasks bypass the automatic source-direct skip and create a separate thumbnail. Source files are unchanged; failures and cancellation follow the relevant generator's existing handling, and generation continues in the background.
+
+Refreshing PPTX only extracts its embedded cover again. It cannot correct stale `docProps/thumbnail.*` content or render the actual first slide. A missing usable embedded cover fails directly, so repeated refreshes cannot create one. PPT has no source-cover decoder; an explicit refresh of an imported cover may therefore be unable to rebuild it from the source.
+
 ## 3. Implementation order
 
 1. Decide whether the addition is a codec, container, or alias extension; record MIME, decoder, and fallback semantics.
@@ -51,6 +70,25 @@ The viewer needs to read media pixels: mirage detection and the previous/next bu
 5. Update this developer documentation and the human acceptance checklist. “The backend library can theoretically read it” is not evidence of support.
 
 `.blend` is not in the product format table: there is no reliable public mesh parser for Blender 3–4.x, and Serpent does not bundle Blender. Files can still be imported and show as an unknown type. Export glTF or FBX from Blender when a 3D preview is needed. FBX / OBJ / glTF / GLB / STL still use the WebGL viewer.
+
+### PPT/PPTX cover thumbnails
+
+`.ppt` / `.pptx` currently support cover thumbnails only. They remain `other` assets and are not added to `DOCUMENT_EXTENSIONS`; source files do not enter the HTML/PDF viewer, while an available cover can be viewed as an image. The format filter offers PPT/PPTX options, which does not imply full presentation viewing support.
+
+- PPTX only reads `docProps/thumbnail.jpeg`, `docProps/thumbnail.jpg`, or `docProps/thumbnail.png`, normalizes it with Sharp, and stores an ordinary `thumbnail` artifact with generator `pptx-embedded-thumbnail@1`. The embedded cover can be missing or stale and is not guaranteed to match the current first slide. Arbitrary pictures under `ppt/media` are not used as a complete cover.
+- Missing, corrupt, oversized, or undecodable embedded covers fail directly without starting a converter process. PPT has no new binary source-cover decoder and uses the same failure policy. This path needs no LibreOffice, external renderer, installation, or environment-variable configuration. Ordinary PDF files retain their separate PDF.js thumbnail path.
+- The job and artifact record the permanent terminal code `PRESENTATION_THUMBNAIL_UNAVAILABLE` with failed generator `pptx-embedded-thumbnail@1;failed`. The UI explains that the file has no usable embedded cover. Background refill, reopening, and automatic failed-artifact repair do not repeatedly attempt the work. Cancellation does not write this terminal failure. Memory pressure and disk/database write errors retain their existing classification rather than becoming missing-cover failures. Explicit refresh or a manual retry in the task panel retries extraction, and a source revision change can require new generation; neither selects another rendering method.
+- Automatic work preserves valid Eagle/Billfish covers and existing usable caches, including `ready` covers from the old converter path. Removing the converter does not purge them. Historical `presentation-soffice-pdfjs@1` / `LIBREOFFICE_REQUIRED` values remain readable only for compatibility and never trigger conversion or installation hints. Explicit manual refresh can invalidate and replace a cover, subject to the coalescing rule above for generation or normalization already running on the current revision.
+
+Acceptance should cover valid, missing, corrupt, oversized, and Sharp-undecodable embedded covers; no external process on failure; direct failure for PPT; cancellation; explicit retry; no repeated background work after failure; and preservation of original/normalized Eagle/Billfish covers and old `ready` caches. Record packaged-app verification separately for Windows/macOS/Linux. This path does not render the actual first slide.
+
+### Diagnostics and task controls
+
+- A presentation with no usable embedded cover retains a per-asset `PRESENTATION_THUMBNAIL_UNAVAILABLE` failure record. Diagnostics no longer discover or suggest installing an external converter.
+- Expected cancellation that yields resources to interactive work and returns a job to the queue is logged at info level. Normal Worker shutdown with `code: 0` is also informational.
+- Source requests are not logged individually by default. Start with `SERPENT_VIEWER_TIMING_LOG=1` to inspect revision, HTTP method, Range and response timing for byte-range media reads. Request counts alone do not establish a generation loop.
+- **Background Tasks → Retry failed** fetches every current-library media-task page, collects and deduplicates failed IDs, then submits the retry. It does not depend on the loaded UI page or send empty `jobIds`; the protocol still requires at least one ID. AI retry retains its loaded-list scope: the button is disabled when that list has no failures, and App/preload also prevent empty selections from reaching IPC.
+- The development server retains CSP, using a random nonce for Vite/React scripts and permitting the required blob Worker; production policy remains intact. Mount timeouts capture page/resource diagnostics, and window closure stops retries. The original 20-second blank mount has not been reproduced; isolated cold-cache startup and HMR passed, which does not establish that the original cause is fixed.
 
 ## 4. Test matrix
 

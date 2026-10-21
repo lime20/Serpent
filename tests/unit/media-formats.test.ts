@@ -10,6 +10,7 @@ import {
   isRawImageExtension,
   isSupportedImageExtension,
   isSupportedDocumentExtension,
+  isSupportedPresentationExtension,
   isSupportedModelExtension,
   isSupportedVideoExtension,
   mediaTypeHasPixelResolution,
@@ -65,6 +66,12 @@ describe('media format registry', () => {
     expect(isSupportedDocumentExtension('Artwork.AI')).toBe(true);
     expect(isSupportedDocumentExtension('Artwork.ai')).toBe(true);
     expect(isSupportedDocumentExtension('Artwork.ai.txt')).toBe(false);
+  });
+
+  it('registers presentations as thumbnail-only formats', () => {
+    expect(isSupportedPresentationExtension('deck.PPT')).toBe(true);
+    expect(isSupportedPresentationExtension('deck.PpTx')).toBe(true);
+    expect(isSupportedPresentationExtension('deck.pptx.txt')).toBe(false);
   });
 
   it('treats only Chromium-playable containers as viewer source-first', () => {

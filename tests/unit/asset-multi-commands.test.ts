@@ -15,6 +15,32 @@ import type { ResolvedMenuItem } from '../../src/renderer/commands/command-types
 
 const registry = createCommandRegistry(assetMultiCommandDefinitions);
 
+describe('manual thumbnail refresh', () => {
+  it('offers a localized count for only refreshable targets', () => {
+    const { ctx } = makeCtx({ thumbnailRefreshAssetIds: ['a-1', 'a-3'] });
+    const item = findItem(registry.resolveMenu(ctx), 'assets.refresh-thumbnails');
+    expect(item.label).toBe('刷新缩略图（2 项）');
+    expect(item.disabled).toBe(false);
+  });
+
+  it('hides the action with no supported available targets or in trash', () => {
+    expect(resolveIds(makeCtx({ thumbnailRefreshAssetIds: [] }).ctx))
+      .not.toContain('assets.refresh-thumbnails');
+    expect(resolveIds(makeTrashedCtx({ thumbnailRefreshAssetIds: ['a-1'] }).ctx))
+      .not.toContain('assets.refresh-thumbnails');
+  });
+
+  it('routes only the eligible targets to the refresh action', () => {
+    const ids: string[][] = [];
+    const { ctx } = makeCtx({ thumbnailRefreshAssetIds: ['a-1', 'a-3'] });
+    registry.get('assets.refresh-thumbnails')?.run({
+      ...ctx,
+      actions: { ...ctx.actions, refreshThumbnails: (assetIds: string[]) => { ids.push(assetIds); } },
+    });
+    expect(ids).toEqual([['a-1', 'a-3']]);
+  });
+});
+
 interface RecordedCall {
   readonly action: string;
   readonly args: readonly unknown[];
@@ -413,12 +439,13 @@ describe('run 委托到 actions 回调包', () => {
 });
 
 describe('注册表完整性', () => {
-  it('14 条定义全部注册且 id 唯一（createCommandRegistry 未抛错）', () => {
+  it('16 条定义全部注册且 id 唯一（createCommandRegistry 未抛错）', () => {
     expect(registry.list().map((def) => def.id)).toEqual([
       'assets.restore',
       'assets.delete-permanent',
       'assets.assign-tag',
       'assets.remove-tag',
+      'assets.refresh-thumbnails',
       'assets.ai-analyze-pending',
       'assets.ai-analyze',
       'assets.clear-ai-content',

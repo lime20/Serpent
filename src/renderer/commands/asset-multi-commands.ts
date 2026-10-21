@@ -43,6 +43,7 @@ export interface AssetMultiCommandActions {
   readonly clearSelection: () => void;
   readonly aiAnalyze?: (assetIds: string[]) => void;
   readonly clearAiContent?: (assetIds: string[]) => void;
+  readonly refreshThumbnails?: (assetIds: string[]) => void;
   /**
    * Serpent-d7acfa：多选里的文件夹「设置图标」与「忽略」。外观由菜单里的
    * 取色/图标面板给出，注册表只决定可见性、计数与禁用原因。
@@ -81,6 +82,7 @@ export interface AssetMultiCommandContext extends CommandContext {
   readonly availableManagedAssetIds: readonly string[];
   /** Available (non-missing) assets that can be written to OS clipboard. */
   readonly availableAssetIds: readonly string[];
+  readonly thumbnailRefreshAssetIds?: readonly string[];
   /**
    * 选中里没有任何 AI 生成数据的资产（菜单打开时预取）——「AI分析未分析项」。
    */
@@ -149,6 +151,13 @@ export const assetMultiCommandDefinitions: readonly AssetMultiCommandDefinition[
       run: (ctx) => ctx.actions.openRemoveTagPicker([...ctx.selectedAssetIds]),
     },
     // ---- AI 元数据 ----
+    {
+      id: 'assets.refresh-thumbnails',
+      title: (ctx) => t(ctx, 'command.assets.refreshThumbnails', { count: ctx.thumbnailRefreshAssetIds?.length ?? 0 }),
+      group: 'metadata',
+      visible: (ctx) => !ctx.trashedAll && (ctx.thumbnailRefreshAssetIds?.length ?? 0) > 0,
+      run: (ctx) => ctx.actions.refreshThumbnails?.([...(ctx.thumbnailRefreshAssetIds ?? [])]),
+    },
     {
       // 「AI分析未分析项」排在最前：只分析没有任何 AI 生成数据的资产，
       // 计数来自 ctx.aiPendingAssetIds（菜单打开时预取）。

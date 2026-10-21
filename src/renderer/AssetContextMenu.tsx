@@ -67,6 +67,7 @@ import {
   type MenuSkipScopeOptions,
 } from "./menu-skip-report";
 import { canCreateImageSequenceFromSelection } from "./image-sequence-selection";
+import { selectThumbnailRefreshCandidateIds, supportsThumbnailRefresh } from "./thumbnail-refresh";
 import type { SerpentPluginManagerApi } from "../shared/plugin-manager-api";
 import type { PluginContributionContext } from "../plugins/plugin-context";
 import {
@@ -410,6 +411,7 @@ interface AssetContextMenuProps {
   onRelink: (assetId: string) => void;
   onAnalyze: (assetId: string, batchIds?: readonly string[]) => void;
   onClearAiContent: (assetIds: string[]) => void;
+  onRefreshThumbnails: (assetIds: string[]) => void;
   canAnalyze: boolean;
   /** Serpent-rsbt: show link-off on AI analyze when connection is unavailable. */
   aiDisconnected: boolean;
@@ -514,6 +516,7 @@ export function AssetContextMenu(props: AssetContextMenuProps) {
     onRelink,
     onAnalyze,
     onClearAiContent,
+    onRefreshThumbnails,
     canAnalyze,
     aiDisconnected,
     onClearSelection,
@@ -1623,6 +1626,7 @@ export function AssetContextMenu(props: AssetContextMenuProps) {
               managedAssetIds,
               availableManagedAssetIds,
               availableAssetIds,
+              thumbnailRefreshAssetIds: selectThumbnailRefreshCandidateIds(targetAssetIds, targetAssets),
               pasteTargetFolderId,
               appearanceFolderTargets: appearancePlan.targets,
               ignoreFolderTargets: ignorePlan.targets,
@@ -1647,6 +1651,7 @@ export function AssetContextMenu(props: AssetContextMenuProps) {
                   onAnalyze(primary, assetIds);
                 },
                 clearAiContent: onClearAiContent,
+                refreshThumbnails: onRefreshThumbnails,
                 setFolderAppearance: (targets, appearance) => {
                   for (const target of targets) {
                     onSetEntityAppearance(
@@ -1708,6 +1713,7 @@ export function AssetContextMenu(props: AssetContextMenuProps) {
             const aiAnalyzeMissingItem = resolvedById.get("assets.ai-analyze-pending");
             const aiAnalyzeItem = resolvedById.get("assets.ai-analyze");
             const clearAiContentItem = resolvedById.get("assets.clear-ai-content");
+            const refreshThumbnailsItem = resolvedById.get("assets.refresh-thumbnails");
             const moveToFolderItem = resolvedById.get("assets.move-to-folder");
             const appearanceItem = resolvedById.get("assets.appearance");
             const ignoreItem = resolvedById.get("assets.ignore");
@@ -1784,8 +1790,16 @@ export function AssetContextMenu(props: AssetContextMenuProps) {
                   </div>
                 )}
             {(targetAssetIds.length > 0 &&
-              (aiAnalyzeMissingItem || aiAnalyzeItem || clearAiContentItem)) && (
+              (aiAnalyzeMissingItem || aiAnalyzeItem || clearAiContentItem || refreshThumbnailsItem)) && (
               <ContextMenuSection label={t("command.group.metadata")}>
+                {refreshThumbnailsItem && (
+                  <ContextMenuItem
+                    icon={<Icon name="refresh" size={14} />}
+                    label={refreshThumbnailsItem.label}
+                    disabled={refreshThumbnailsItem.disabled}
+                    onAction={() => runMultiCommand("assets.refresh-thumbnails")}
+                  />
+                )}
                 {aiAnalyzeMissingItem && (
                   <ContextMenuItem
                     icon={<Icon name="smart" size={14} />}
@@ -2091,6 +2105,7 @@ export function AssetContextMenu(props: AssetContextMenuProps) {
               pasteTargetFolderId: resolvedPasteTarget,
               semanticSearchEnabled,
               similarSourceSupported: sourceSupported,
+              thumbnailRefreshSupported: Boolean(singleAsset && supportsThumbnailRefresh(singleAsset)),
               actions: {
                 view: onViewAsset,
                 openExternal: onOpenExternal,
@@ -2103,6 +2118,7 @@ export function AssetContextMenu(props: AssetContextMenuProps) {
                 rename: onRenameAssetFile,
                 aiAnalyze: onAnalyze,
                 clearAiContent: onClearAiContent,
+                refreshThumbnails: onRefreshThumbnails,
                 moveToTrash: onTrash,
                 deleteFromDisk: onDeleteFromDisk,
                 moveToFolder: onMoveToFolder,
@@ -2146,6 +2162,7 @@ export function AssetContextMenu(props: AssetContextMenuProps) {
             const renameItem = resolvedById.get("asset.rename");
             const aiAnalyzeItem = resolvedById.get("asset.ai-analyze");
             const clearAiContentItem = resolvedById.get("asset.clear-ai-content");
+            const refreshThumbnailItem = resolvedById.get("asset.refresh-thumbnail");
             const moveToTrashItem = resolvedById.get("asset.move-to-trash");
             const deleteFromDiskItem = resolvedById.get(
               "asset.delete-from-disk",
@@ -2507,6 +2524,15 @@ export function AssetContextMenu(props: AssetContextMenuProps) {
                     items={pluginItemsForHostGroup(pluginAssetMenuPlacement, "metadata", "before")}
                     onRun={(item) => runPluginCommand(item, { assetIds: [assetId] })}
                   />
+                  {refreshThumbnailItem && (
+                    <ContextMenuItem
+                      icon={<Icon name="refresh" size={14} />}
+                      label={refreshThumbnailItem.label}
+                      disabled={refreshThumbnailItem.disabled}
+                      disabledReason={refreshThumbnailItem.disabledReason ?? undefined}
+                      onAction={() => runAssetCommand("asset.refresh-thumbnail")}
+                    />
+                  )}
                   {aiAnalyzeItem && (
                     <ContextMenuItem
                       icon={

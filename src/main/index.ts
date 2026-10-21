@@ -1868,77 +1868,119 @@ const DEV_SERVER_POLL_MS = 250;
 const DEV_RENDERER_MOUNT_TIMEOUT_MS = 20_000;
 const DEV_RENDERER_LOAD_ATTEMPTS = 4;
 
-async function waitForDevServer(url: string): Promise<void> {
+interface DevRendererMountSnapshot {
+  mounted: boolean;
+  closed?: boolean;
+  readyState?: string;
+  rootChildCount?: number;
+  resourceCount?: number;
+  recentResources?: Array<{ path: string; duration: number; initiatorType: string }>;
+  probeError?: string;
+}
+
+async function waitForDevServer(
+  url: string,
+  isClosed: () => boolean,
+): Promise<boolean> {
   const deadline = Date.now() + DEV_SERVER_WAIT_MS;
   while (Date.now() < deadline) {
+    if (isClosed()) return false;
     try {
       const response = await fetch(url, { signal: AbortSignal.timeout(2_000) });
-      if (response.ok) return;
+      if (response.ok) return !isClosed();
     } catch {
       // Vite may still be binding; keep polling until the deadline.
     }
     await new Promise((resolve) => setTimeout(resolve, DEV_SERVER_POLL_MS));
   }
+  if (isClosed()) return false;
   throw new Error(
     `Renderer dev server did not become reachable within ${DEV_SERVER_WAIT_MS}ms: ${url}`,
   );
 }
 
-async function isRendererMounted(
+async function inspectRendererMount(
   webContents: Electron.WebContents,
-): Promise<boolean> {
+): Promise<DevRendererMountSnapshot> {
+  if (webContents.isDestroyed()) return { mounted: false, closed: true };
   try {
     return await webContents.executeJavaScript(
-      "Boolean(document.querySelector('#root .app-shell'))",
+      `(() => ({
+        mounted: Boolean(document.querySelector('#root .app-shell')),
+        readyState: document.readyState,
+        rootChildCount: document.getElementById('root')?.childElementCount ?? 0,
+        resourceCount: performance.getEntriesByType('resource').length,
+        recentResources: performance.getEntriesByType('resource').slice(-5).map(resource => ({
+          path: new URL(resource.name).pathname,
+          duration: Math.round(resource.duration),
+          initiatorType: resource.initiatorType,
+        })),
+      }))()`,
     );
-  } catch {
-    return false;
+  } catch (error) {
+    return {
+      mounted: false,
+      ...(webContents.isDestroyed() ? { closed: true } : {}),
+      probeError: error instanceof Error ? error.message : String(error),
+    };
   }
 }
 
 async function waitForRendererMounted(
   webContents: Electron.WebContents,
   timeoutMs = DEV_RENDERER_MOUNT_TIMEOUT_MS,
-): Promise<boolean> {
+): Promise<DevRendererMountSnapshot> {
   const deadline = Date.now() + timeoutMs;
+  let snapshot: DevRendererMountSnapshot = { mounted: false };
   while (Date.now() < deadline) {
-    if (await isRendererMounted(webContents)) return true;
+    snapshot = await inspectRendererMount(webContents);
+    if (snapshot.mounted || snapshot.closed) return snapshot;
     await new Promise((resolve) => setTimeout(resolve, DEV_SERVER_POLL_MS));
   }
-  return false;
+  return snapshot;
 }
 
 async function loadRendererDevUrl(
   window: BrowserWindow,
   url: string,
 ): Promise<void> {
+  const startedAt = Date.now();
+  const isClosed = () => window.isDestroyed() || window.webContents.isDestroyed();
+  let snapshot: DevRendererMountSnapshot | undefined;
   for (let attempt = 1; attempt <= DEV_RENDERER_LOAD_ATTEMPTS; attempt++) {
+    if (isClosed()) return;
+    const attemptStartedAt = Date.now();
     try {
-      await waitForDevServer(url);
+      if (!await waitForDevServer(url, isClosed)) return;
       await window.loadURL(url);
     } catch (error) {
-      logger?.error("main.window.load-attempt", error, { attempt, url });
+      if (isClosed()) return;
+      logger?.error("main.window.load-attempt", error, { attempt, url, elapsedMs: Date.now() - startedAt });
       await new Promise((resolve) => setTimeout(resolve, 400 * attempt));
       continue;
     }
-    if (await waitForRendererMounted(window.webContents)) {
+    snapshot = await waitForRendererMounted(window.webContents);
+    if (snapshot.closed || isClosed()) return;
+    if (snapshot.mounted) {
       logger?.info("main.window.mount-verified", "Renderer shell visible.", {
         attempt,
         url,
+        elapsedMs: Date.now() - startedAt,
       });
       return;
     }
     logger?.info(
       "main.window.mount-retry",
       "Renderer still blank after load; retrying.",
-      { attempt, url },
+      { attempt, url, elapsedMs: Date.now() - startedAt, attemptElapsedMs: Date.now() - attemptStartedAt, snapshot },
     );
     await new Promise((resolve) => setTimeout(resolve, 400 * attempt));
   }
+  if (isClosed()) return;
   logger?.error(
     "main.window.mount-failed",
     new Error("Renderer remained blank after dev load retries."),
-    { url, attempts: DEV_RENDERER_LOAD_ATTEMPTS },
+    { url, attempts: DEV_RENDERER_LOAD_ATTEMPTS, elapsedMs: Date.now() - startedAt, snapshot },
   );
   throw new Error(`Renderer remained blank after dev load retries: ${url}`);
 }
@@ -6016,11 +6058,6 @@ async function startApplication(): Promise<void> {
         if (!sourceWorkerClient) {
           return new Response("Worker unavailable", { status: 503 });
         }
-        logger?.info(
-          "serpent-protocol.source-request",
-          "Resolving a source asset request.",
-          { libraryId, assetId: artifactId },
-        );
         // Serpent-485aeb：字体卡片样张页。字体卡片的封面由 Main 的离屏捕获
         // 渲染成 512px 缩略图，因此这里按同一个 source URL + `sample=font`
         // 返回一张生成的 HTML 样张页；页面里的 @font-face 指向去掉该参数的
@@ -6051,6 +6088,19 @@ async function startApplication(): Promise<void> {
             "Rejected malformed source revision token.",
           );
           return new Response("Invalid revision", { status: 400 });
+        }
+        if (VIEWER_TIMING_LOG) {
+          logger?.info(
+            "serpent-protocol.source-request",
+            "Resolving a source asset request.",
+            {
+              libraryId,
+              assetId: artifactId,
+              revisionId,
+              method: request.method,
+              range: request.headers.get("range") ?? undefined,
+            },
+          );
         }
         const authorizedSource = resolveModelThumbnailSourceAuthorization({
           libraryId,

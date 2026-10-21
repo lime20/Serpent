@@ -5,6 +5,48 @@ import { describe, expect, it } from "vitest";
 import { MediaJobsDialog } from "../../src/renderer/MediaJobsDialog";
 import { LocaleProvider } from "../../src/renderer/i18n";
 
+it.each(["PRESENTATION_THUMBNAIL_UNAVAILABLE", "LIBREOFFICE_REQUIRED"])("explains unavailable embedded thumbnails for %s without converter advice", (errorCode) => {
+  const dialog = createElement(MediaJobsDialog, {
+    open: true,
+    mediaJobsLoading: false,
+    mediaJobs: {
+      queued: 0,
+      running: 0,
+      succeeded: 0,
+      failed: 1,
+      paused: 0,
+      cancelled: 0,
+      jobs: [{
+        jobId: "presentation-job",
+        assetId: "presentation",
+        revisionId: null,
+        kind: "generate_thumbnail",
+        status: "failed",
+        progress: 0,
+        attemptCount: 1,
+        errorCode,
+        errorDetail: "spawn soffice.com ENOENT",
+        createdAt: "2026-10-21T00:00:00.000Z",
+        updatedAt: "2026-10-21T00:00:00.000Z",
+      }],
+    },
+    aiJobs: null,
+    pluginJobs: null,
+    onClose: () => undefined,
+    onControlMediaJobs: () => undefined,
+    onControlAiJobs: () => undefined,
+  });
+  const html = renderToStaticMarkup(
+    createElement(LocaleProvider, { initialPreference: "en", children: dialog }),
+  );
+
+  expect(html).not.toContain("spawn soffice.com ENOENT");
+  expect(html).not.toContain("LIBREOFFICE_REQUIRED");
+  expect(html).not.toContain("PRESENTATION_THUMBNAIL_UNAVAILABLE");
+  expect(html).not.toContain("LibreOffice");
+  expect(html).toContain("embedded thumbnail");
+});
+
 describe("MediaJobsDialog asset labels", () => {
   it("shows the associated asset filename instead of only the job kind", () => {
     const dialog = createElement(MediaJobsDialog, {

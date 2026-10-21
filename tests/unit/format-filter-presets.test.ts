@@ -87,12 +87,12 @@ describe("format-filter-presets", () => {
     expect(allChipTokens()).not.toContain(FORMAT_TEXT_TOKEN);
   });
 
-  it("keeps HTML, HDF, and HTM in the miscellaneous-format group", () => {
+  it("keeps non-native document and presentation formats in the miscellaneous group", () => {
     const documentGroup = FORMAT_FILTER_GROUPS.find(
       (group) => group.labelKey === "filter.formatGroupDocument",
     );
     expect(documentGroup?.extensions).toEqual(["pdf", "ai"]);
-    expect(OTHER_FORMAT_EXTENSIONS).toEqual(["html", "hdf", "htm"]);
+    expect(OTHER_FORMAT_EXTENSIONS).toEqual(["html", "hdf", "htm", "ppt", "pptx"]);
     expect(FORMAT_UNKNOWN_TOKEN).toBe("unknown");
     expect(allChipTokens()).not.toContain(FORMAT_UNKNOWN_TOKEN);
   });

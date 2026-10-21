@@ -2615,6 +2615,7 @@ export const library: SerpentLibraryApi = Object.freeze({
   },
 
   async pauseMediaJobs({ libraryId, jobIds }: { libraryId: string; jobIds?: string[] }): Promise<LibraryApiResult<{ pausedCount: number }>> {
+    if (jobIds?.length === 0) return { ok: true, value: { pausedCount: 0 } };
     const result = await request({ type: 'media.pause-jobs.request', libraryId, jobIds });
     if (!result.ok) return failure(result);
     if (result.type !== 'media.jobs.paused') throw new Error('Unexpected media pause-jobs response.');
@@ -2622,6 +2623,7 @@ export const library: SerpentLibraryApi = Object.freeze({
   },
 
   async resumeMediaJobs({ libraryId, jobIds }: { libraryId: string; jobIds?: string[] }): Promise<LibraryApiResult<{ resumedCount: number }>> {
+    if (jobIds?.length === 0) return { ok: true, value: { resumedCount: 0 } };
     const result = await request({ type: 'media.resume-jobs.request', libraryId, jobIds });
     if (!result.ok) return failure(result);
     if (result.type !== 'media.jobs.resumed') throw new Error('Unexpected media resume-jobs response.');
@@ -2629,6 +2631,7 @@ export const library: SerpentLibraryApi = Object.freeze({
   },
 
   async cancelMediaJobs({ libraryId, jobIds }: { libraryId: string; jobIds?: string[] }): Promise<LibraryApiResult<{ cancelledCount: number }>> {
+    if (jobIds?.length === 0) return { ok: true, value: { cancelledCount: 0 } };
     const result = await request({ type: 'media.cancel-jobs.request', libraryId, jobIds });
     if (!result.ok) return failure(result);
     if (result.type !== 'media.jobs.cancelled') throw new Error('Unexpected media cancel-jobs response.');
@@ -2636,6 +2639,7 @@ export const library: SerpentLibraryApi = Object.freeze({
   },
 
   async retryMediaJobs({ libraryId, jobIds }: { libraryId: string; jobIds: string[] }): Promise<LibraryApiResult<{ retriedCount: number }>> {
+    if (jobIds.length === 0) return { ok: true, value: { retriedCount: 0 } };
     const result = await request({ type: 'media.retry-jobs.request', libraryId, jobIds });
     if (!result.ok) return failure(result);
     if (result.type !== 'media.jobs.retried') throw new Error('Unexpected media retry-jobs response.');
@@ -2730,6 +2734,7 @@ export const library: SerpentLibraryApi = Object.freeze({
 
   // AI job queue
   async pauseAiJobs({ libraryId, jobIds }: { libraryId: string; jobIds?: string[] }): Promise<LibraryApiResult<{ pausedCount: number }>> {
+    if (jobIds?.length === 0) return { ok: true, value: { pausedCount: 0 } };
     const result = await request({ type: 'ai.pause-jobs.request', libraryId, jobIds });
     if (!result.ok) return failure(result);
     if (result.type !== 'ai.jobs.paused') throw new Error('Unexpected pause-jobs response.');
@@ -2737,6 +2742,7 @@ export const library: SerpentLibraryApi = Object.freeze({
   },
 
   async resumeAiJobs({ libraryId, jobIds }: { libraryId: string; jobIds?: string[] }): Promise<LibraryApiResult<{ resumedCount: number }>> {
+    if (jobIds?.length === 0) return { ok: true, value: { resumedCount: 0 } };
     const result = await request({ type: 'ai.resume-jobs.request', libraryId, jobIds });
     if (!result.ok) return failure(result);
     if (result.type !== 'ai.jobs.resumed') throw new Error('Unexpected resume-jobs response.');
@@ -2744,6 +2750,7 @@ export const library: SerpentLibraryApi = Object.freeze({
   },
 
   async cancelAiJobs({ libraryId, jobIds }: { libraryId: string; jobIds?: string[] }): Promise<LibraryApiResult<{ cancelledCount: number }>> {
+    if (jobIds?.length === 0) return { ok: true, value: { cancelledCount: 0 } };
     const result = await request({ type: 'ai.cancel-jobs.request', libraryId, jobIds });
     if (!result.ok) return failure(result);
     if (result.type !== 'ai.jobs.cancelled') throw new Error('Unexpected cancel-jobs response.');
@@ -2751,6 +2758,7 @@ export const library: SerpentLibraryApi = Object.freeze({
   },
 
   async retryAiJobs({ libraryId, jobIds }: { libraryId: string; jobIds: string[] }): Promise<LibraryApiResult<{ retriedCount: number }>> {
+    if (jobIds.length === 0) return { ok: true, value: { retriedCount: 0 } };
     const result = await request({ type: 'ai.retry-jobs.request', libraryId, jobIds });
     if (!result.ok) return failure(result);
     if (result.type !== 'ai.jobs.retried') throw new Error('Unexpected retry-jobs response.');
