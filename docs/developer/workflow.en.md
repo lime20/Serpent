@@ -53,7 +53,7 @@ When making changes, adhere to these engineering principles:
    - Add tests for Worker or SQLite operations to `tests/worker/`;
    - Run targeted tests to verify your changes:
      ```bash
-     npm run test:unit -- tests/unit/<your-test-file>.test.ts
+     npx vitest run --config vitest.config.ts tests/unit/<your-test-file>.test.ts
      ```
    - If changes touch library opening, database migrations, or underlying filesystem operations, pass the library availability suite:
      ```bash
@@ -99,6 +99,35 @@ For detailed step-by-step instructions, quality gate requirements, and environme
 4. Clearly state the purpose of the change, affected scope, and local test evidence in the PR description;
 5. Maintainers review the change and merge it into `main`;
 6. Merged contributions are acknowledged in [`CONTRIBUTORS.md`](https://github.com/dolag233/Serpent/blob/main/CONTRIBUTORS.md) in the root directory.
+
+### 2.5 Sync a fork's `main` into `develop`
+
+A fork may keep its own `develop` integration branch. Its role differs from the upstream maintainer's `dolag_dev`; upstream Pull Requests still target `main`. This procedure merges the fork's remote `origin/main` into local `develop`. If the fork's `main` is behind upstream, sync the fork first.
+
+Before starting, confirm there are no pending tracked changes. Check `.gitattributes` and `core.autocrlf`, and preserve file encodings, BOMs, line endings, and existing untracked content.
+
+```bash
+git status --short --branch
+git fetch origin
+git switch main
+git merge --ff-only origin/main
+git switch develop
+git merge --no-ff --no-commit main
+```
+
+If local `main` cannot fast-forward, inspect the divergence first. Resolve conflicts by integrating both behaviors rather than choosing one entire file, then stage only the resolved files. Automatic merges still need compatibility checks for shared APIs, protocols, and persisted configuration. For example, multiple connection configurations must retain keyless local connections and separate credentials; presentation covers and manual refresh must retain their existing behavior.
+
+Follow the [Testing Guide](testing.en.md) for type checks, affected unit and Worker tests, and desktop E2E where needed. Review the diff and file formats, commit a pending merge, then push normally:
+
+```bash
+git diff --cached --check
+git commit
+git push origin develop
+git fetch origin
+git rev-list --left-right --count develop...origin/develop
+```
+
+The final command should return `0 0` after a successful sync. If new remote commits reject the push, fetch and integrate them before retrying; avoid force-pushing. Add an existing untracked file only when it explicitly belongs to the current change.
 
 ---
 

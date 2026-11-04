@@ -53,7 +53,7 @@
    - 涉及 Worker、SQLite 数据存储的修改添加测试至 `tests/worker/`；
    - 运行定向测试验证改动：
      ```bash
-     npm run test:unit -- tests/unit/<你的测试文件>.test.ts
+     npx vitest run --config vitest.config.ts tests/unit/<你的测试文件>.test.ts
      ```
    - 若涉及资源库打开、数据库迁移或底层文件操作，必须跑通可用性底线套件：
      ```bash
@@ -99,6 +99,35 @@ git commit -m "feat(canvas): 增加卡片悬停进度跳转"
 4. 在 PR 描述中清晰说明修改目的、涉及范围、以及本地验证所运行的测试命令和结果；
 5. 维护者审查后把改动合并入 `main`；
 6. 合并入项目的贡献会同步收录至根目录的 [`CONTRIBUTORS.md`](https://github.com/dolag233/Serpent/blob/main/CONTRIBUTORS.md) 予以致谢。
+
+### 2.5 Fork 的 `main` 同步到 `develop`
+
+Fork 可以保留自己的 `develop` 集成分支；它与上游维护者的 `dolag_dev` 分工不同，向上游提交 Pull Request 时仍以 `main` 为目标。以下流程把 Fork 远端 `origin/main` 合入本地 `develop`；如果 Fork 的 `main` 尚未同步上游，先完成 Fork 同步。
+
+开始前确认受跟踪文件没有待提交修改，核对 `.gitattributes` 和 `core.autocrlf`，保留文件原编码、BOM、换行及已有未跟踪内容。
+
+```bash
+git status --short --branch
+git fetch origin
+git switch main
+git merge --ff-only origin/main
+git switch develop
+git merge --no-ff --no-commit main
+```
+
+若 `main` 不能快进更新，先核对分叉原因。若合并有冲突，逐处整合双方行为，不要整文件选择某一侧；随后只暂存已处理的文件。即使 Git 自动合并成功，也要检查共同修改的 API、协议和持久化配置是否兼容。例如，多连接配置仍须支持本地免密钥连接和独立凭据，演示文稿封面与手动刷新仍须满足已有行为。
+
+按[测试指南](testing.md)运行类型检查、受影响的单元/Worker 测试及必要的桌面 E2E。检查差异和编码后，若存在待提交的合并则创建提交，再正常推送：
+
+```bash
+git diff --cached --check
+git commit
+git push origin develop
+git fetch origin
+git rev-list --left-right --count develop...origin/develop
+```
+
+成功同步时最后一条命令应返回 `0 0`。推送若因远端新增提交而被拒绝，重新获取并整合远端改动，避免强制推送。已有未跟踪文件只在明确属于本次改动时逐个加入提交。
 
 ---
 

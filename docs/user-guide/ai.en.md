@@ -1,6 +1,6 @@
 # AI analysis
 
-Serpent’s AI analysis connects to a cloud AI service that you provide by default, and can also connect to a **local model running on this machine or inside WSL**. The cloud route needs a provider account, an API key, and a vision-capable model; the local route needs none of those.
+Serpent’s AI analysis connects to a cloud AI service that you provide by default, and can also connect to a **local model running on this machine or inside WSL**. The cloud route needs a provider account, an API key, and a vision-capable model. The local route needs no provider account or API key, but still needs a vision-capable runtime and model.
 
 ## Configure AI
 
@@ -10,14 +10,21 @@ On Windows open `Main menu → Settings → AI`; on macOS open `Settings → AI`
 
 ### Connect a provider
 
+- Choose `New configuration…` in the connection selector and enter a `Configuration name`, or select a saved configuration to edit it.
 - `API format`: choose the provider interface, such as `DashScope Multimodal (native)`, `OpenAI Chat Completions`, `OpenAI Responses`, `Anthropic Messages`, `Gemini Native`, or `Local model (WSL / OpenAI-compatible)`. With a relay, follow the relay’s interface instructions.
 - `Base URL`: usually leave it empty. For a relay or self-hosted gateway, enter the address supplied by that service. DashScope native uses an `/api/v1` root.
 - `API Key`: paste the provider key. The eye icon shows it temporarily; after saving, the full key is not displayed. Enter a new key to replace it.
 - `Model`: enter the provider’s vision model name. With a valid key, the picker can load models; if that fails, enter the name manually.
-- `Language`: choose one language—Chinese, English, Japanese, or Korean—for descriptions and tags.
-- Click `Test connection`, then `Save` after it succeeds.
+- Click `Test connection` to check the values currently entered, then `Save configuration`. Testing does not save or activate a configuration. After saving a new configuration, click `Set as current`; the `In use` label identifies the connection used for AI analysis.
 
 Never put an API key in a script, plugin, screenshot, issue report, or MCP configuration.
+
+### Manage connection configurations
+
+- Save separate cloud or local connections, each with its own name, API format, base URL, model, and credential. Selecting an entry changes what you edit; click `Set as current` to switch the connection used for analysis. Save pending changes first.
+- A cloud configuration can be saved as a draft without a key, but needs a saved key before activation. A local configuration can be saved and activated without a key; enter its own credential if an authenticating proxy requires one.
+- `Clear saved API key` keeps the configuration: a cloud connection needs a new key, while a local connection can continue without one. `Delete configuration` removes that entry and its saved key. After deleting the active configuration, select another and set it as current.
+- Language, AI write toggles, advanced settings, and automatic-analysis settings are shared across connections. They are not saved separately per configuration. Choose one language—Chinese, English, Japanese, or Korean—for descriptions and tags.
 
 ### Use a local model (including WSL)
 
@@ -30,7 +37,7 @@ With `Local model (WSL / OpenAI-compatible)` selected, analysis requests go to a
    - vLLM: `vllm serve Qwen/Qwen2.5-VL-7B-Instruct`
 2. Selecting `Local model (WSL / OpenAI-compatible)` probes the stock ports once and fills `Base URL` when exactly one server answers. You can also click a preset (`Ollama` / `LM Studio` / `llama.cpp` / `vLLM`), or click `Detect local / WSL servers` to re-probe and pick from the results.
 3. Confirm `Model` accepts images. When the runtime declares capabilities itself (llama.cpp and newer Ollama return `capabilities` in the model list) Serpent uses that; only when the server says nothing does it fall back to judging the model name and warning “may not accept images”.
-4. Leave `API Key` empty, click `Test connection`, then `Save` once it succeeds. `Test connection` tests what is currently on screen — you do not have to save first.
+4. Enter a configuration name, leave `API Key` empty, click `Test connection`, then `Save configuration` and `Set as current`. Testing uses the values currently on screen; it does not require saving first and does not activate the configuration.
 
 **WSL reachability**
 

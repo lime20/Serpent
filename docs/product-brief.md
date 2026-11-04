@@ -337,6 +337,7 @@ MVP：
 
 - 以连接云端 AI 模型为默认路径，同时支持用户自己启动的本地模型服务。
 - 云端由用户填写并自行承担第三方模型 API Key 与费用；本地端点不需要 API Key。
+- 支持保存多份具名连接配置，各自维护接口格式、模型、地址和独立密钥；保存新配置后须显式设为当前。本地配置可无密钥保存和启用，语言、写入开关与高级分析设置由所有连接共用。
 - Serpent 不提供官方代理、账号额度或商业化 AI 服务。
 - 内置 DashScope、OpenAI Chat Completions、OpenAI Responses、Anthropic Messages 和 Gemini Native 适配器；它们使用统一的 Serpent 内部请求与结构化输出协议，但分别处理各供应商 API 差异。
 - 支持连接用户自行启动的本地模型服务（Ollama / LM Studio / llama.cpp / vLLM），包括运行在 WSL 中的服务：本地端点免 API Key，可自动探测本机回环端口与 `wsl hostname -I` 给出的发行版地址，并复用同一套 OpenAI 兼容请求路径与结构化输出回退。
