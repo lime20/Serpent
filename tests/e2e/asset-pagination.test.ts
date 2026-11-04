@@ -53,8 +53,16 @@ test("ordinary browsing continuously appends every asset without page controls",
     await window.getByRole("textbox", { name: "名称" }).fill(libraryName);
     await window.getByRole("button", { name: "创建", exact: true }).click();
     await window.getByRole("button", { name: "添加文件夹" }).click();
-    await window.getByLabel("新文件夹名称").fill("分页文件夹");
-    await window.keyboard.press("Enter");
+    const newFolderInput = window.locator(".nav-inline-edit input");
+    await expect(newFolderInput).toBeVisible({ timeout: 5_000 });
+    await newFolderInput.fill("分页文件夹");
+    await newFolderInput.press("Enter");
+    await expect(window.locator(".nav-inline-edit")).toHaveCount(0, {
+      timeout: 10_000,
+    });
+    await expect(sidebarFolderRow(window, "分页文件夹")).toBeVisible({
+      timeout: 15_000,
+    });
     await sidebarFolderRow(window, "分页文件夹").click();
     await window
       .getByRole("button", { name: "导入文件", exact: true })
@@ -165,8 +173,21 @@ test("ordinary browsing continuously appends every asset without page controls",
       await sizeControl.fill(String(clamped));
       return clamped;
     }
-    await fillCardSize(3);
-    const anchorCard = window.locator(".asset-card").nth(30);
+    // Start one step below the current maximum so the following Ctrl+wheel
+    // always has a valid stop to advance to, independent of the window width.
+    const maxSizeIndex = await currentMaxSizeIndex();
+    const startSizeIndex = Math.max(0, maxSizeIndex - 1);
+    await fillCardSize(startSizeIndex);
+    const anchorCard = window
+      .locator(".asset-card")
+      .filter({ hasText: "asset-030.txt" });
+    // The canvas is windowed, so an offscreen card is not necessarily in the
+    // DOM and cannot be scrolled into view by Playwright. Move near its
+    // logical position first, then wait for virtualization to mount it.
+    await workspaceCanvas.evaluate((element) =>
+      element.scrollTo(0, element.scrollHeight * 0.2),
+    );
+    await expect(anchorCard).toHaveCount(1, { timeout: 15_000 });
     await anchorCard.scrollIntoViewIfNeeded();
     const anchorAssetId = await anchorCard.getAttribute("data-asset-id");
     const anchorBox = await anchorCard.boundingBox();
@@ -186,11 +207,17 @@ test("ordinary browsing continuously appends every asset without page controls",
     );
     await window.keyboard.down("Control");
     await window.mouse.wheel(0, -120);
-    await window.keyboard.up("Control");
-    await expect
-      .poll(async () => Number(await sizeControl.inputValue()))
-      .toBeGreaterThan(sizeBeforeWheel);
+    try {
+      await expect
+        .poll(async () => Number(await sizeControl.inputValue()))
+        .toBeGreaterThan(sizeBeforeWheel);
+    } finally {
+      await window.keyboard.up("Control");
+    }
     expect(anchorAssetId).not.toBeNull();
+    // The control value updates before the virtual layout finishes. Wait for
+    // the same anchor restoration barrier used before the masonry assertions.
+    await expect(workspaceCanvas).not.toHaveClass(/is-reflow-restoring/);
     await expect(
       window.locator(`[data-asset-id="${anchorAssetId}"]`),
     ).toBeInViewport();
@@ -398,9 +425,15 @@ test("ordinary browsing continuously appends every asset without page controls",
           await expect(
             textViewer.getByRole("button", { name: "重试生成" }),
           ).toHaveCount(0);
-          await textViewer
-            .getByRole("button", { name: "关闭", exact: true })
-            .click();
+          const closeButton = textViewer.getByRole("button", { name: "关闭", exact: true });
+          // Offscreen Chromium can resolve a pointer click without delivering
+          // its onClick; use the same button's keyboard action in hidden perf
+          // runs. The ordinary visible journey still checks the pointer path.
+          if (process.env.SERPENT_E2E_PERF_OFFSCREEN === "1") {
+            await closeButton.press("Enter");
+          } else {
+            await closeButton.click();
+          }
           await expect(textViewer).toBeHidden();
           await expect(workspaceCanvas).toBeVisible();
           // Reflow may slightly adjust the raw offset after the text viewer

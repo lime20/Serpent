@@ -38,6 +38,7 @@ import {
 } from "../shared/embedding/modalities";
 import type { EmbeddingHttpAdapter } from "../shared/embedding/http-service";
 import { Icon, type IconName } from "./Icons";
+import { formatRuntimeShortcut } from "./shortcut-runtime";
 import { TagPickerEntry, TagPickerMenu } from "./TagPickerMenu";
 import { CollectionPickerMenu } from "./CollectionPickerMenu";
 import { ColorSpaceSubmenuItems } from "./ColorSpacePickerMenu";
@@ -814,6 +815,10 @@ export function AssetContextMenu(props: AssetContextMenuProps) {
                   <ContextMenuItem
                     icon={<Icon name="close" size={14} />}
                     label={t("tabs.close")}
+                    shortcut={formatRuntimeShortcut(
+                      "workspace.close-tab",
+                      isMac ? "mac" : "windows",
+                    ) ?? undefined}
                     onAction={() => props.onCloseWorkspaceTab(desc.tabId)}
                   />
                 ) : null}
@@ -1409,6 +1414,7 @@ export function AssetContextMenu(props: AssetContextMenuProps) {
                   <ContextMenuItem
                     icon={<Icon name="file" size={14} />}
                     label={copyPathItem.label}
+                    shortcut={copyPathItem.shortcutLabel ?? undefined}
                     disabled={copyPathItem.disabled}
                     disabledReason={copyPathItem.disabledReason ?? undefined}
                     onAction={() => runSidebarCommand("folder.copy-path")}
@@ -2391,6 +2397,7 @@ export function AssetContextMenu(props: AssetContextMenuProps) {
                     <ContextMenuItem
                       icon={<Icon name="file" size={14} />}
                       label={copyFilePathItem.label}
+                      shortcut={copyFilePathItem.shortcutLabel ?? undefined}
                       disabled={copyFilePathItem.disabled}
                       disabledReason={
                         copyFilePathItem.disabledReason ?? undefined

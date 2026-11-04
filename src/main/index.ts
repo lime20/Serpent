@@ -8,9 +8,11 @@ import {
   appendFileSync,
   existsSync,
   mkdirSync,
+  readdirSync,
   readFileSync,
   rmSync,
   writeFileSync,
+  type Dirent,
 } from "node:fs";
 
 import {
@@ -35,6 +37,7 @@ import {
   setApplicationMenuCommandLabel,
 } from "./application-menu";
 import { applyDevAppIcon, appIconImage } from "./app-icon";
+import { mcpFullAccessConfirmationCopy } from "./mcp-full-access-confirmation-copy";
 import { ArtifactPathCache } from "./artifact-path-cache";
 import { createWindowsInstallerCleanupInvocation } from "./windows-installer-cleanup";
 import { SourcePathCache, type SourcePathResolution } from "./source-path-cache";
@@ -84,6 +87,34 @@ import {
   type SyncBindingRecord,
 } from "./library-request/sync";
 import { tryHandleAiOwnedRequest } from "./library-request/ai";
+import {
+  recoverAiProfileTransaction as recoverAiProfileTransactionFromJournal,
+  commitAiProfileTransaction as commitAiProfileTransactionToJournal,
+  type AiProfileCredentialMutation,
+  type AiProfileTransactionIo,
+} from "./ai-profile-transaction";
+import {
+  runAiProfileMigrationStartup,
+} from "./ai-profile-legacy-config";
+import {
+  activateAiProfile,
+  AiProfileStorageError,
+  captureAiConnectionSnapshot,
+  createAiProfileId,
+  deleteAiProfile,
+  emptyAiProfileCatalog,
+  AiProfileValidationError,
+  isAiProfileId,
+  legacyAiConnectionProfile,
+  migrateAiProfileStorage,
+  parseAiProfileCatalog,
+  resolveAiCredential,
+  saveAiConnectionProfile as saveAiProfileInCatalog,
+  summarizeAiProfiles,
+  type AiConnectionProfileDraft,
+  type AiProfileCatalog,
+} from "./ai-profile-store";
+import { readAtomicJsonFile, writeAtomicJsonFile } from "./atomic-json-file";
 import { tryHandleEmbeddingModelRequest } from "./library-request/embedding-models";
 import { EmbeddingTestIndex } from "./embedding-test-index";
 import { EmbeddingHttpIndex } from "./embedding-http-index";
@@ -218,6 +249,7 @@ import {
 import {
   ASSET_CHANGE_CHANNEL,
   ASSET_NATIVE_DRAG_CHANNEL,
+  ASSET_NATIVE_DRAG_READINESS_CHANNEL,
   ASSET_NATIVE_DRAG_PRIME_CHANNEL,
   EXTENSION_SAVE_COMPLETED_CHANNEL,
   THUMBNAIL_CHANNEL,
@@ -297,6 +329,7 @@ import {
 } from './automation-execution-journal';
 import { createJsonFileAutomationIdempotencyStore } from './automation-idempotency-store';
 import { EmbeddedMcpServer, EmbeddedMcpServerError } from './embedded-mcp-server';
+import { McpCredentialStoreError } from './mcp-client-credentials';
 import { McpPermissionBroker } from './mcp-permission-broker';
 import { McpPermissionPolicyStore } from './mcp-permission-policy-store';
 import { McpOperationChallengeStore } from './mcp-operation-challenge';
@@ -369,7 +402,7 @@ import {
   shouldHideApplicationMenuBar,
   shouldUseFramelessTitleBar,
 } from "../shared/window-controls";
-import { matchViewerVideoLetterShortcut } from "../shared/viewer-video-shortcuts";
+import { matchViewerVideoLetterShortcut, viewerShortcutRepeatForward } from "../shared/viewer-video-shortcuts";
 import {
   resolveOpenExternalUrlTarget,
   type OpenExternalUrlResult,
@@ -444,35 +477,32 @@ import {
 import { AiQueueScheduler } from "./ai-queue-scheduler";
 import {
   DEFAULT_AI_ANALYSIS_SETTINGS,
-  normalizeAiAnalysisSettings,
   toWireAiAnalysisSettings,
   type AiAnalysisSettings,
 } from "../shared/ai-analysis-settings";
 import {
   AI_ANALYSIS_QUEUE_BATCH_SIZE,
   DEFAULT_AI_ANALYSIS_CONCURRENCY,
-  normalizeAiAnalysisConcurrency,
 } from "../shared/ai-concurrency";
 import {
   DEFAULT_AI_ANALYSIS_IMAGE_EDGE_PX,
-  normalizeAiAnalysisImageEdgePx,
 } from "../shared/ai-analysis-image";
 import {
   DEFAULT_AI_RELIABILITY_SETTINGS,
-  normalizeAiReliabilitySettings,
   type AiReliabilitySettings,
 } from "../shared/ai-reliability";
 import {
   DEFAULT_AI_API_FORMAT,
-  DEFAULT_AI_LANGUAGES,
   DEFAULT_AI_MODELS,
   aiApiFormatRequiresApiKey,
   aiConfigHasCredentials,
-  migrateLegacyProviderToApiFormat,
-  normalizeAiLanguages,
   type AiApiFormat,
 } from "../shared/ai-endpoints";
 import { discoverLocalAiEndpoints } from "./ai-local-endpoint-probe";
+import {
+  normalizeAiAnalysisPreferences,
+  type AiAnalysisPreferences,
+} from "./ai-analysis-preferences";
 import { createArtifactResponse } from "./artifact-response";
 import { PreviewCache } from "./preview-cache";
 import {
@@ -661,7 +691,9 @@ function clearArtifactPathCache(libraryId?: string): void {
 }
 
 function evictArtifactPathCache(libraryId: string): void {
-  artifactPathCache.evictLibrary(libraryId);
+  // An async path batch may have started before this asset change. Fence its
+  // completion as well as evicting existing entries, or stale paths reappear.
+  artifactPathCache.clearLibrary(libraryId);
 }
 
 function cancelArtifactPathBatches(libraryId: string): void {
@@ -751,6 +783,7 @@ function resolveArtifactPathBatched(
   });
 }
 const nativeAssetDragCache = new NativeAssetDragCache();
+const lastVisibleDragAssetIds = new Map<string, string[]>();
 /**
  * Serpent-8ee170: every media completion enqueues here instead of issuing its
  * own Worker request, so a 2,000-job wave cannot become 2,000 background
@@ -781,12 +814,32 @@ const nativeAssetDragPrimer = new NativeAssetDragPrimeScheduler({
     } else {
       nativeAssetDragCache.upsert(libraryId, entries as Parameters<NativeAssetDragCache["upsert"]>[1]);
     }
+    const dragWindow = mainWindow;
+    if (dragWindow && !dragWindow.isDestroyed()) {
+      if (mode === "replace") {
+        dragWindow.webContents.send(ASSET_NATIVE_DRAG_READINESS_CHANNEL, {
+          type: "clear", libraryId,
+        });
+      }
+      dragWindow.webContents.send(ASSET_NATIVE_DRAG_READINESS_CHANNEL, {
+        type: "ready", libraryId,
+        assetIds: (entries as Parameters<NativeAssetDragCache["upsert"]>[1])
+          .map((entry) => entry.assetId),
+      });
+    }
   },
 });
 
 function clearNativeAssetDragCache(libraryId: string): void {
+  lastVisibleDragAssetIds.delete(libraryId);
   nativeAssetDragCache.clear(libraryId);
   nativeAssetDragPrimer.invalidate(libraryId);
+  const dragWindow = mainWindow;
+  if (dragWindow && !dragWindow.isDestroyed()) {
+    dragWindow.webContents.send(ASSET_NATIVE_DRAG_READINESS_CHANNEL, {
+      type: "clear", libraryId,
+    });
+  }
 }
 /**
  * Serpent-1e3d4f: Chromium never persists custom-protocol responses on disk,
@@ -828,6 +881,7 @@ let appLogPath: string | undefined;
 let appUpdateService: AppUpdateService | undefined;
 let automationExecutionJournal: AutomationExecutionJournal | undefined;
 let embeddedMcpServer: EmbeddedMcpServer | undefined;
+let embeddedMcpInitializationFailure: McpCredentialStoreError | undefined;
 let automationCommandGateway: AutomationCommandGateway | undefined;
 let mcpPermissionPolicyStore: McpPermissionPolicyStore | undefined;
 let mcpOperationChallengeStore: McpOperationChallengeStore | undefined;
@@ -1246,6 +1300,13 @@ interface AiConfig {
   disclaimerAccepted: boolean;
 }
 
+type LegacyAiConfig = Partial<AiConfig> & {
+  provider?: string;
+  language?: string;
+  apiFormat?: string;
+  languages?: unknown;
+};
+
 const DEFAULT_AI_CONFIG: AiConfig = {
   apiFormat: DEFAULT_AI_API_FORMAT,
   model: DEFAULT_AI_MODELS[DEFAULT_AI_API_FORMAT],
@@ -1266,8 +1327,28 @@ function aiConfigPath(): string {
   return path.join(app.getPath("userData"), "ai-config.json");
 }
 
+function aiProfilesPath(): string {
+  return path.join(app.getPath("userData"), "ai-profiles.json");
+}
+
+function aiAnalysisSettingsPath(): string {
+  return path.join(app.getPath("userData"), "ai-analysis-settings.json");
+}
+
+function aiProfileMigrationPath(): string {
+  return path.join(app.getPath("userData"), "ai-profile-migration.json");
+}
+
+function aiProfileTransactionPath(): string {
+  return path.join(app.getPath("userData"), "ai-profile-transaction.json");
+}
+
 function aiKeyPath(): string {
   return path.join(app.getPath("userData"), "ai-key.enc");
+}
+
+function aiProfileKeyPath(id: string): string {
+  return path.join(app.getPath("userData"), "ai-profile-keys", `${id}.bin`);
 }
 
 // ── Serpent-xffq: 同步服务器（全局）与库绑定持久化 ───────────────────
@@ -1401,101 +1482,324 @@ function resolveSyncServerCredentials(serverId: string): {
   };
 }
 
-function loadAiConfig(): AiConfig & { hasKey: boolean } {
+function normalizeLegacyAiAnalysisPreferences(
+  parsed: LegacyAiConfig | null,
+): AiAnalysisPreferences {
+  return normalizeAiAnalysisPreferences(parsed);
+}
+
+function readAiProfileCatalog(required = false): AiProfileCatalog {
+  recoverAiProfileTransactionIfPresent();
+  const raw = readAtomicJsonFile(aiProfilesPath());
+  if (raw === undefined) {
+    if (required) throw new Error("AI profile catalog is missing after migration.");
+    return emptyAiProfileCatalog();
+  }
+  return parseAiProfileCatalog(JSON.parse(raw) as unknown);
+}
+
+function aiProfileTransactionIo(): AiProfileTransactionIo {
+  return {
+    readJournal: () => readAtomicJsonFile(aiProfileTransactionPath()) ?? null,
+    writeJournal: (contents) => writeAtomicJsonFile(aiProfileTransactionPath(), contents),
+    writeCredential: (profileId, encryptedCredentialBase64) => {
+      const filename = aiProfileKeyPath(profileId);
+      mkdirSync(path.dirname(filename), { recursive: true });
+      writeFileSync(filename, Buffer.from(encryptedCredentialBase64, "base64"), {
+        mode: 0o600,
+        flush: true,
+      });
+    },
+    deleteCredential: (profileId) => deleteAiProfileCredential(profileId),
+    writeCatalog: (catalog) => {
+      writeAtomicJsonFile(aiProfilesPath(), JSON.stringify(catalog, null, 2));
+    },
+    deleteJournal: () => rmSync(aiProfileTransactionPath(), { force: true }),
+  };
+}
+
+function recoverAiProfileTransactionIfPresent(): void {
+  recoverAiProfileTransactionFromJournal(aiProfileTransactionIo());
+}
+
+function commitAiProfileCatalogTransaction(
+  profileId: string,
+  catalog: AiProfileCatalog,
+  credential: AiProfileCredentialMutation,
+): void {
+  commitAiProfileTransactionToJournal({
+    version: 1,
+    profileId,
+    credential,
+    catalog,
+  }, aiProfileTransactionIo());
+}
+
+function readAiAnalysisPreferences(): AiAnalysisPreferences {
+  const raw = readAtomicJsonFile(aiAnalysisSettingsPath());
+  if (raw === undefined) return normalizeLegacyAiAnalysisPreferences(null);
+  const parsed: unknown = JSON.parse(raw);
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("AI analysis preferences have an invalid structure.");
+  }
+  return normalizeAiAnalysisPreferences(parsed);
+}
+
+function hasAiProfileCredential(profileId: string): boolean {
+  return existsSync(aiProfileKeyPath(profileId));
+}
+
+function readAiProfileCredential(profileId: string): string {
   try {
-    const raw = readFileSync(aiConfigPath(), "utf-8");
-    const parsed = JSON.parse(raw) as Partial<AiConfig> & {
-      provider?: string;
-      language?: string;
-      apiFormat?: string;
-      languages?: unknown;
-    };
-    const apiFormat =
-      migrateLegacyProviderToApiFormat(parsed.apiFormat) ??
-      migrateLegacyProviderToApiFormat(parsed.provider) ??
-      DEFAULT_AI_CONFIG.apiFormat;
-    const languages = normalizeAiLanguages(
-      parsed.languages ?? parsed.language ?? DEFAULT_AI_LANGUAGES,
-    );
-    const merged: AiConfig = {
-      ...DEFAULT_AI_CONFIG,
-      model: typeof parsed.model === "string" && parsed.model.trim()
-        ? parsed.model
-        : DEFAULT_AI_CONFIG.model,
-      baseUrl: typeof parsed.baseUrl === "string" ? parsed.baseUrl : "",
-      descriptionEnabled:
-        parsed.descriptionEnabled ?? DEFAULT_AI_CONFIG.descriptionEnabled,
-      tagEnabled: parsed.tagEnabled ?? DEFAULT_AI_CONFIG.tagEnabled,
-      ratingEnabled:
-        (parsed as { ratingEnabled?: boolean }).ratingEnabled ??
-        DEFAULT_AI_CONFIG.ratingEnabled,
-      analysisSettings: normalizeAiAnalysisSettings({
-        ...DEFAULT_AI_ANALYSIS_SETTINGS,
-        ...((parsed as { analysisSettings?: Partial<AiAnalysisSettings> })
-          .analysisSettings ?? {}),
-        forceExistingTags:
-          (parsed as { analysisSettings?: { forceExistingTags?: boolean } })
-            .analysisSettings?.forceExistingTags ??
-          DEFAULT_AI_ANALYSIS_SETTINGS.forceExistingTags,
-      }),
-      concurrencyLimit: normalizeAiAnalysisConcurrency(parsed.concurrencyLimit),
-      maxAnalysisImageEdgePx: normalizeAiAnalysisImageEdgePx(
-        (parsed as { maxAnalysisImageEdgePx?: unknown }).maxAnalysisImageEdgePx,
-      ),
-      reliabilitySettings: normalizeAiReliabilitySettings(
-        parsed.reliabilitySettings,
-      ),
-      autoAnalyzeEnabled:
-        parsed.autoAnalyzeEnabled ?? DEFAULT_AI_CONFIG.autoAnalyzeEnabled,
-      disclaimerAccepted:
-        parsed.disclaimerAccepted ?? DEFAULT_AI_CONFIG.disclaimerAccepted,
-      apiFormat,
-      languages,
-    };
-    const hasKey = existsSync(aiKeyPath());
-    return { ...merged, hasKey };
+    return safeStorage.decryptString(readFileSync(aiProfileKeyPath(profileId)));
   } catch {
-    const hasKey = existsSync(aiKeyPath());
-    return { ...DEFAULT_AI_CONFIG, hasKey };
+    throw new Error("AI API key not configured or could not be decrypted.");
+  }
+}
+
+function writeAiProfileCredential(profileId: string, apiKey: string): void {
+  if (!safeStorage.isEncryptionAvailable()) {
+    throw new Error("Secure credential storage is unavailable.");
+  }
+  const filename = aiProfileKeyPath(profileId);
+  mkdirSync(path.dirname(filename), { recursive: true });
+  writeFileSync(filename, safeStorage.encryptString(apiKey), { mode: 0o600, flush: true });
+}
+
+function deleteAiProfileCredential(profileId: string): void {
+  rmSync(aiProfileKeyPath(profileId), { force: true });
+}
+
+function cleanupOrphanAiProfileCredentials(catalog: AiProfileCatalog): void {
+  const directory = path.join(app.getPath("userData"), "ai-profile-keys");
+  if (!existsSync(directory)) return;
+
+  let entries: Dirent[];
+  try {
+    entries = readdirSync(directory, { withFileTypes: true });
+  } catch (error) {
+    logger?.error("ai.profile-keys.orphan-cleanup", error);
+    return;
+  }
+
+  const knownProfileIds = new Set(catalog.profiles.map((profile) => profile.id));
+  for (const entry of entries) {
+    if (!entry.isFile() || !entry.name.endsWith(".bin")) continue;
+    const profileId = entry.name.slice(0, -".bin".length);
+    if (!isAiProfileId(profileId) || knownProfileIds.has(profileId)) continue;
+    try {
+      rmSync(path.join(directory, entry.name), { force: true });
+    } catch (error) {
+      // Migration is still usable; this runs on every load so failed removals retry.
+      logger?.error("ai.profile-keys.orphan-cleanup", error);
+    }
+  }
+}
+
+function ensureAiProfileMigration(): void {
+  recoverAiProfileTransactionIfPresent();
+  const markerPath = aiProfileMigrationPath();
+  const markerContents = readAtomicJsonFile(markerPath);
+  let markerVersion: number | null = null;
+  if (markerContents !== undefined) {
+    const marker: unknown = JSON.parse(markerContents);
+    if (!marker || typeof marker !== "object" || Array.isArray(marker)) {
+      throw new Error("AI profile migration marker has an invalid structure.");
+    }
+    const version = (marker as { version?: unknown }).version;
+    if (version !== 1) throw new Error("AI profile migration marker has an unsupported version.");
+    markerVersion = version;
+  }
+
+  runAiProfileMigrationStartup<LegacyAiConfig, void>({
+    markerVersion,
+    readLegacyConfig: () => readFileSync(aiConfigPath()),
+    recoverCompletedMigration: () => {
+      const catalog = readAiProfileCatalog(true);
+      cleanupOrphanAiProfileCredentials(catalog);
+      cleanupLegacyAiConfig();
+    },
+    migrate: (legacy) => {
+      const legacyKeyExists = existsSync(aiKeyPath());
+      migrateAiProfileStorage({
+        markerExists: () => false,
+        readCatalog: () => existsSync(aiProfilesPath()) ? readAiProfileCatalog() : null,
+        cleanupOrphanCredentials: cleanupOrphanAiProfileCredentials,
+        readPreferences: () => {
+          if (!existsSync(aiAnalysisSettingsPath())) return null;
+          return JSON.parse(readFileSync(aiAnalysisSettingsPath(), "utf-8")) as unknown;
+        },
+        legacyProfile: legacy !== null || legacyKeyExists
+          ? legacyAiConnectionProfile({
+              apiFormat: legacy?.apiFormat,
+              provider: legacy?.provider,
+              model: legacy?.model,
+              baseUrl: legacy?.baseUrl,
+            })
+          : null,
+        readLegacyCredential: () => legacyKeyExists
+          ? safeStorage.decryptString(readFileSync(aiKeyPath()))
+          : null,
+        writeCredential: writeAiProfileCredential,
+        verifyCredential: (profileId) => { readAiProfileCredential(profileId); },
+        defaultPreferences: normalizeLegacyAiAnalysisPreferences(null),
+        normalizeLegacyPreferences: () => legacy
+          ? normalizeLegacyAiAnalysisPreferences(legacy)
+          : null,
+        writeCatalog: (catalog) => {
+          writeAtomicJsonFile(aiProfilesPath(), JSON.stringify(catalog, null, 2));
+        },
+        writePreferences: (preferences) => {
+          writeAtomicJsonFile(aiAnalysisSettingsPath(), JSON.stringify(preferences, null, 2));
+        },
+        writeMarker: () => {
+          writeAtomicJsonFile(markerPath, JSON.stringify({ version: 1 }, null, 2));
+        },
+        cleanupLegacy: cleanupLegacyAiConfig,
+      });
+    },
+  });
+}
+
+function cleanupLegacyAiConfig(): void {
+  try {
+    rmSync(aiConfigPath(), { force: true });
+    rmSync(aiKeyPath(), { force: true });
+  } catch (error) {
+    logger?.error("ai.profile-migration.cleanup", error);
+  }
+}
+
+function loadAiConfig(): AiConfig & {
+  hasKey: boolean;
+  activeProfileId: string | null;
+  profiles: ReturnType<typeof summarizeAiProfiles>;
+} {
+  try {
+    ensureAiProfileMigration();
+    const catalog = readAiProfileCatalog();
+    const profile = catalog.profiles.find((item) => item.id === catalog.activeProfileId);
+    const preferences = readAiAnalysisPreferences();
+    return {
+      ...(profile ?? {
+        apiFormat: DEFAULT_AI_CONFIG.apiFormat,
+        model: DEFAULT_AI_CONFIG.model,
+        baseUrl: DEFAULT_AI_CONFIG.baseUrl,
+      }),
+      ...preferences,
+      activeProfileId: profile?.id ?? null,
+      profiles: summarizeAiProfiles(catalog, hasAiProfileCredential),
+      hasKey: profile ? hasAiProfileCredential(profile.id) : false,
+    };
+  } catch (error) {
+    if (error instanceof AiProfileStorageError) throw error;
+    throw new AiProfileStorageError(error);
   }
 }
 
 function saveAiConfig(config: AiConfig): void {
-  const toSave: Record<string, unknown> = {};
-  toSave.apiFormat = config.apiFormat;
-  toSave.model = config.model;
-  toSave.baseUrl = config.baseUrl;
-  toSave.descriptionEnabled = config.descriptionEnabled;
-  toSave.tagEnabled = config.tagEnabled;
-  toSave.ratingEnabled = config.ratingEnabled;
-  toSave.analysisSettings = config.analysisSettings;
-  toSave.concurrencyLimit = config.concurrencyLimit;
-  toSave.maxAnalysisImageEdgePx = config.maxAnalysisImageEdgePx;
-  toSave.reliabilitySettings = config.reliabilitySettings;
-  toSave.languages = config.languages;
-  toSave.autoAnalyzeEnabled = config.autoAnalyzeEnabled;
-  toSave.disclaimerAccepted = config.disclaimerAccepted;
-  writeFileSync(aiConfigPath(), JSON.stringify(toSave, null, 2), "utf-8");
+  ensureAiProfileMigration();
+  const preferences: AiAnalysisPreferences = {
+    descriptionEnabled: config.descriptionEnabled,
+    tagEnabled: config.tagEnabled,
+    ratingEnabled: config.ratingEnabled,
+    analysisSettings: config.analysisSettings,
+    concurrencyLimit: config.concurrencyLimit,
+    maxAnalysisImageEdgePx: config.maxAnalysisImageEdgePx,
+    reliabilitySettings: config.reliabilitySettings,
+    languages: config.languages,
+    autoAnalyzeEnabled: config.autoAnalyzeEnabled,
+    disclaimerAccepted: config.disclaimerAccepted,
+  };
+  writeAtomicJsonFile(aiAnalysisSettingsPath(), JSON.stringify(preferences, null, 2));
+}
+
+function saveAiConnectionProfile(
+  draft: AiConnectionProfileDraft & { apiKey?: string; clearCredential?: boolean },
+): string {
+  ensureAiProfileMigration();
+  const catalog = readAiProfileCatalog();
+  const profileId = draft.id ?? createAiProfileId();
+  const next = saveAiProfileInCatalog(catalog, { ...draft, id: profileId });
+  const key = draft.apiKey?.trim();
+  let credential: AiProfileCredentialMutation = { kind: "preserve" };
+  if (key) {
+    if (!safeStorage.isEncryptionAvailable()) {
+      throw new Error("Secure credential storage is unavailable.");
+    }
+    credential = {
+      kind: "write",
+      encryptedCredentialBase64: safeStorage.encryptString(key).toString("base64"),
+    };
+  } else if (draft.clearCredential) {
+    credential = { kind: "delete" };
+  }
+  commitAiProfileCatalogTransaction(profileId, next, credential);
+  return profileId;
+}
+
+function activateAiConnectionProfile(profileId: string): void {
+  ensureAiProfileMigration();
+  const catalog = readAiProfileCatalog();
+  const next = activateAiProfile(catalog, profileId);
+  const profile = catalog.profiles.find((item) => item.id === profileId)!;
+  if (aiApiFormatRequiresApiKey(profile.apiFormat) && !hasAiProfileCredential(profileId)) {
+    throw new AiProfileValidationError("AI profile has no saved credential.");
+  }
+  if (hasAiProfileCredential(profileId)) readAiProfileCredential(profileId);
+  commitAiProfileCatalogTransaction(profileId, next, { kind: "preserve" });
+}
+
+function deleteAiConnectionProfile(profileId: string): void {
+  ensureAiProfileMigration();
+  const catalog = readAiProfileCatalog();
+  const next = deleteAiProfile(catalog, profileId);
+  commitAiProfileCatalogTransaction(profileId, next, { kind: "delete" });
 }
 
 function getDecryptedApiKey(): string {
+  const config = loadAiConfig();
+  if (!aiApiFormatRequiresApiKey(config.apiFormat) && !config.hasKey) return "";
+  const activeProfileId = config.activeProfileId;
+  return resolveAiCredential(
+    activeProfileId,
+    hasCompletedAiProfileMigration(),
+    readAiProfileCredential,
+    () => {
+      // Keep the previous installation usable if migration cannot finish
+      // because the new profile files or secure storage are temporarily unavailable.
+      try {
+        return safeStorage.decryptString(readFileSync(aiKeyPath()));
+      } catch {
+        throw new Error("AI API key not configured.");
+      }
+    },
+  );
+}
+
+function hasCompletedAiProfileMigration(): boolean {
   try {
-    const encrypted = readFileSync(aiKeyPath());
-    return safeStorage.decryptString(encrypted);
-  } catch (error) {
-    // Keyless local runtimes (Ollama / llama.cpp / …) have no credential to
-    // decrypt. Returning an empty key keeps every existing call site working:
-    // adapters omit the Authorization header instead of failing the request.
-    if (!aiApiFormatRequiresApiKey(loadAiConfig().apiFormat)) return "";
-    throw new Error("AI API key not configured or could not be decrypted.", {
-      cause: error,
-    });
+    const marker = JSON.parse(readFileSync(aiProfileMigrationPath(), "utf-8")) as {
+      version?: unknown;
+    };
+    return marker.version === 1;
+  } catch {
+    return false;
   }
 }
 
-function saveEncryptedApiKey(apiKey: string): void {
-  const encrypted = safeStorage.encryptString(apiKey);
-  writeFileSync(aiKeyPath(), encrypted);
+function getDecryptedProfileApiKey(profileId: string): string {
+  try {
+    const profile = readAiProfileCatalog().profiles.find((item) => item.id === profileId);
+    if (!profile) {
+      throw new Error("AI profile does not exist.");
+    }
+    if (!aiApiFormatRequiresApiKey(profile.apiFormat) && !hasAiProfileCredential(profileId)) return "";
+    return readAiProfileCredential(profileId);
+  } catch (error) {
+    if (error instanceof AiProfileStorageError) throw error;
+    throw new AiProfileStorageError(error);
+  }
 }
 
 function focusMainWindow(): boolean {
@@ -2047,6 +2351,10 @@ async function createMainWindow(): Promise<void> {
       sandbox: true,
       contextIsolation: true,
       nodeIntegration: false,
+      // The opt-in performance harness needs frames while remaining hidden.
+      ...(process.env.SERPENT_E2E === "1" && process.env.SERPENT_E2E_PERF_OFFSCREEN === "1"
+        ? { offscreen: true, backgroundThrottling: false }
+        : {}),
     },
   });
 
@@ -2142,7 +2450,7 @@ async function createMainWindow(): Promise<void> {
         if (appAction) forwardApplicationShortcutToWindow(window, appAction);
         return;
       }
-      const browseAction = matchBrowseKeyboardShortcut({
+      const browseInput = {
         type: input.type,
         code: input.code,
         key: input.key,
@@ -2151,9 +2459,25 @@ async function createMainWindow(): Promise<void> {
         meta: input.meta,
         alt: input.alt,
         shift: input.shift,
+      };
+      const browseAction = matchBrowseKeyboardShortcut(browseInput, {
+        bindings: readShortcutBindingsSnapshot(),
+        platform: shortcutPlatformFromProcess(process.platform),
       });
       if (browseAction) {
-        forwardBrowseShortcut(window.webContents, browseAction);
+        if (browseAction === "copy-path") {
+          event.preventDefault();
+          forwardBrowseShortcut(window.webContents, browseAction, {
+            key: input.key,
+            code: input.code,
+            ctrlKey: input.control,
+            metaKey: input.meta,
+            altKey: input.alt,
+            shiftKey: input.shift,
+          });
+        } else {
+          forwardBrowseShortcut(window.webContents, browseAction);
+        }
       }
     }
     if (!isViewerVideoShortcutContentsActive(window.webContents.id)) {
@@ -2190,7 +2514,12 @@ async function createMainWindow(): Promise<void> {
       : null;
     if (!action && !repeatedViewerAction) return;
     event.preventDefault();
-    if (action) forwardViewerVideoShortcut(window.webContents, action);
+    const forward = viewerShortcutRepeatForward(action, repeatedViewerAction);
+    if (forward) {
+      forwardViewerVideoShortcut(window.webContents, forward.action, {
+        repeat: forward.repeat,
+      });
+    }
   });
   // Defense in depth (Serpent-46i9): even if a page-zoom accelerator sneaks
   // back into the menu, Chromium must not rescale the whole UI.
@@ -2693,6 +3022,14 @@ function publishAssetChange(event: AssetChangeEvent): void {
   // library.changed channel and do not evict the viewer's hot path.
   sourcePathCache.clearLibrary(parsed.libraryId);
   evictArtifactPathCache(parsed.libraryId);
+  if (parsed.nativeDragPathsChanged === true || parsed.source === "watcher") {
+    const visibleDragIds = lastVisibleDragAssetIds.get(parsed.libraryId);
+    clearNativeAssetDragCache(parsed.libraryId);
+    if (visibleDragIds) {
+      lastVisibleDragAssetIds.set(parsed.libraryId, visibleDragIds);
+      nativeAssetDragPrimer.scheduleVisible(parsed.libraryId, visibleDragIds);
+    }
+  }
   embeddingTestIndex?.catchUp(parsed.libraryId);
   embeddingHttpIndex?.catchUp(parsed.libraryId);
   pluginActivationCoordinator?.fanOutDomainEvent(createPluginDomainEvent({
@@ -2780,16 +3117,11 @@ async function enqueueAutoAnalyzeAfterImport(
   importedAssetIds: string[],
   folderId?: string,
 ): Promise<void> {
-  const config = loadAiConfig();
-  if (
-    !config.autoAnalyzeEnabled ||
-    !aiConfigHasCredentials({ hasKey: config.hasKey, apiFormat: config.apiFormat })
-  ) {
-    return;
-  }
-  if ((importedAssetIds.length === 0 && !folderId) || !workerClient) return;
-
   try {
+    const config = loadAiConfig();
+    if (!config.autoAnalyzeEnabled || !aiConfigHasCredentials(config)) return;
+    if ((importedAssetIds.length === 0 && !folderId) || !workerClient) return;
+
     const result = await workerClient.request({
       type: "ai.enqueue-analysis",
       libraryId,
@@ -2810,9 +3142,13 @@ async function enqueueAutoAnalyzeAfterImport(
 }
 
 async function processAiQueue(libraryId: string): Promise<void> {
-  const config = loadAiConfig();
-  aiQueueScheduler.setRetryPolicy(config.reliabilitySettings);
-  await aiQueueScheduler.trigger(libraryId);
+  try {
+    const config = loadAiConfig();
+    aiQueueScheduler.setRetryPolicy(config.reliabilitySettings);
+    await aiQueueScheduler.trigger(libraryId);
+  } catch (error) {
+    logger?.error("ai.queue.config", error, { libraryId });
+  }
 }
 
 /** Global menu preference: linked-folder assets with a missing source stay listed. */
@@ -2871,15 +3207,32 @@ async function processAiQueueBatch(
   libraryId: string,
   maxJobs: number,
 ): Promise<{ processed: number; requeued: number }> {
-  const config = loadAiConfig();
-  if (
-    !aiConfigHasCredentials({ hasKey: config.hasKey, apiFormat: config.apiFormat }) ||
-    !workerClient
-  ) {
+  let config: ReturnType<typeof loadAiConfig>;
+  try {
+    config = loadAiConfig();
+  } catch (error) {
+    logger?.error("ai.queue.config", error, { libraryId });
+    return { processed: 0, requeued: 0 };
+  }
+  const activeProfile = config.profiles.find(
+    (profile) => profile.id === config.activeProfileId,
+  );
+  const legacyFallbackAvailable = !activeProfile
+    && !hasCompletedAiProfileMigration()
+    && Boolean(config.apiFormat);
+  if (!aiConfigHasCredentials(config) || !workerClient || (!activeProfile && !legacyFallbackAvailable)) {
     return { processed: 0, requeued: 0 };
   }
   try {
-    const apiKey = getDecryptedApiKey();
+    const profile = activeProfile ?? legacyAiConnectionProfile({
+      apiFormat: config.apiFormat,
+      model: config.model,
+      baseUrl: config.baseUrl,
+    });
+    const apiKey = activeProfile
+      ? getDecryptedProfileApiKey(activeProfile.id)
+      : getDecryptedApiKey();
+    const connection = captureAiConnectionSnapshot(profile, apiKey);
     // Keep each Worker admission bounded. A 32-job batch with 16 external
     // waits used to be one long scheduler request; slice it into short
     // continuations so claim/commit ownership is reacquired between waves.
@@ -2891,10 +3244,10 @@ async function processAiQueueBatch(
       const result = await workerClient.request({
         type: "ai.process-queue",
         libraryId,
-        apiFormat: config.apiFormat,
-        model: config.model,
-        apiKey,
-        ...(config.baseUrl.trim() ? { baseUrl: config.baseUrl.trim() } : {}),
+        apiFormat: connection.apiFormat,
+        model: connection.model,
+        apiKey: connection.apiKey,
+        ...(connection.baseUrl.trim() ? { baseUrl: connection.baseUrl.trim() } : {}),
         enabledFields: {
           description: config.descriptionEnabled,
           tags: config.tagEnabled,
@@ -3058,6 +3411,7 @@ async function commandFor(
     case "folder.cover.set-asset.request":
     case "folder.list.request":
     case "folder.browse-entries.request":
+    case "folder.filtered-counts.request":
     case "folder.entries-request":
     case "folder.indexed-bytes.request":
     case "folder.trash.request":
@@ -3222,6 +3576,9 @@ async function commandFor(
     }
     case "ai.config.get.request":
     case "ai.config.set.request":
+    case "ai.profiles.save.request":
+    case "ai.profiles.activate.request":
+    case "ai.profiles.delete.request":
     case "ai.list-models.request":
     case "ai.local-endpoints.request":
     case "ai.test-connection.request":
@@ -3378,6 +3735,14 @@ async function handleLibraryRequest(
   };
   try {
     const request = parseRendererRequest(input);
+    if (request.type === "asset.thumbnail.visible-window.request") {
+      lastVisibleDragAssetIds.set(request.libraryId, [...request.assetIds]);
+      nativeAssetDragPrimer.scheduleVisible(request.libraryId, request.assetIds);
+    } else if (request.type === "browse.session.open.request"
+      || request.type === "browse.session.page.request") {
+      lastVisibleDragAssetIds.delete(request.libraryId);
+      nativeAssetDragPrimer.cancelScheduledVisible(request.libraryId);
+    }
     if (request.type === "browse.session.open.request" && request.navigationId) {
       navigationTrace = {
         navigationId: request.navigationId,
@@ -3489,9 +3854,12 @@ async function handleLibraryRequest(
     const aiOwnedResult = await tryHandleAiOwnedRequest(request, {
       loadAiConfig,
       getDecryptedApiKey,
+      getDecryptedProfileApiKey,
       saveAiConfig,
-      saveEncryptedApiKey,
-      workerAvailable: () => Boolean(workerClient),
+      saveConnectionProfile: saveAiConnectionProfile,
+      activateConnectionProfile: activateAiConnectionProfile,
+      deleteConnectionProfile: deleteAiConnectionProfile,
+      workerAvailable: () => workerClient?.available ?? false,
       requestWorker: (command) => {
         if (!workerClient) throw new Error("Library Worker is unavailable.");
         return workerClient.request(command);
@@ -3547,7 +3915,7 @@ async function handleLibraryRequest(
       const ingestion = await tryBuildIngestionCommand(request, {
         isUnpackagedE2e: () => !app.isPackaged && process.env.SERPENT_E2E === "1",
         e2eEnv: (name) => process.env[name],
-        workerAvailable: () => Boolean(workerClient),
+        workerAvailable: () => workerClient?.available ?? false,
         requestWorker: (workerCommand) => {
           if (!workerClient) throw new Error("Library Worker is unavailable.");
           return workerClient.request(workerCommand);
@@ -3604,7 +3972,7 @@ async function handleLibraryRequest(
     if (!command || openCancellation?.cancelled) return cancelled();
     const sequenceProbe = await maybeProbeImportSequences(request, command, {
       isUnpackagedE2e: () => !app.isPackaged && process.env.SERPENT_E2E === "1",
-      workerAvailable: () => Boolean(workerClient),
+      workerAvailable: () => workerClient?.available ?? false,
       requestWorker: (workerCommand) => {
         if (!workerClient) throw new Error("Library Worker is unavailable.");
         return workerClient.request(workerCommand);
@@ -4041,8 +4409,8 @@ async function confirmCriticalLibraryDeletion(libraryId: string): Promise<boolea
       ? `The library “${library.displayName}” and its Serpent-managed directory will be permanently deleted.`
       : `资源库“${library.displayName}”及其 Serpent 管理的目录将被永久删除。`,
     detail: english
-      ? 'This cannot be undone. Linked-folder source directories are not included. This confirmation is required every time and cannot be remembered or bypassed by MCP permissions.'
-      : '此操作无法撤销。关联文件夹的源目录不会被删除。每次操作都必须确认；不能记住此决定，也不能通过 MCP 权限或“开启所有权限”绕过。',
+      ? 'This cannot be undone. Linked-folder source directories are not included.'
+      : '此操作无法撤销。关联文件夹的源目录不会被删除。',
     cancelLabel: english ? 'Cancel' : '取消',
     confirmLabel: english ? 'Delete from disk' : '从磁盘删除',
     initialFocus: 'cancel',
@@ -4050,18 +4418,13 @@ async function confirmCriticalLibraryDeletion(libraryId: string): Promise<boolea
 }
 
 async function confirmEnableAllMcpPermissions(label: string): Promise<boolean> {
-  const english = appLocale === 'en';
+  const copy = mcpFullAccessConfirmationCopy(
+    label,
+    appLocale === 'en' ? 'en' : 'zh-CN',
+  );
   return askCriticalConfirmation({
-    title: english ? 'Confirm full access' : '确认开启完全权限',
-    heading: english ? 'Enable Full Access for this MCP client?' : '为这个 MCP 客户端开启完全权限？',
-    message: english
-      ? `“${label}” will be allowed to execute every MCP operation, including dangerous operations, without asking again.`
-      : `客户端“${label}”将可以直接执行所有 MCP 操作，包括永久删除等危险操作，之后不再询问。`,
-    detail: english
-      ? 'This applies only to this client credential. Serpent still enforces exact targets, path boundaries, version checks, idempotency and worker safety checks. Disable Full Access or revoke the credential to stop it immediately.'
-      : '此设置只作用于当前客户端凭据。Serpent 仍会执行精确目标、路径边界、版本校验、幂等和 Worker 安全检查。关闭完全权限或删除凭据即可立即停止。',
-    cancelLabel: english ? 'Cancel' : '取消',
-    confirmLabel: english ? 'Enable Full Access' : '开启完全权限',
+    ...copy,
+    cancelLabel: appLocale === 'en' ? 'Cancel' : '取消',
     initialFocus: 'cancel',
   });
 }
@@ -4112,9 +4475,6 @@ function criticalRendererCopy(
   count: number,
   english: boolean,
 ): { heading: string; message: string; detail: string } {
-  const confirmationPolicy = english
-    ? 'This confirmation is required every time; it cannot be remembered or bypassed by MCP permissions.'
-    : '每次操作都必须确认；不能记住此决定，也不能通过 MCP 权限绕过。';
   switch (operation) {
     case 'folder':
       return {
@@ -4123,8 +4483,8 @@ function criticalRendererCopy(
           ? 'The selected folder and its managed assets will be permanently deleted.'
           : '选定文件夹及其中的托管资产将被永久删除。',
         detail: english
-          ? `This cannot be undone and the files will not go to the application trash. ${confirmationPolicy}`
-          : `此操作无法撤销，文件不会进入应用回收站。${confirmationPolicy}`,
+          ? 'This cannot be undone and the files will not go to the application trash.'
+          : '此操作无法撤销，文件不会进入应用回收站。',
       };
     case 'linked-folder':
       return {
@@ -4133,8 +4493,8 @@ function criticalRendererCopy(
           ? 'The selected linked-folder source files will be permanently deleted.'
           : '选定链接文件夹中的源文件将被永久删除。',
         detail: english
-          ? `This cannot be undone and the files will not go to the application trash. ${confirmationPolicy}`
-          : `此操作无法撤销，文件不会进入应用回收站。${confirmationPolicy}`,
+          ? 'This cannot be undone and the files will not go to the application trash.'
+          : '此操作无法撤销，文件不会进入应用回收站。',
       };
     case 'linked-asset':
       return {
@@ -4143,8 +4503,8 @@ function criticalRendererCopy(
           ? `The source files of ${count} selected linked asset(s) will be permanently deleted, and their library link records with them.`
           : `选定 ${count} 个链接资产的源文件将被永久删除，库内的链接记录也会一并移除。`,
         detail: english
-          ? `This cannot be undone; the source files are deleted from the linked folder and do not go to the recycle bin. ${confirmationPolicy}`
-          : `此操作无法撤销：链接文件夹中的源文件会被直接删除，不会进入系统回收站。${confirmationPolicy}`,
+          ? 'This cannot be undone; the source files are deleted from the linked folder and do not go to the recycle bin.'
+          : '此操作无法撤销：链接文件夹中的源文件会被直接删除，不会进入系统回收站。',
       };
     case 'asset-permanent':
       return {
@@ -4153,8 +4513,8 @@ function criticalRendererCopy(
           ? `${count} selected trash asset(s) will be permanently deleted.`
           : `选定的 ${count} 项回收站资产将被永久删除。`,
         detail: english
-          ? `This cannot be undone and the files will not go to the application trash. ${confirmationPolicy}`
-          : `此操作无法撤销，文件不会进入应用回收站。${confirmationPolicy}`,
+          ? 'This cannot be undone and the files will not go to the application trash.'
+          : '此操作无法撤销，文件不会进入应用回收站。',
       };
     case 'trash-purge':
       return {
@@ -4163,8 +4523,8 @@ function criticalRendererCopy(
           ? 'All assets currently in the Serpent trash will be permanently deleted.'
           : 'Serpent 回收站中的全部资产将被永久删除。',
         detail: english
-          ? `This cannot be undone and the files will not go to the application trash. ${confirmationPolicy}`
-          : `此操作无法撤销，文件不会进入应用回收站。${confirmationPolicy}`,
+          ? 'This cannot be undone and the files will not go to the application trash.'
+          : '此操作无法撤销，文件不会进入应用回收站。',
       };
     case 'asset':
       return {
@@ -4173,8 +4533,8 @@ function criticalRendererCopy(
           ? `${count} selected asset(s) will be permanently deleted.`
           : `选定的 ${count} 项资产将被永久删除。`,
         detail: english
-          ? `This cannot be undone and the files will not go to the application trash. ${confirmationPolicy}`
-          : `此操作无法撤销，文件不会进入应用回收站。${confirmationPolicy}`,
+          ? 'This cannot be undone and the files will not go to the application trash.'
+          : '此操作无法撤销，文件不会进入应用回收站。',
       };
   }
 }
@@ -4596,6 +4956,76 @@ async function startApplication(): Promise<void> {
   // during a previous session (deferred-cleanup store, backoff loop).
   retryPendingLibraryCleanups();
   const activeWorkerClient = workerClient;
+  let workerRecoveryEpoch = 0;
+  workerClient.onRecovery((event) => {
+    if (event.state === 'recovering') {
+      workerRecoveryEpoch += 1;
+      publishLifecycle({ type: 'worker.recovering' });
+      return;
+    }
+    if (event.state === 'failed') {
+      workerRecoveryEpoch += 1;
+      publishLifecycle({ type: 'worker.failed' });
+      return;
+    }
+    const recoveryEpoch = ++workerRecoveryEpoch;
+    // Clear generation-bound caches and resend Worker configuration before
+    // the client releases its request gate. Slow plugin/AI work follows below.
+    for (const libraryId of event.failedLibraryIds) {
+      sourcePathCache.clearLibrary(libraryId);
+      clearArtifactPathCache(libraryId);
+      clearNativeAssetDragCache(libraryId);
+    }
+    for (const library of event.libraries) {
+      sourcePathCache.clearLibrary(library.libraryId);
+      clearArtifactPathCache(library.libraryId);
+      clearNativeAssetDragCache(library.libraryId);
+      activeWorkerClient.publishPluginThumbnailExtensions(
+        library.libraryId,
+        pluginThumbnailExtensionsFor(library.libraryId),
+      );
+    }
+    activeWorkerClient.publishShowMissingLinkedFiles(showMissingLinkedFiles);
+    // Plugin activation and AI queue scheduling can call client.request(), so
+    // run them after the gate is released while retaining the epoch guard.
+    setTimeout(() => {
+      void (async () => {
+        if (recoveryEpoch !== workerRecoveryEpoch || !activeWorkerClient.available) return;
+        for (const libraryId of event.failedLibraryIds) {
+          pluginActivationCoordinator?.onLibraryClosed(libraryId);
+          publishLifecycle({ type: 'library.closed', libraryId });
+        }
+        for (const library of event.libraries) {
+          if (recoveryEpoch !== workerRecoveryEpoch || !activeWorkerClient.available) return;
+          try {
+            await notifyLibraryOpenedSideEffects({
+              libraryId: library.libraryId,
+              libraryDirectory: library.libraryPath,
+            });
+          } catch (error) {
+            logger?.error('worker.recovery.library-side-effects', error, {
+              libraryId: library.libraryId,
+            });
+          }
+        }
+        if (recoveryEpoch !== workerRecoveryEpoch || !activeWorkerClient.available) return;
+        publishLifecycle({
+          type: 'worker.recovered',
+          libraryIds: event.libraries.map((library) => library.libraryId),
+          failedLibraryIds: event.failedLibraryIds,
+        });
+      })().catch((error) => {
+        logger?.error('worker.recovery.main-state', error);
+        if (recoveryEpoch === workerRecoveryEpoch && activeWorkerClient.available) {
+          publishLifecycle({
+            type: 'worker.recovered',
+            libraryIds: event.libraries.map((library) => library.libraryId),
+            failedLibraryIds: event.failedLibraryIds,
+          });
+        }
+      });
+    }, 0);
+  });
   // Slice E (Serpent-hnmg): Main owns the shared offscreen window that renders
   // model thumbnails. The worker enqueues model jobs and asks Main to render;
   // Main replies with PNG bytes (or a typed failure) that the worker persists
@@ -5710,14 +6140,34 @@ async function startApplication(): Promise<void> {
     // credential pepper ACL cannot be restricted on Windows) must disable the
     // MCP service, never the whole app — the settings IPC answers
     // MCP_SETTINGS_UNAVAILABLE while embeddedMcpServer stays undefined.
+    embeddedMcpInitializationFailure = error instanceof McpCredentialStoreError ? error : undefined;
     logger?.error('mcp.embedded-server.construction-failed', error);
   }
   ipcMain.handle(MCP_SETTINGS_REQUEST_CHANNEL, async (event, input: unknown) => {
     const server = embeddedMcpServer;
     const response = (value: unknown) => mcpSettingsResponseSchema.parse(value);
-    if (!server || !mainWindow || event.sender !== mainWindow.webContents) {
+    if (!mainWindow || event.sender !== mainWindow.webContents) {
       logger?.info('mcp.settings', 'Rejected MCP settings request.', { code: 'unauthorized_sender' });
-      return response({ ok: false, code: 'MCP_SETTINGS_UNAVAILABLE', message: 'MCP settings are unavailable.', snapshot: server?.snapshot() });
+      return response({ ok: false, code: 'unauthorized_sender', message: 'The MCP settings request sender is not authorized.' });
+    }
+    if (!server) {
+      const failure = embeddedMcpInitializationFailure;
+      logger?.info('mcp.settings', 'MCP service is unavailable after initialization failed.', {
+        code: failure?.code ?? 'MCP_SETTINGS_UNAVAILABLE',
+        ...(failure?.systemCode === undefined ? {} : { systemCode: failure.systemCode }),
+      });
+      return response({
+        ok: false,
+        code: failure?.code ?? 'MCP_SETTINGS_UNAVAILABLE',
+        message: failure?.message ?? 'MCP settings are unavailable.',
+        ...(failure === undefined ? {} : {
+          details: {
+            filePath: failure.filePath,
+            ...(failure.systemCode === undefined ? {} : { systemCode: failure.systemCode }),
+            ...(failure.recoveryCode === undefined ? {} : { recoveryCode: failure.recoveryCode }),
+          },
+        }),
+      });
     }
     const parsed = mcpSettingsRequestSchema.safeParse(input);
     if (!parsed.success) {

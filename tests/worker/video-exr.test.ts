@@ -1,10 +1,10 @@
-import { existsSync, mkdirSync, mkdtempSync, rmSync, truncateSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, rmSync, statSync, truncateSync, writeFileSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import {
   LibraryService,
@@ -16,6 +16,7 @@ import {
   type SpawnResult,
 } from '../../src/worker/library-service';
 import { mediaResourceGuard } from '../../src/worker/media-resource-guard';
+import { MEDIA_FFMPEG_MEMORY_THRESHOLD_BYTES } from '../../src/worker/media-memory-concurrency';
 import { extractRawEmbeddedJpegThumbnail } from '../../src/worker/raw-embedded-thumbnail';
 import { AUDIO_FORCED_WAVEFORM_GENERATOR_MARK, AUDIO_WAVEFORM_COVER_GENERATOR_TAG } from '../../src/shared/audio-media';
 import { importNoConflict as sharedImportNoConflict } from './import-no-conflict';
@@ -279,6 +280,247 @@ function assertDb(
 // ── Tests ──────────────────────────────────────────────────────────
 
 describe('video (ffprobe + ffmpeg)', () => {
+  it('shares one full ffprobe between concurrent poster and metadata jobs for the same revision', async () => {
+    process.env['SERPENT_FFMPEG_PATH'] = '/fake/ffmpeg';
+    const root = temporaryRoot();
+    let ffprobeCalls = 0;
+    const baseSpawn = createMockSpawn({ ffprobeStdout: CANNED_FFPROBE_JSON });
+    const service = new LibraryService({
+      spawnFn: async (command, args) => {
+        if (command.includes('ffprobe')) {
+          ffprobeCalls += 1;
+          // A controlled delay keeps concurrent queue workers on the same
+          // probe window so the test also exercises single-flight behavior.
+          await new Promise((resolve) => setTimeout(resolve, 8));
+        }
+        return await baseSpawn(command, args);
+      },
+    });
+    const created = service.createLibrary({
+      displayName: 'VideoProbeQueueReuse',
+      selectedParentPath: root,
+    });
+    const sourcePath = path.join(root, 'video.mp4');
+    writeFileSync(sourcePath, Buffer.alloc(4096, 0));
+    importNoConflict(service, created.libraryId, sourcePath);
+    const asset = service.listAssets({ libraryId: created.libraryId, recursive: true })[0]!;
+
+    service.enqueueThumbnailJobs(created.libraryId, { assetIds: [asset.assetId], priority: 300 });
+    const queuedJobs = service.listMediaJobs(created.libraryId).jobs.filter(
+      (job) => job.assetId === asset.assetId,
+    );
+    expect(new Set(queuedJobs.map((job) => job.revisionId))).toEqual(
+      new Set([asset.currentRevisionId]),
+    );
+    expect(queuedJobs.map((job) => job.kind)).toEqual(
+      expect.arrayContaining(['extract_metadata', 'generate_thumbnail']),
+    );
+
+    const derived: Array<{ assetId: string; kind: string; revisionId?: string }> = [];
+    await service.processThumbnailQueue(created.libraryId, {
+      maxJobs: 2,
+      onDerivedReady: (event) => derived.push(event),
+    });
+
+    expect(service.getCurrentArtifact(created.libraryId, asset.assetId, 'extracted_metadata'))
+      .toMatchObject({ status: 'ready' });
+    expect(service.getCurrentArtifact(created.libraryId, asset.assetId, 'video_poster'))
+      .toMatchObject({ status: 'ready' });
+    expect(derived).toContainEqual(expect.objectContaining({
+      assetId: asset.assetId,
+      kind: 'extract_metadata',
+      revisionId: asset.currentRevisionId,
+    }));
+    expect(ffprobeCalls).toBe(1);
+
+    service.closeAll();
+  });
+
+  it('replaces an abandoned probe without letting its finalizer discard the new probe', async () => {
+    process.env['SERPENT_FFMPEG_PATH'] = '/fake/ffmpeg';
+    const root = temporaryRoot();
+    const baseSpawn = createMockSpawn({ ffprobeStdout: CANNED_FFPROBE_JSON });
+    let fullProbeCalls = 0;
+    let firstProbeStarted!: () => void;
+    let releaseFirstProbe!: () => void;
+    let releaseSecondProbe!: () => void;
+    const firstStarted = new Promise<void>((resolve) => { firstProbeStarted = resolve; });
+    const firstReleased = new Promise<void>((resolve) => { releaseFirstProbe = resolve; });
+    const secondReleased = new Promise<void>((resolve) => { releaseSecondProbe = resolve; });
+    const service = new LibraryService({
+      availablePhysicalMemoryBytesForTests: () => 8 * 1024 ** 3,
+      spawnFn: async (command, args, options) => {
+        if (command.includes('ffprobe') && args.includes('-show_streams')) {
+          fullProbeCalls += 1;
+          if (fullProbeCalls === 1) {
+            firstProbeStarted();
+            await firstReleased;
+            if (options?.signal?.aborted) throw new DOMException('cancelled', 'AbortError');
+          } else if (fullProbeCalls === 2) {
+            await secondReleased;
+          }
+        }
+        return await baseSpawn(command, args);
+      },
+    });
+    const created = service.createLibrary({
+      displayName: 'AbandonedVideoProbe',
+      selectedParentPath: root,
+    });
+    const sourcePath = path.join(root, 'video.mp4');
+    writeFileSync(sourcePath, Buffer.alloc(4096, 0));
+    importNoConflict(service, created.libraryId, sourcePath);
+    const asset = service.listAssets({ libraryId: created.libraryId, recursive: true })[0]!;
+    const assetId = asset.assetId;
+    const inFlightKey = [created.libraryId, asset.currentRevisionId].join('\u0000');
+    const probeMap = (service as unknown as {
+      videoMetadataProbeInFlight: Map<string, { promise: Promise<unknown>; waiters: number }>;
+    }).videoMetadataProbeInFlight;
+    service.enqueueThumbnailJobs(created.libraryId, { assetIds: [assetId], priority: 300 });
+    const metadataJobId = service.listMediaJobs(created.libraryId).jobs
+      .find((job) => job.assetId === assetId && job.kind === 'extract_metadata')!.jobId;
+
+    const metadataProcessing = service.processThumbnailQueue(created.libraryId, {
+      maxJobs: 1,
+      jobKinds: ['extract_metadata'],
+    });
+    let posterProcessing: Promise<number> | undefined;
+    let contactSheetProcessing: Promise<boolean> | undefined;
+    let abandonedProbe: Promise<unknown> | undefined;
+    try {
+      await firstStarted;
+      abandonedProbe = probeMap.get(inFlightKey)?.promise;
+      expect(abandonedProbe).toBeDefined();
+      expect(service.cancelMediaJobs(created.libraryId, [metadataJobId]))
+        .toEqual({ cancelledCount: 1 });
+      await metadataProcessing;
+      posterProcessing = service.processThumbnailQueue(created.libraryId, {
+        maxJobs: 1,
+        jobKinds: ['generate_thumbnail'],
+      });
+      // The first native process has not settled. The new poster must launch
+      // its own full probe rather than wait on the cancelled producer.
+      await vi.waitFor(() => expect(fullProbeCalls).toBe(2), { timeout: 2_000 });
+      releaseFirstProbe();
+      await expect(abandonedProbe).rejects.toMatchObject({ name: 'AbortError' });
+      // The abandoned producer's finally has now run while the replacement
+      // is still pending. A third consumer must join that replacement.
+      contactSheetProcessing = service.ensureVideoContactSheet(created.libraryId, assetId);
+      await vi.waitFor(() => expect(probeMap.get(inFlightKey)?.waiters).toBe(2), {
+        timeout: 2_000,
+      });
+      expect(fullProbeCalls).toBe(2);
+      releaseSecondProbe();
+      await Promise.all([posterProcessing, contactSheetProcessing]);
+      expect(service.getCurrentArtifact(created.libraryId, assetId, 'video_poster'))
+        .toMatchObject({ status: 'ready' });
+      expect(service.getCurrentArtifact(created.libraryId, assetId, 'contact_sheet'))
+        .toMatchObject({ status: 'ready' });
+    } finally {
+      releaseFirstProbe();
+      releaseSecondProbe();
+      const pending: Promise<unknown>[] = [metadataProcessing];
+      if (posterProcessing) pending.push(posterProcessing);
+      if (contactSheetProcessing) pending.push(contactSheetProcessing);
+      if (abandonedProbe) pending.push(abandonedProbe);
+      await Promise.allSettled(pending);
+      service.closeAll();
+    }
+  });
+
+  it('reuses persisted video metadata for a later poster job only on the matching revision', async () => {
+    process.env['SERPENT_FFMPEG_PATH'] = '/fake/ffmpeg';
+    const root = temporaryRoot();
+    let ffprobeCalls = 0;
+    const baseSpawn = createMockSpawn({ ffprobeStdout: CANNED_FFPROBE_JSON });
+    const service = new LibraryService({
+      spawnFn: async (command, args) => {
+        if (command.includes('ffprobe')) ffprobeCalls += 1;
+        return await baseSpawn(command, args);
+      },
+    });
+    const created = service.createLibrary({
+      displayName: 'VideoMetadataRevisionReuse',
+      selectedParentPath: root,
+    });
+    const sourcePath = path.join(root, 'video.mp4');
+    writeFileSync(sourcePath, Buffer.alloc(4096, 0));
+    importNoConflict(service, created.libraryId, sourcePath);
+    const asset = service.listAssets({ libraryId: created.libraryId, recursive: true })[0]!;
+
+    service.enqueueThumbnailJobs(created.libraryId, { assetIds: [asset.assetId], priority: 300 });
+    await service.processThumbnailQueue(created.libraryId, {
+      maxJobs: 1,
+      jobKinds: ['extract_metadata'],
+    });
+    expect(service.getCurrentArtifact(created.libraryId, asset.assetId, 'extracted_metadata'))
+      .toMatchObject({ status: 'ready' });
+    await service.processThumbnailQueue(created.libraryId, {
+      maxJobs: 1,
+      jobKinds: ['generate_thumbnail'],
+    });
+    expect(ffprobeCalls).toBe(1);
+    expect(service.getCurrentArtifact(created.libraryId, asset.assetId, 'video_poster'))
+      .toMatchObject({ status: 'ready' });
+
+    writeFileSync(sourcePath, Buffer.alloc(8192, 1));
+    const sourceStat = statSync(sourcePath);
+    const replacementRevision = randomUUID();
+    const db = assertDb(created.libraryPath);
+    db.prepare(
+      `INSERT INTO revisions
+         (revision_id, asset_id, parent_revision_id, byte_size, modified_at,
+          original_filename, origin, accepted_at)
+       VALUES (?, ?, ?, ?, ?, 'video.mp4', 'external_change', ?)`,
+    ).run(
+      replacementRevision,
+      asset.assetId,
+      asset.currentRevisionId,
+      sourceStat.size,
+      sourceStat.mtime.toISOString(),
+      new Date().toISOString(),
+    );
+    db.prepare('UPDATE assets SET current_revision_id = ? WHERE asset_id = ?')
+      .run(replacementRevision, asset.assetId);
+    db.close();
+
+    service.enqueueThumbnailJobs(created.libraryId, { assetIds: [asset.assetId], priority: 300 });
+    expect(service.listMediaJobs(created.libraryId).jobs.filter((job) => job.assetId === asset.assetId))
+      .toEqual(expect.arrayContaining([
+        expect.objectContaining({ revisionId: replacementRevision, kind: 'extract_metadata' }),
+      ]));
+    await service.processThumbnailQueue(created.libraryId, {
+      maxJobs: 1,
+      jobKinds: ['generate_thumbnail'],
+    });
+    expect(ffprobeCalls).toBe(2);
+    expect(service.getCurrentArtifact(created.libraryId, asset.assetId, 'extracted_metadata'))
+      .toMatchObject({ status: 'ready' });
+
+    const derived: Array<{ assetId: string; kind: string; revisionId?: string; durationMs?: number }> = [];
+    await service.processThumbnailQueue(created.libraryId, {
+      maxJobs: 1,
+      jobKinds: ['extract_metadata'],
+      onDerivedReady: (event) => derived.push(event),
+    });
+
+    expect(ffprobeCalls).toBe(2);
+    expect(service.getCurrentArtifact(created.libraryId, asset.assetId, 'extracted_metadata'))
+      .toMatchObject({ status: 'ready' });
+    expect(derived).toContainEqual(expect.objectContaining({
+      assetId: asset.assetId,
+      kind: 'extract_metadata',
+      revisionId: replacementRevision,
+      width: 1920,
+      height: 1080,
+      durationMs: 30050,
+    }));
+    expect(service.listAssets({ libraryId: created.libraryId, recursive: true })[0])
+      .toMatchObject({ currentRevisionId: replacementRevision, durationMs: 30050 });
+
+    service.closeAll();
+  });
+
   it('keeps AI contact-sheet preparation independent from poster work (Serpent-140fe2)', async () => {
     process.env['SERPENT_FFMPEG_PATH'] = '/fake/ffmpeg';
     const root = temporaryRoot();
@@ -864,7 +1106,7 @@ describe('video (ffprobe + ffmpeg)', () => {
     service.closeAll();
   });
 
-  it('falls back to realtime VP9/WebM when FFmpeg has no H.264 encoder', async () => {
+  it('fails video proxy generation without attempting VP9 when FFmpeg has no H.264 encoder', async () => {
     process.env['SERPENT_FFMPEG_PATH'] = '/fake/ffmpeg';
     const root = temporaryRoot();
     const capturedSpawnArgs: Array<{ command: string; args: string[] }> = [];
@@ -903,22 +1145,13 @@ describe('video (ffprobe + ffmpeg)', () => {
     await service.processThumbnailQueue(created.libraryId);
 
     expect(service.getCurrentArtifact(created.libraryId, asset.assetId, 'webm_proxy'))
-      .toMatchObject({ status: 'ready', mimeType: 'video/webm' });
-    const proxyCall = capturedSpawnArgs.find(
-      (c) => c.command === '/fake/ffmpeg' && c.args.includes('libvpx-vp9'),
-    );
-    expect(proxyCall).toBeDefined();
-    expect(proxyCall!.args).toContain('-deadline');
-    expect(proxyCall!.args).toContain('realtime');
-    expect(proxyCall!.args).toContain('-cpu-used');
-    expect(proxyCall!.args).toContain('8');
-    expect(proxyCall!.args).toContain('-row-mt');
-    expect(proxyCall!.args).toContain('libopus');
+      .toMatchObject({ status: 'failed', mimeType: 'video/mp4' });
+    expect(capturedSpawnArgs.some((call) => call.args.includes('libvpx-vp9'))).toBe(false);
 
     service.closeAll();
   });
 
-  it('falls back to VP9/WebM when the selected H.264 encoder fails at runtime', async () => {
+  it('does not switch to VP9 when the selected H.264 proxy encode fails at runtime', async () => {
     process.env['SERPENT_FFMPEG_PATH'] = '/fake/ffmpeg';
     const root = temporaryRoot();
     const capturedSpawnArgs: Array<{ command: string; args: string[] }> = [];
@@ -926,11 +1159,7 @@ describe('video (ffprobe + ffmpeg)', () => {
       spawnFn: async (command, args) => {
         capturedSpawnArgs.push({ command, args });
         if (args.includes('-encoders')) {
-          return {
-            stdout: Buffer.from(' V....D h264_videotoolbox H.264 VideoToolbox encoder\n', 'utf-8'),
-            stderr: '',
-            exitCode: 0,
-          };
+          return { stdout: Buffer.from(' V....D libopenh264 H.264 encoder\n', 'utf-8'), stderr: '', exitCode: 0 };
         }
         const outPath = args[args.length - 1];
         if (outPath && (outPath.endsWith('.mp4') || outPath.endsWith('.webm') || outPath.endsWith('.jpg') || outPath.endsWith('.json'))) {
@@ -940,8 +1169,11 @@ describe('video (ffprobe + ffmpeg)', () => {
         if (command === '/fake/ffprobe' || command.includes('ffprobe')) {
           return { stdout: Buffer.from(CANNED_FFPROBE_JSON, 'utf-8'), stderr: '', exitCode: 0 };
         }
-        if (args.includes('h264_videotoolbox')) {
-          return { stdout: Buffer.alloc(0), stderr: 'VideoToolbox unavailable', exitCode: 1 };
+        if (args.includes('testsrc2=size=128x72:rate=12:duration=0.25')) {
+          return { stdout: Buffer.alloc(0), stderr: '', exitCode: 0 };
+        }
+        if (args.includes('libopenh264')) {
+          return { stdout: Buffer.alloc(0), stderr: 'H.264 proxy encode failed', exitCode: 1 };
         }
         return { stdout: Buffer.alloc(0), stderr: '', exitCode: 0 };
       },
@@ -964,9 +1196,12 @@ describe('video (ffprobe + ffmpeg)', () => {
     await service.processThumbnailQueue(created.libraryId);
 
     expect(service.getCurrentArtifact(created.libraryId, asset.assetId, 'webm_proxy'))
-      .toMatchObject({ status: 'ready', mimeType: 'video/webm' });
-    expect(capturedSpawnArgs.some((call) => call.args.includes('h264_videotoolbox'))).toBe(true);
-    expect(capturedSpawnArgs.some((call) => call.args.includes('libvpx-vp9'))).toBe(true);
+      .toMatchObject({ status: 'failed', mimeType: 'video/mp4' });
+    expect(capturedSpawnArgs.some((call) => call.args.includes('testsrc2=size=128x72:rate=12:duration=0.25')))
+      .toBe(true);
+    expect(capturedSpawnArgs.some((call) => call.args.includes('libopenh264') && !call.args.includes('-frames:v')))
+      .toBe(true);
+    expect(capturedSpawnArgs.some((call) => call.args.includes('libvpx-vp9'))).toBe(false);
 
     service.closeAll();
   });
@@ -1107,7 +1342,7 @@ describe('video (ffprobe + ffmpeg)', () => {
     service.closeAll();
   });
 
-  it('stores a generated WebM proxy without an output-size gate', async () => {
+  it('stores a generated H.264 proxy without an output-size gate', async () => {
     process.env['SERPENT_FFMPEG_PATH'] = '/fake/ffmpeg';
     const root = temporaryRoot();
     const diagnostics: LibraryServiceDiagnostic[] = [];
@@ -1115,17 +1350,32 @@ describe('video (ffprobe + ffmpeg)', () => {
       onDiagnostic: (diagnostic) => diagnostics.push(diagnostic),
       spawnFn: async (_command, args) => {
         if (args.includes('-encoders')) {
+          return {
+            stdout: Buffer.from(' V..... libopenh264 H.264 encoder\n', 'utf-8'),
+            stderr: '',
+            exitCode: 0,
+          };
+        }
+        if (args.includes('lavfi')) {
+          const probeOutputPath = args[args.length - 1]!;
+          mkdirSync(path.dirname(probeOutputPath), { recursive: true });
+          writeFileSync(probeOutputPath, Buffer.from('valid-one-frame-probe'));
           return { stdout: Buffer.alloc(0), stderr: '', exitCode: 0 };
         }
+        if (_command.includes('ffprobe')) {
+          return { stdout: Buffer.from(CANNED_FFPROBE_JSON, 'utf-8'), stderr: '', exitCode: 0 };
+        }
         const outputPath = args[args.length - 1]!;
-        mkdirSync(path.dirname(outputPath), { recursive: true });
-        writeFileSync(outputPath, Buffer.from('oversized-proxy'));
-        truncateSync(outputPath, 512 * 1024 * 1024 + 1);
+        if (outputPath.endsWith('.mp4')) {
+          mkdirSync(path.dirname(outputPath), { recursive: true });
+          writeFileSync(outputPath, Buffer.from('oversized-proxy'));
+          truncateSync(outputPath, 512 * 1024 * 1024 + 1);
+        }
         return { stdout: Buffer.alloc(0), stderr: '', exitCode: 0 };
       },
     });
     const created = service.createLibrary({
-      displayName: 'OversizedWebmProxy',
+      displayName: 'OversizedH264Proxy',
       selectedParentPath: root,
     });
     const sourcePath = path.join(root, 'oversized.avi');
@@ -1617,21 +1867,27 @@ describe('media execution cancellation and global decoder limits', () => {
     service.closeAll();
   });
 
-  it('limits FFmpeg and ffprobe to one native decoder across concurrent libraries', async () => {
+  it.each([
+    { tier: 'below 4 GiB', availableBytes: MEDIA_FFMPEG_MEMORY_THRESHOLD_BYTES - 1, limit: 1 },
+    { tier: 'at 4 GiB', availableBytes: MEDIA_FFMPEG_MEMORY_THRESHOLD_BYTES, limit: 2 },
+  ])('caps FFmpeg across concurrent libraries: $tier → $limit slots', async ({ availableBytes, limit }) => {
     process.env['SERPENT_FFMPEG_PATH'] = '/fake/ffmpeg';
     const root = temporaryRoot();
     let active = 0;
     let maximum = 0;
     const spawnFn: SpawnFunction = async (command, args) => {
-      active += 1;
-      maximum = Math.max(maximum, active);
+      const isFfmpeg = !command.toLowerCase().includes('ffprobe');
+      if (isFfmpeg) {
+        active += 1;
+        maximum = Math.max(maximum, active);
+      }
       await new Promise((resolve) => setTimeout(resolve, 10));
       const output = args[args.length - 1]!;
       if (!command.includes('ffprobe') && !args.includes('-encoders')) {
         mkdirSync(path.dirname(output), { recursive: true });
         writeFileSync(output, Buffer.from('video-artifact'));
       }
-      active -= 1;
+      if (isFfmpeg) active -= 1;
       return {
         stdout: command.includes('ffprobe')
           ? Buffer.from(CANNED_FFPROBE_JSON)
@@ -1642,7 +1898,10 @@ describe('media execution cancellation and global decoder limits', () => {
     };
     const targets: Array<{ service: LibraryService; libraryId: string; assetId: string }> = [];
     for (const [index, name] of ['one.mp4', 'two.mp4', 'three.mp4', 'four.mp4', 'five.mp4'].entries()) {
-      const service = new LibraryService({ spawnFn });
+      const service = new LibraryService({
+        spawnFn,
+        availablePhysicalMemoryBytesForTests: () => availableBytes,
+      });
       const created = service.createLibrary({ displayName: `FfmpegLimit-${index}`, selectedParentPath: root });
       const source = path.join(root, name);
       writeFileSync(source, Buffer.alloc(1024));
@@ -1657,7 +1916,77 @@ describe('media execution cancellation and global decoder limits', () => {
       libraryId: target.libraryId,
       assetId: target.assetId,
     })));
-    expect(maximum).toBe(1);
+    expect(maximum).toBe(limit);
+    for (const target of targets) target.service.closeAll();
+  });
+
+  it('stops admitting queued FFmpeg work after system memory drops below 4 GiB', async () => {
+    process.env['SERPENT_FFMPEG_PATH'] = '/fake/ffmpeg';
+    const root = temporaryRoot();
+    let availableBytes = MEDIA_FFMPEG_MEMORY_THRESHOLD_BYTES;
+    let active = 0;
+    let maximum = 0;
+    let ffmpegStarts = 0;
+    let notifyTwoStarted!: () => void;
+    const twoStarted = new Promise<void>((resolve) => { notifyTwoStarted = resolve; });
+    let unblockInitial!: () => void;
+    const initialBlocked = new Promise<void>((resolve) => { unblockInitial = resolve; });
+    const spawnFn: SpawnFunction = async (command, args) => {
+      const isFfmpeg = !command.toLowerCase().includes('ffprobe');
+      if (isFfmpeg) {
+        active += 1;
+        maximum = Math.max(maximum, active);
+        ffmpegStarts += 1;
+        if (ffmpegStarts === 2) {
+          availableBytes = MEDIA_FFMPEG_MEMORY_THRESHOLD_BYTES - 1;
+          notifyTwoStarted();
+          await initialBlocked;
+        }
+        if (ffmpegStarts === 1) await initialBlocked;
+      }
+      const output = args[args.length - 1]!;
+      if (isFfmpeg && !args.includes('-encoders')) {
+        mkdirSync(path.dirname(output), { recursive: true });
+        writeFileSync(output, Buffer.from('video-artifact'));
+      }
+      if (isFfmpeg) active -= 1;
+      return {
+        stdout: command.toLowerCase().includes('ffprobe')
+          ? Buffer.from(CANNED_FFPROBE_JSON)
+          : Buffer.alloc(0),
+        stderr: '',
+        exitCode: 0,
+      };
+    };
+    const targets: Array<{ service: LibraryService; libraryId: string; assetId: string }> = [];
+    for (const [index, name] of ['one.mp4', 'two.mp4', 'three.mp4', 'four.mp4', 'five.mp4'].entries()) {
+      const service = new LibraryService({
+        spawnFn,
+        availablePhysicalMemoryBytesForTests: () => availableBytes,
+      });
+      const created = service.createLibrary({ displayName: `FfmpegDrop-${index}`, selectedParentPath: root });
+      const source = path.join(root, name);
+      writeFileSync(source, Buffer.alloc(1024));
+      importNoConflict(service, created.libraryId, source);
+      targets.push({
+        service,
+        libraryId: created.libraryId,
+        assetId: service.listAssets({ libraryId: created.libraryId, recursive: true })[0]!.assetId,
+      });
+    }
+    const processing = Promise.all(targets.map((target) => target.service.generateThumbnail({
+      libraryId: target.libraryId,
+      assetId: target.assetId,
+    })));
+    await twoStarted;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(ffmpegStarts).toBe(2);
+    expect(maximum).toBe(2);
+
+    unblockInitial();
+    await processing;
+    expect(maximum).toBe(2);
+    expect(ffmpegStarts).toBeGreaterThan(2);
     for (const target of targets) target.service.closeAll();
   });
 
@@ -3859,10 +4188,10 @@ describe('independent video derivative jobs', () => {
     });
 
     await ready;
-    // The poster is deliberately published before the independent metadata
-    // probe finishes. The callback therefore proves the primary visual is
-    // ready, but must not require dimensions that belong to the secondary
-    // metadata job.
+    // The poster is available before the slow proxy resolves. Metadata may
+    // already be ready because the poster and metadata jobs share one
+    // revision-scoped ffprobe; the primary preview still does not wait for the
+    // proxy lane.
     expect(eventDimensions).toBeDefined();
     expect(service.getCurrentArtifact(created.libraryId, asset.assetId, 'video_poster'))
       .toMatchObject({ status: 'ready' });

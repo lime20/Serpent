@@ -1,3 +1,4 @@
+import { isImeKeyboardEvent } from "./ime-safe-dismiss";
 import { setShellLayout, useShellLayout } from "./ui/use-shell-layout";
 import { useState, type ReactNode } from "react";
 
@@ -25,6 +26,12 @@ import {
   loadFolderBrowseCardPreferences,
   saveFolderBrowseCardPreferences,
 } from "./folder-browse-card-preferences";
+import {
+  loadVideoSeekJumpPreferences,
+  saveVideoSeekJumpPreferences,
+  type VideoSeekJumpMode,
+  type VideoSeekJumpPreferences,
+} from "./video-seek-jump-preferences";
 import {
   loadFeatureHintPreferences,
   saveFeatureHintPreferences,
@@ -84,6 +91,10 @@ type SettingsToggleRowProps = {
   label: string;
   onChange: () => void;
 };
+
+function seekJumpAmountText(preferences: VideoSeekJumpPreferences): string {
+  return String(preferences.mode === "time" ? preferences.seconds : preferences.percent);
+}
 
 function SettingsToggleRow({
   checked,
@@ -641,11 +652,34 @@ export function BrowseSettingsPage({
   const t = useT();
   const [showFolderCardsWhenRecursive, setShowFolderCardsWhenRecursive] =
     useState(() => loadFolderBrowseCardPreferences().showWhenRecursive);
+  const [seekJump, setSeekJump] = useState<VideoSeekJumpPreferences>(() =>
+    loadVideoSeekJumpPreferences(),
+  );
+  const [seekJumpDraft, setSeekJumpDraft] = useState(() =>
+    seekJumpAmountText(loadVideoSeekJumpPreferences()),
+  );
 
   function toggleFolderCardsWhenRecursive(): void {
     const showWhenRecursive = !showFolderCardsWhenRecursive;
     saveFolderBrowseCardPreferences({ version: 1, showWhenRecursive });
     setShowFolderCardsWhenRecursive(showWhenRecursive);
+  }
+
+  function selectSeekJumpMode(mode: VideoSeekJumpMode): void {
+    const next = saveVideoSeekJumpPreferences({ ...seekJump, mode });
+    setSeekJump(next);
+    setSeekJumpDraft(seekJumpAmountText(next));
+  }
+
+  function commitSeekJumpAmount(): void {
+    const parsed = Number(seekJumpDraft);
+    const next = saveVideoSeekJumpPreferences(
+      seekJump.mode === "time"
+        ? { ...seekJump, seconds: parsed }
+        : { ...seekJump, percent: parsed },
+    );
+    setSeekJump(next);
+    setSeekJumpDraft(seekJumpAmountText(next));
   }
 
   return (
@@ -772,6 +806,61 @@ export function BrowseSettingsPage({
         label={t("shell.showMissingLinkedFiles")}
         onChange={onToggleShowMissingLinkedFiles}
       />
+      <div className="app-settings-card-divider" />
+      <div className="app-settings-row app-settings-row-stack">
+        <div className="app-settings-row-copy">
+          <strong>{t("settings.videoSeekJump")}</strong>
+          <span>{t("settings.videoSeekJumpHint")}</span>
+        </div>
+        <div
+          aria-label={t("settings.videoSeekJump")}
+          className="app-settings-option-group"
+          role="radiogroup"
+        >
+          <button
+            aria-checked={seekJump.mode === "time"}
+            className="app-settings-option"
+            onClick={() => selectSeekJumpMode("time")}
+            role="radio"
+            type="button"
+          >
+            {t("settings.videoSeekJumpTime")}
+          </button>
+          <button
+            aria-checked={seekJump.mode === "percent"}
+            className="app-settings-option"
+            onClick={() => selectSeekJumpMode("percent")}
+            role="radio"
+            type="button"
+          >
+            {t("settings.videoSeekJumpPercent")}
+          </button>
+        </div>
+        <label className="video-seek-jump-amount">
+          <span>{t("settings.videoSeekJumpAmount")}</span>
+          <input
+            aria-label={t("settings.videoSeekJumpAmount")}
+            className="text-field video-seek-jump-input"
+            inputMode="decimal"
+            max={seekJump.mode === "time" ? 3600 : 100}
+            min={0.1}
+            onBlur={commitSeekJumpAmount}
+            onChange={(event) => setSeekJumpDraft(event.target.value)}
+            onKeyDown={(event) => {
+              if (isImeKeyboardEvent(event)) return;
+              if (event.key === "Enter") event.currentTarget.blur();
+            }}
+            step={0.1}
+            type="number"
+            value={seekJumpDraft}
+          />
+          <span>
+            {seekJump.mode === "time"
+              ? t("settings.videoSeekJumpSecondsUnit")
+              : t("settings.videoSeekJumpPercentUnit")}
+          </span>
+        </label>
+      </div>
       <SettingsToggleRow
         checked={navArrowsOnApproach}
         hint={t("settings.viewerNavOnApproachHint")}

@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 
 import { _electron as electron, expect, test, type Page } from '@playwright/test';
-import { resolveElectronExecutablePath } from './electron-test-helpers';
+import { chooseStandardOption, resolveElectronExecutablePath } from './electron-test-helpers';
 
 test.describe.configure({ timeout: 180_000 });
 
@@ -164,7 +164,7 @@ test('persists Worker-owned vectors through full app restart and reuses them for
     await serviceCard.getByRole('button').nth(1).click();
     await expect(serviceCard.getByRole('status')).toContainText('768');
     await window.getByRole('switch', { name: '开启语义搜索' }).click();
-    await window.getByRole('combobox', { name: '默认模型' }).selectOption({ label: 'Local semantic fixture' });
+    await chooseStandardOption(window.getByRole('combobox', { name: '默认模型' }), { label: 'Local semantic fixture' });
 
     const readIndexState = () => window.evaluate(async () => {
       const api = (globalThis as typeof globalThis & { serpent: { library: {

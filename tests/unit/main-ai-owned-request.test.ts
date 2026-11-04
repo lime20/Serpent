@@ -4,6 +4,10 @@ import { DEFAULT_AI_ANALYSIS_SETTINGS } from "../../src/shared/ai-analysis-setti
 import { DEFAULT_AI_RELIABILITY_SETTINGS } from "../../src/shared/ai-reliability";
 import { parseRendererResult } from "../../src/shared/protocol/responses";
 import {
+  AiProfileStorageError,
+  AiProfileValidationError,
+} from "../../src/main/ai-profile-store";
+import {
   tryHandleAiOwnedRequest,
   type AiOwnedConfig,
   type AiOwnedRequestRuntime,
@@ -12,6 +16,15 @@ import {
 function config(overrides?: Partial<AiOwnedConfig>): AiOwnedConfig {
   return {
     hasKey: true,
+    activeProfileId: "ai_000000000000000000000000",
+    profiles: [{
+      id: "ai_000000000000000000000000",
+      name: "Test profile",
+      apiFormat: "openai_chat",
+      model: "gpt-4o",
+      baseUrl: "",
+      hasCredential: true,
+    }],
     apiFormat: "openai_chat",
     model: "gpt-4o",
     baseUrl: "",
@@ -33,8 +46,11 @@ function runtime(overrides?: Partial<AiOwnedRequestRuntime>): AiOwnedRequestRunt
   return {
     loadAiConfig: () => config(),
     getDecryptedApiKey: () => "sk-test",
+    getDecryptedProfileApiKey: () => "sk-test",
     saveAiConfig: vi.fn(),
-    saveEncryptedApiKey: vi.fn(),
+    saveConnectionProfile: vi.fn(() => "ai_000000000000000000000000"),
+    activateConnectionProfile: vi.fn(),
+    deleteConnectionProfile: vi.fn(),
     workerAvailable: () => true,
     requestWorker: vi.fn(async () => ({
       ok: false as const,
@@ -107,6 +123,8 @@ test("ai.config.get maps the stored config onto the renderer payload", async () 
     model: "gpt-4o",
     hasKey: true,
     requiresApiKey: true,
+    activeProfileId: "ai_000000000000000000000000",
+    profiles: [{ id: "ai_000000000000000000000000", hasCredential: true }],
   });
 });
 
@@ -133,23 +151,24 @@ test("ai.config.get reports a keyless local profile", async () => {
  * A local runtime has no credential to paste, so saving must not be blocked by
  * the missing key file that every cloud format requires.
  */
-test("ai.config.set saves a keyless local profile without an API key", async () => {
+test("ai.config.set saves analysis preferences for a keyless local profile", async () => {
   const saveAiConfig = vi.fn();
-  const saveEncryptedApiKey = vi.fn();
+  const saveConnectionProfile = vi.fn();
 
   await expect(tryHandleAiOwnedRequest(
     {
       type: "ai.config.set.request",
-      apiFormat: "local_openai",
-      model: "qwen2.5vl:7b",
-      baseUrl: "http://127.0.0.1:11434/v1",
       autoAnalyzeEnabled: false,
       disclaimerAccepted: true,
     },
     runtime({
-      loadAiConfig: () => config({ apiFormat: "local_openai", hasKey: false }),
+      loadAiConfig: () => config({
+        apiFormat: "local_openai",
+        baseUrl: "http://127.0.0.1:11434/v1",
+        hasKey: false,
+      }),
       saveAiConfig,
-      saveEncryptedApiKey,
+      saveConnectionProfile,
     }),
   )).resolves.toMatchObject({ ok: true, type: "ai.config.saved" });
 
@@ -157,16 +176,14 @@ test("ai.config.set saves a keyless local profile without an API key", async () 
     apiFormat: "local_openai",
     baseUrl: "http://127.0.0.1:11434/v1",
   }));
-  expect(saveEncryptedApiKey).not.toHaveBeenCalled();
+  expect(saveConnectionProfile).not.toHaveBeenCalled();
 });
 
-test("ai.config.set still refuses a keyless save for a cloud format", async () => {
+test("ai.config.set saves analysis preferences independently of a missing cloud key", async () => {
   const saveAiConfig = vi.fn();
   await expect(tryHandleAiOwnedRequest(
     {
       type: "ai.config.set.request",
-      apiFormat: "openai_chat",
-      model: "gpt-4o",
       autoAnalyzeEnabled: false,
       disclaimerAccepted: true,
     },
@@ -175,10 +192,10 @@ test("ai.config.set still refuses a keyless save for a cloud format", async () =
       saveAiConfig,
     }),
   )).resolves.toMatchObject({
-    ok: false,
-    error: { code: "AI_SETTINGS_INCOMPLETE" },
+    ok: true,
+    type: "ai.config.saved",
   });
-  expect(saveAiConfig).not.toHaveBeenCalled();
+  expect(saveAiConfig).toHaveBeenCalledOnce();
 });
 
 test("assets.analyze is allowed for a keyless local profile", async () => {
@@ -208,7 +225,8 @@ test("assets.analyze is allowed for a keyless local profile", async () => {
  * throws — which used to report "AI_ANALYSIS_FAILED" for a reachable local
  * server and made the feature look broken until the user saved blindly.
  */
-test("ai.test-connection probes a keyless draft without any stored key", async () => {
+test("ai.test-connection does not inherit an active cloud credential for a keyless draft", async () => {
+  const getDecryptedApiKey = vi.fn(() => "unrelated-cloud-secret");
   const requestWorker = vi.fn(async () => ({
     ok: true as const,
     type: "ai.test-connection.result" as const,
@@ -223,11 +241,8 @@ test("ai.test-connection probes a keyless draft without any stored key", async (
       baseUrl: "http://127.0.0.1:8000/v1",
     },
     runtime({
-      // Stored profile is still the untouched default.
-      loadAiConfig: () => config({ apiFormat: "anthropic", hasKey: false }),
-      getDecryptedApiKey: () => {
-        throw new Error("no key stored");
-      },
+      loadAiConfig: () => config({ apiFormat: "anthropic", hasKey: true }),
+      getDecryptedApiKey,
       requestWorker,
     }),
   )).resolves.toMatchObject({
@@ -242,6 +257,7 @@ test("ai.test-connection probes a keyless draft without any stored key", async (
     apiKey: "",
     baseUrl: "http://127.0.0.1:8000/v1",
   }));
+  expect(getDecryptedApiKey).not.toHaveBeenCalled();
 });
 
 test("ai.test-connection still demands a key for a cloud draft", async () => {
@@ -267,21 +283,60 @@ test("ai.test-connection still demands a key for a cloud draft", async () => {
   expect(requestWorker).not.toHaveBeenCalled();
 });
 
-test("ai.list-models reports local discovery without a key", async () => {
-  const result = await tryHandleAiOwnedRequest(
-    { type: "ai.list-models.request", apiFormat: "local_openai" },
-    runtime({
-      loadAiConfig: () => config({ apiFormat: "local_openai", hasKey: false }),
-      getDecryptedApiKey: () => {
-        throw new Error("no key stored");
-      },
-    }),
-  );
+test("ai.list-models preserves local vision capabilities without reading a cloud key", async () => {
+  const fetchFn = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+    void input;
+    void init;
+    return new Response(JSON.stringify({
+      data: [{ id: "local-vision", capabilities: ["vision"] }],
+    }), { status: 200 });
+  });
+  const getDecryptedApiKey = vi.fn(() => "unrelated-cloud-secret");
+  vi.stubGlobal("fetch", fetchFn);
+  try {
+    const result = await tryHandleAiOwnedRequest(
+      { type: "ai.list-models.request", apiFormat: "local_openai" },
+      runtime({ getDecryptedApiKey }),
+    );
 
-  // The keyless path must not surface the cloud "auth required" rejection.
-  expect(result).toMatchObject({ ok: true, type: "ai.list-models.result" });
-  expect((result as { errorKind?: string }).errorKind).not.toBe("auth");
+    expect(result).toMatchObject({
+      ok: true,
+      type: "ai.list-models.result",
+      models: ["local-vision"],
+      visionModels: ["local-vision"],
+      capabilitiesReported: true,
+    });
+    expect(() => parseRendererResult(result)).not.toThrow();
+    expect(getDecryptedApiKey).not.toHaveBeenCalled();
+    expect(fetchFn.mock.calls[0]?.[1]).toMatchObject({
+      headers: { "Content-Type": "application/json" },
+    });
+    expect(fetchFn.mock.calls[0]?.[1]?.headers).not.toHaveProperty("Authorization");
+  } finally {
+    vi.unstubAllGlobals();
+  }
 });
+
+test.each(["ai.test-connection.request", "ai.list-models.request"] as const)(
+  "%s keeps local profile storage corruption visible",
+  async (type) => {
+    const requestWorker = vi.fn();
+    const result = await tryHandleAiOwnedRequest({
+      type,
+      apiFormat: "local_openai",
+      model: "local-model",
+      profileId: "ai_000000000000000000000006",
+    }, runtime({
+      getDecryptedProfileApiKey: () => {
+        throw new AiProfileStorageError(new Error("profile catalog is corrupt"));
+      },
+      requestWorker,
+    }));
+
+    expect(result).toMatchObject({ ok: false, error: { code: "AI_PROFILE_STORAGE_FAILED" } });
+    expect(requestWorker).not.toHaveBeenCalled();
+  },
+);
 
 /**
  * The preload re-validates every result against `rendererResultSchema`, so a
@@ -360,4 +415,382 @@ test("ai.local-endpoints returns the probed servers", async () => {
       },
     ],
   });
+});
+
+test("ai.config.get reports a profile storage failure instead of returning default settings", async () => {
+  const logError = vi.fn();
+  const result = await tryHandleAiOwnedRequest(
+    { type: "ai.config.get.request" },
+    runtime({
+      loadAiConfig: () => { throw new AiProfileStorageError(new Error("catalog is unreadable")); },
+      logError,
+    }),
+  );
+
+  expect(result).toMatchObject({
+    ok: false,
+    error: { code: "AI_PROFILE_STORAGE_FAILED" },
+  });
+  expect(logError).toHaveBeenCalledWith(
+    "ai.profile-storage.read",
+    expect.any(AiProfileStorageError),
+    { operation: "ai.config.get.request" },
+  );
+});
+
+test("analysis preference writes stop when the stored AI settings cannot be read", async () => {
+  const saveAiConfig = vi.fn();
+  const result = await tryHandleAiOwnedRequest(
+    {
+      type: "ai.config.set.request",
+      enabledFields: { description: true, tags: true, rating: true },
+      autoAnalyzeEnabled: false,
+      disclaimerAccepted: true,
+    },
+    runtime({
+      loadAiConfig: () => { throw new Error("profile journal is corrupt"); },
+      saveAiConfig,
+    }),
+  );
+
+  expect(result).toMatchObject({
+    ok: false,
+    error: { code: "AI_PROFILE_STORAGE_FAILED" },
+  });
+  expect(saveAiConfig).not.toHaveBeenCalled();
+});
+
+test("analysis preferences save independently from connection profiles", async () => {
+  const saveAiConfig = vi.fn();
+  const saveConnectionProfile = vi.fn();
+  await expect(tryHandleAiOwnedRequest(
+    {
+      type: "ai.config.set.request",
+      enabledFields: { description: true, tags: false, rating: true },
+      analysisSettings: {
+        forceExistingTags: true,
+        maxTags: 5,
+        maxDescriptionCharsZh: 80,
+        maxDescriptionWordsEn: 40,
+        outputStyle: "concise",
+        ratingRubric: "Use a five point scale.",
+        customDescriptionPrompt: "",
+        customTagPrompt: "",
+      },
+      autoAnalyzeEnabled: false,
+      disclaimerAccepted: true,
+    },
+    runtime({ saveAiConfig, saveConnectionProfile }),
+  )).resolves.toMatchObject({ ok: true, type: "ai.config.saved" });
+  expect(saveConnectionProfile).not.toHaveBeenCalled();
+  expect(saveAiConfig).toHaveBeenCalledWith(expect.objectContaining({
+    apiFormat: "openai_chat",
+    model: "gpt-4o",
+    analysisSettings: expect.objectContaining({ forceExistingTags: true }),
+  }));
+});
+
+test.each([
+  { apiFormat: "openai_chat" as const, apiKey: "active-profile-secret" },
+  { apiFormat: "local_openai" as const, apiKey: "" },
+])("AI search planning uses the active $apiFormat profile's connection", async ({ apiFormat, apiKey }) => {
+  const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+    void input;
+    void init;
+    return new Response(JSON.stringify({
+      choices: [{
+        message: {
+          content: JSON.stringify({
+            keywords: ["active-profile-keyword"],
+            synonyms: [],
+            exclusions: [],
+            filters: [],
+            sort: null,
+          }),
+        },
+      }],
+    }), { headers: { "content-type": "application/json" } });
+  });
+  vi.stubGlobal("fetch", fetchMock);
+
+  try {
+    const activeConfig = config({
+      activeProfileId: "ai_000000000000000000000006",
+      profiles: [{
+        id: "ai_000000000000000000000006",
+        name: "Active profile",
+        apiFormat,
+        model: "active-search-model",
+        baseUrl: "https://active.example.invalid/v1",
+        hasCredential: !!apiKey,
+      }],
+      apiFormat,
+      model: "active-search-model",
+      baseUrl: "https://active.example.invalid/v1",
+      hasKey: !!apiKey,
+      disclaimerAccepted: true,
+    });
+    const getDecryptedApiKey = vi.fn(() => apiKey);
+    const result = await tryHandleAiOwnedRequest(
+      { type: "ai.search-plan.request", naturalQuery: "find active profile" },
+      runtime({
+        loadAiConfig: () => activeConfig,
+        getDecryptedApiKey,
+      }),
+    );
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "https://active.example.invalid/v1/chat/completions",
+      expect.objectContaining({
+        headers: expect.objectContaining(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
+      }),
+    );
+    const requestInit = fetchMock.mock.calls[0]?.[1];
+    if (!apiKey) expect(requestInit?.headers).not.toHaveProperty("Authorization");
+    expect(JSON.parse(String(requestInit?.body))).toMatchObject({ model: "active-search-model" });
+    expect(getDecryptedApiKey).toHaveBeenCalledOnce();
+    expect(result).toMatchObject({
+      ok: true,
+      type: "ai.search-plan.result",
+      apiFormat,
+      model: "active-search-model",
+      plan: { keywords: ["active-profile-keyword"] },
+    });
+  } finally {
+    vi.unstubAllGlobals();
+  }
+});
+
+test("profile save response exposes only its id", async () => {
+  await expect(tryHandleAiOwnedRequest(
+    {
+      type: "ai.profiles.save.request",
+      name: "Private profile",
+      apiFormat: "openai_chat",
+      model: "gpt-4o",
+      baseUrl: "",
+      apiKey: "secret-token",
+    },
+    runtime({ saveConnectionProfile: vi.fn(() => "ai_000000000000000000000005") }),
+  )).resolves.toEqual({
+    ok: true,
+    type: "ai.profiles.saved",
+    id: "ai_000000000000000000000005",
+  });
+});
+
+test("profile validation failures remain actionable settings errors", async () => {
+  const logError = vi.fn();
+  const result = await tryHandleAiOwnedRequest(
+    {
+      type: "ai.profiles.save.request",
+      name: "Invalid profile",
+      apiFormat: "openai_chat",
+      model: "gpt-4o",
+      baseUrl: "",
+    },
+    runtime({
+      saveConnectionProfile: () => { throw new AiProfileValidationError("invalid profile"); },
+      logError,
+    }),
+  );
+
+  expect(result).toMatchObject({
+    ok: false,
+    error: { code: "AI_SETTINGS_INCOMPLETE" },
+  });
+  expect(logError).not.toHaveBeenCalled();
+});
+
+test.each([
+  {
+    scope: "ai.profile.save",
+    request: {
+      type: "ai.profiles.save.request" as const,
+      name: "Private profile",
+      apiFormat: "openai_chat" as const,
+      model: "gpt-4o",
+      baseUrl: "",
+    },
+    override: { saveConnectionProfile: () => { throw new Error("disk write failed"); } },
+  },
+  {
+    scope: "ai.profile.activate",
+    request: { type: "ai.profiles.activate.request" as const, id: "ai_000000000000000000000006" },
+    override: { activateConnectionProfile: () => { throw new Error("safeStorage failed"); } },
+  },
+  {
+    scope: "ai.profile.delete",
+    request: { type: "ai.profiles.delete.request" as const, id: "ai_000000000000000000000006" },
+    override: { deleteConnectionProfile: () => { throw new Error("credential delete failed"); } },
+  },
+])("profile storage failures are logged and returned as retryable errors: $scope", async ({ scope, request, override }) => {
+  const logError = vi.fn();
+  const result = await tryHandleAiOwnedRequest(
+    request,
+    runtime({ ...override, logError }),
+  );
+
+  expect(result).toMatchObject({
+    ok: false,
+    error: { code: "AI_PROFILE_STORAGE_FAILED" },
+  });
+  expect(logError).toHaveBeenCalledWith(scope, expect.any(Error), expect.any(Object));
+});
+
+test("profile activation and deletion are owned by Main", async () => {
+  const activateConnectionProfile = vi.fn();
+  const deleteConnectionProfile = vi.fn();
+  const activateResult = await tryHandleAiOwnedRequest(
+    { type: "ai.profiles.activate.request", id: "ai_000000000000000000000006" },
+    runtime({ activateConnectionProfile }),
+  );
+  const deleteResult = await tryHandleAiOwnedRequest(
+    { type: "ai.profiles.delete.request", id: "ai_000000000000000000000006" },
+    runtime({ deleteConnectionProfile }),
+  );
+
+  expect(activateConnectionProfile).toHaveBeenCalledWith("ai_000000000000000000000006");
+  expect(deleteConnectionProfile).toHaveBeenCalledWith("ai_000000000000000000000006");
+  expect(activateResult).toMatchObject({ ok: true, type: "ai.profiles.activated" });
+  expect(deleteResult).toMatchObject({ ok: true, type: "ai.profiles.deleted" });
+});
+
+test("profile save can explicitly clear its saved credential", async () => {
+  const saveConnectionProfile = vi.fn(() => "ai_000000000000000000000006");
+  await tryHandleAiOwnedRequest(
+    {
+      type: "ai.profiles.save.request",
+      id: "ai_000000000000000000000006",
+      name: "Private profile",
+      apiFormat: "openai_chat",
+      model: "gpt-4o",
+      baseUrl: "",
+      clearCredential: true,
+    },
+    runtime({ saveConnectionProfile }),
+  );
+
+  expect(saveConnectionProfile).toHaveBeenCalledWith(expect.objectContaining({ clearCredential: true }));
+});
+
+test("stored connection probes keep their profile snapshot after the active profile changes", async () => {
+  const getDecryptedProfileApiKey = vi.fn(() => "profile-secret");
+  const getDecryptedApiKey = vi.fn(() => "new-active-profile-secret");
+  const requestWorker = vi.fn(async () => ({
+    ok: true as const,
+    type: "ai.test-connection.result" as const,
+    success: true,
+  }));
+  const result = await tryHandleAiOwnedRequest(
+    {
+      type: "ai.test-connection.request",
+      apiFormat: "openai_chat",
+      model: "wrong-renderer-model",
+      baseUrl: "https://wrong.example.invalid",
+      profileId: "ai_000000000000000000000006",
+    },
+    runtime({
+      loadAiConfig: () => config({
+        // Simulate a switch to profile 007 after the renderer captured profile 006.
+        activeProfileId: "ai_000000000000000000000007",
+        profiles: [{
+          id: "ai_000000000000000000000006",
+          name: "Target profile",
+          apiFormat: "anthropic",
+          model: "claude-test",
+          baseUrl: "https://target.example.invalid",
+          hasCredential: true,
+        }, {
+          id: "ai_000000000000000000000007",
+          name: "New active profile",
+          apiFormat: "anthropic",
+          model: "claude-current",
+          baseUrl: "https://current.example.invalid",
+          hasCredential: true,
+        }],
+      }),
+      getDecryptedProfileApiKey,
+      getDecryptedApiKey,
+      requestWorker,
+    }),
+  );
+
+  expect(getDecryptedProfileApiKey).toHaveBeenCalledWith("ai_000000000000000000000006");
+  expect(getDecryptedApiKey).not.toHaveBeenCalled();
+  expect(requestWorker).toHaveBeenCalledWith(expect.objectContaining({
+    apiFormat: "openai_chat",
+    model: "wrong-renderer-model",
+    baseUrl: "https://wrong.example.invalid",
+    apiKey: "profile-secret",
+  }));
+  expect(JSON.stringify(result)).not.toContain("profile-secret");
+});
+
+test("connection probes report corrupt profile storage separately from a missing key", async () => {
+  const result = await tryHandleAiOwnedRequest(
+    {
+      type: "ai.test-connection.request",
+      apiFormat: "openai_chat",
+      model: "gpt-4o",
+      profileId: "ai_000000000000000000000006",
+    },
+    runtime({
+      getDecryptedProfileApiKey: () => {
+        throw new AiProfileStorageError(new Error("profile catalog is corrupt"));
+      },
+    }),
+  );
+
+  expect(result).toMatchObject({
+    ok: false,
+    error: { code: "AI_PROFILE_STORAGE_FAILED" },
+  });
+});
+
+test("listing models uses a saved profile credential with the current draft endpoint and format", async () => {
+  const fetchFn = vi.fn(async () => new Response(
+    JSON.stringify({ data: [{ id: "draft-model" }] }),
+    { status: 200 },
+  ));
+  vi.stubGlobal("fetch", fetchFn);
+  try {
+    const getDecryptedProfileApiKey = vi.fn(() => "profile-secret");
+    const result = await tryHandleAiOwnedRequest(
+      {
+        type: "ai.list-models.request",
+        apiFormat: "openai_chat",
+        baseUrl: "https://draft.example.invalid/v1",
+        profileId: "ai_000000000000000000000006",
+      },
+      runtime({
+        loadAiConfig: () => config({
+          profiles: [{
+            id: "ai_000000000000000000000006",
+            name: "Saved profile with an older endpoint",
+            apiFormat: "anthropic",
+            model: "saved-model",
+            baseUrl: "https://saved.example.invalid",
+            hasCredential: true,
+          }],
+        }),
+        getDecryptedProfileApiKey,
+      }),
+    );
+
+    expect(getDecryptedProfileApiKey).toHaveBeenCalledWith("ai_000000000000000000000006");
+    expect(fetchFn).toHaveBeenCalledWith(
+      "https://draft.example.invalid/v1/models",
+      expect.objectContaining({
+        headers: expect.objectContaining({ Authorization: "Bearer profile-secret" }),
+      }),
+    );
+    expect(result).toMatchObject({
+      ok: true,
+      type: "ai.list-models.result",
+      models: ["draft-model"],
+    });
+  } finally {
+    vi.unstubAllGlobals();
+  }
 });

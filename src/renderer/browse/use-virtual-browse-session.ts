@@ -13,11 +13,13 @@ import {
   materializeVirtualLoadedEntries,
   mergeVirtualSummaryPage,
   patchVirtualLayoutGeometry,
+  patchVirtualLayoutPreviews,
   removeVirtualLayoutEntries,
   virtualIndexMatchesFirstPage,
   virtualSummaryAssetIds,
   type VirtualBrowseLayout,
 } from "./virtual-browse-layout";
+import { captureVirtualScrollAnchorsBeforeGeometryChange } from "./virtual-scroll-anchor-signal";
 
 /**
  * Largest scope whose complete compact index is fetched in one request.
@@ -205,6 +207,7 @@ export function useVirtualBrowseSession({
     const session = sessionRef.current;
     if (!session?.virtualized) return false;
     const next = createVirtualBrowseLayoutFromIndex(input);
+    captureVirtualScrollAnchorsBeforeGeometryChange();
     // The seeded index replaces every loaded entry, so the previous summary-page
     // LRU no longer describes what is loaded; keeping it would let eviction drop
     // pages that were never registered against the new index.
@@ -217,7 +220,7 @@ export function useVirtualBrowseSession({
     setVirtualBrowseLayout(next);
     setBrowseLayout(layoutRef.current);
     return true;
-  }, [setBrowseLayout, setVirtualBrowseLayout]);
+  }, [registerSummaryPages, setBrowseLayout, setVirtualBrowseLayout]);
 
   /** Keep the visible summary pages at the hot end of the LRU while scrolling. */
   const noteVisibleRange = useCallback((startIndex: number, endIndex: number) => {
@@ -246,6 +249,9 @@ export function useVirtualBrowseSession({
       summaryPagesRef.current.delete(oldest);
       next = evictVirtualSummaryPage(next, oldest, BROWSE_SUMMARY_PAGE_SIZE);
       evicted.push(oldest);
+    }
+    if (next.geometryRevision !== current.geometryRevision) {
+      captureVirtualScrollAnchorsBeforeGeometryChange();
     }
     virtualLayoutRef.current = next;
     // Rendering always follows the virtual index.
@@ -301,6 +307,7 @@ export function useVirtualBrowseSession({
   const removeEntries = useCallback((assetIds: string[], removedCount: number) => {
     const current = virtualLayoutRef.current;
     if (!current) return;
+    captureVirtualScrollAnchorsBeforeGeometryChange();
     virtualLayoutRef.current = removeVirtualLayoutEntries(
       current,
       assetIds,
@@ -321,6 +328,25 @@ export function useVirtualBrowseSession({
     const current = virtualLayoutRef.current;
     if (!current || sessionRef.current?.virtualized !== true) return;
     const next = patchVirtualLayoutGeometry(current, patches);
+    if (next === current) return;
+    captureVirtualScrollAnchorsBeforeGeometryChange();
+    virtualLayoutRef.current = next;
+    layoutRef.current = materializeVirtualLoadedEntries(next);
+    layoutDirtyRef.current = false;
+    setVirtualBrowseLayout(next);
+    setBrowseLayout(layoutRef.current);
+  }, [setBrowseLayout, setVirtualBrowseLayout]);
+
+  const applyPreviewPatches = useCallback((
+    patches: ReadonlyMap<string, {
+      previewKind: 'source' | null;
+      previewRevisionId: string | null;
+    }>,
+  ) => {
+    if (patches.size === 0) return;
+    const current = virtualLayoutRef.current;
+    if (!current || sessionRef.current?.virtualized !== true) return;
+    const next = patchVirtualLayoutPreviews(current, patches);
     if (next === current) return;
     virtualLayoutRef.current = next;
     layoutRef.current = materializeVirtualLoadedEntries(next);
@@ -351,6 +377,7 @@ export function useVirtualBrowseSession({
     getLoadedSummaryAssetIds,
     removeEntries,
     applyGeometryPatches,
+    applyPreviewPatches,
     isVirtualized,
     reset,
   };

@@ -26,6 +26,7 @@ import type { ModelCompanionAsset } from '../../shared/model-companions';
 import type { AiSearchPlan, AssetSummary, AssetMetadataResult, ExtractedMetadataResult, CollectionSummary, FilterClause, FolderBrowseEntry, LinkedFolderDirectoryMutation, LinkedFolderRule, LinkedFolderSummary, ManagedFolderSummary, SearchQuery, SearchScope, SmartCollectionSummary, TagCooccurrenceGraph, TagSummary, TrashedFolderSummary } from '../../shared/asset-types';
 import {
   ASSET_CHANGE_CHANNEL,
+  ASSET_NATIVE_DRAG_READINESS_CHANNEL,
   EXTENSION_SAVE_COMPLETED_CHANNEL,
   THUMBNAIL_CHANNEL,
   ACTIVE_CONTEXT_CHANNEL,
@@ -37,6 +38,8 @@ import {
   AI_COMPLETED_CHANNEL,
   AI_CLEARED_CHANNEL,
 } from '../../shared/protocol/channels';
+import { parseNativeDragReadinessEvent } from '../../shared/native-drag-readiness';
+import type { NativeDragReadinessEvent } from '../../shared/native-drag-readiness';
 import { sendNativeAssetDrag, sendNativeAssetDragPrime } from '../native-asset-drag';
 import type { PublicErrorReason } from '../../shared/protocol/errors';
 import {
@@ -556,6 +559,31 @@ export const library: SerpentLibraryApi = Object.freeze({
       throw new Error('Unexpected list-folder-browse-entries response.');
     }
     return { ok: true, value: result.entries };
+  },
+
+  async listFilteredFolderCounts(input: {
+    libraryId: string;
+    filters?: FilterClause[];
+    showIgnored?: boolean;
+  }): Promise<LibraryApiResult<{
+    all: number;
+    root: number;
+    folders: Array<{ folderId: string; count: number }>;
+  }>> {
+    const result = await request({
+      type: 'folder.filtered-counts.request',
+      libraryId: input.libraryId,
+      filters: input.filters,
+      showIgnored: input.showIgnored,
+    });
+    if (!result.ok) return failure(result);
+    if (result.type !== 'folder.filtered-counts') {
+      throw new Error('Unexpected filtered-folder-counts response.');
+    }
+    return {
+      ok: true,
+      value: { all: result.all, root: result.root, folders: result.folders },
+    };
   },
 
   async listFolderEntriesByRefs(input: {
@@ -1854,6 +1882,15 @@ export const library: SerpentLibraryApi = Object.freeze({
   },
 
   async getAiConfig(): Promise<LibraryApiResult<{
+    activeProfileId: string | null;
+    profiles: Array<{
+      id: string;
+      name: string;
+      apiFormat: AiApiFormat;
+      model: string;
+      baseUrl: string;
+      hasCredential: boolean;
+    }>;
     apiFormat: AiApiFormat | null;
     model: string | null;
     baseUrl: string;
@@ -1885,10 +1922,6 @@ export const library: SerpentLibraryApi = Object.freeze({
   },
 
   async setAiConfig(input: {
-    apiFormat: AiApiFormat;
-    model: string;
-    baseUrl?: string;
-    apiKey?: string;
     enabledFields?: { description: boolean; tags: boolean; rating: boolean };
     analysisSettings?: {
       forceExistingTags: boolean;
@@ -1911,6 +1944,39 @@ export const library: SerpentLibraryApi = Object.freeze({
     if (!result.ok) return failure(result);
     if (result.type !== 'ai.config.saved') throw new Error('Unexpected ai-config-save response.');
     return { ok: true, value: undefined };
+  },
+
+  async saveAiProfile(input: {
+    id?: string;
+    name: string;
+    apiFormat: AiApiFormat;
+    model: string;
+    baseUrl: string;
+    apiKey?: string;
+    clearCredential?: boolean;
+  }): Promise<LibraryApiResult<{ id: string }>> {
+    const result = await request({
+      type: 'ai.profiles.save.request',
+      ...input,
+      ...(input.apiKey?.trim() ? { apiKey: input.apiKey.trim() } : {}),
+    });
+    if (!result.ok) return failure(result);
+    if (result.type !== 'ai.profiles.saved') throw new Error('Unexpected AI profile-save response.');
+    return { ok: true, value: { id: result.id } };
+  },
+
+  async activateAiProfile({ id }: { id: string }): Promise<LibraryApiResult<{ id: string }>> {
+    const result = await request({ type: 'ai.profiles.activate.request', id });
+    if (!result.ok) return failure(result);
+    if (result.type !== 'ai.profiles.activated') throw new Error('Unexpected AI profile-activate response.');
+    return { ok: true, value: { id: result.id } };
+  },
+
+  async deleteAiProfile({ id }: { id: string }): Promise<LibraryApiResult<{ id: string }>> {
+    const result = await request({ type: 'ai.profiles.delete.request', id });
+    if (!result.ok) return failure(result);
+    if (result.type !== 'ai.profiles.deleted') throw new Error('Unexpected AI profile-delete response.');
+    return { ok: true, value: { id: result.id } };
   },
 
   async getAiContent(input: {
@@ -2493,6 +2559,18 @@ export const library: SerpentLibraryApi = Object.freeze({
     });
   },
 
+  onNativeDragReadiness(listener: (event: NativeDragReadinessEvent) => void) {
+    const subscription = (_event: Electron.IpcRendererEvent, input: unknown) => {
+      try {
+        listener(parseNativeDragReadinessEvent(input));
+      } catch {
+        // A malformed Main event must not reach Renderer.
+      }
+    };
+    ipcRenderer.on(ASSET_NATIVE_DRAG_READINESS_CHANNEL, subscription);
+    return () => ipcRenderer.removeListener(ASSET_NATIVE_DRAG_READINESS_CHANNEL, subscription);
+  },
+
   async openFolderInFileManager({ libraryId, folderId }: { libraryId: string; folderId: string }): Promise<LibraryApiResult<void>> {
     const result = await request({ type: 'folder.open-in-file-manager.request', libraryId, folderId });
     if (!result.ok) return failure(result);
@@ -2652,11 +2730,13 @@ export const library: SerpentLibraryApi = Object.freeze({
     model,
     apiKey,
     baseUrl,
+    profileId,
   }: {
     apiFormat: AiApiFormat;
     model: string;
     apiKey?: string;
     baseUrl?: string;
+    profileId?: string;
   }): Promise<LibraryApiResult<{ success: boolean; errorKind?: string; reason?: string }>> {
     const result = await request({
       type: 'ai.test-connection.request',
@@ -2664,6 +2744,7 @@ export const library: SerpentLibraryApi = Object.freeze({
       model,
       ...(apiKey?.trim() ? { apiKey: apiKey.trim() } : {}),
       ...(baseUrl?.trim() ? { baseUrl: baseUrl.trim() } : {}),
+      ...(profileId ? { profileId } : {}),
     });
     if (!result.ok) return failure(result);
     if (result.type !== 'ai.test-connection.result') throw new Error('Unexpected test-connection response.');
@@ -2674,16 +2755,19 @@ export const library: SerpentLibraryApi = Object.freeze({
     apiFormat,
     apiKey,
     baseUrl,
+    profileId,
   }: {
     apiFormat: AiApiFormat;
     apiKey?: string;
     baseUrl?: string;
+    profileId?: string;
   }): Promise<LibraryApiResult<AiModelListResult>> {
     const result = await request({
       type: 'ai.list-models.request',
       apiFormat,
       ...(apiKey?.trim() ? { apiKey: apiKey.trim() } : {}),
       ...(baseUrl?.trim() ? { baseUrl: baseUrl.trim() } : {}),
+      ...(profileId ? { profileId } : {}),
     });
     if (!result.ok) return failure(result);
     if (result.type !== 'ai.list-models.result') throw new Error('Unexpected list-models response.');

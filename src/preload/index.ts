@@ -33,6 +33,7 @@ if (e2eEnabled) {
 }
 
 const e2eDiagnostics = Object.freeze({
+  useNativeAssetDrag: process.env.SERPENT_E2E_NATIVE_ASSET_DRAG === '1',
   getRequestCount(type: RendererRequest['type']): number {
     return getE2eRequestCount(type);
   },

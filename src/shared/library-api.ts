@@ -5,6 +5,7 @@ import type { EmbeddingModality } from './embedding/modalities';
 import type { PublicError, PublicErrorReason } from './protocol/errors';
 import type { LibraryNavigationSummary } from './library-navigation';
 import type { MutationReceipt } from './performance-contract';
+import type { NativeDragReadinessEvent } from './native-drag-readiness';
 
 /** Serpent-xffq：WebDAV 服务端能力探测结果。 */
 export interface SyncCapabilities {
@@ -379,6 +380,15 @@ export interface SerpentLibraryApi {
     parentFolderId: string | null;
     showIgnored?: boolean;
   }): Promise<LibraryApiResult<FolderBrowseEntry[]>>;
+  listFilteredFolderCounts(input: {
+    libraryId: string;
+    filters?: FilterClause[];
+    showIgnored?: boolean;
+  }): Promise<LibraryApiResult<{
+    all: number;
+    root: number;
+    folders: Array<{ folderId: string; count: number }>;
+  }>>;
   listFolderEntriesByRefs(input: {
     libraryId: string;
     refs: Array<{ locationKind: 'managed' | 'linked'; folderId: string }>;
@@ -690,6 +700,15 @@ export interface SerpentLibraryApi {
   onProgress(listener: (event: ExportProgressEvent | ImportProgressEvent | SyncProgressEvent | DeleteProgressEvent) => void): () => void;
   // AI
   getAiConfig(): Promise<LibraryApiResult<{
+    activeProfileId: string | null;
+    profiles: Array<{
+      id: string;
+      name: string;
+      apiFormat: AiApiFormat;
+      model: string;
+      baseUrl: string;
+      hasCredential: boolean;
+    }>;
     apiFormat: AiApiFormat | null;
     model: string | null;
     baseUrl: string;
@@ -714,11 +733,18 @@ export interface SerpentLibraryApi {
     autoAnalyzeEnabled: boolean;
     disclaimerAccepted: boolean;
   }>>;
-  setAiConfig(input: {
+  saveAiProfile(input: {
+    id?: string;
+    name: string;
     apiFormat: AiApiFormat;
     model: string;
-    baseUrl?: string;
+    baseUrl: string;
     apiKey?: string;
+    clearCredential?: boolean;
+  }): Promise<LibraryApiResult<{ id: string }>>;
+  activateAiProfile(input: { id: string }): Promise<LibraryApiResult<{ id: string }>>;
+  deleteAiProfile(input: { id: string }): Promise<LibraryApiResult<{ id: string }>>;
+  setAiConfig(input: {
     enabledFields?: { description: boolean; tags: boolean; rating: boolean };
     analysisSettings?: {
       forceExistingTags: boolean;
@@ -920,6 +946,7 @@ export interface SerpentLibraryApi {
     libraryId: string;
     assetIds: string[];
   }): void;
+  onNativeDragReadiness(listener: (event: NativeDragReadinessEvent) => void): () => void;
   // Folder shell actions (REQ-MENU-006): folder id only crosses the bridge;
   // the absolute path is resolved by the Worker and consumed by Main.
   openFolderInFileManager(input: { libraryId: string; folderId: string }): Promise<LibraryApiResult<void>>;
@@ -965,11 +992,13 @@ export interface SerpentLibraryApi {
     model: string;
     apiKey?: string;
     baseUrl?: string;
+    profileId?: string;
   }): Promise<LibraryApiResult<{ success: boolean; errorKind?: string; reason?: string }>>;
   listAiModels(input: {
     apiFormat: AiApiFormat;
     apiKey?: string;
     baseUrl?: string;
+    profileId?: string;
   }): Promise<LibraryApiResult<AiModelListResult>>;
   /** Probes loopback ports and WSL distribution addresses for local runtimes. */
   listAiLocalEndpoints(): Promise<LibraryApiResult<AiLocalEndpointDiscovery>>;

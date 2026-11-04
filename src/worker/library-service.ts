@@ -82,6 +82,10 @@ import {
   workerMediaInteractiveDecodeConcurrency,
 } from './media-concurrency';
 import {
+  mediaFfmpegConcurrencyLimit,
+  systemAvailablePhysicalMemoryBytes,
+} from './media-memory-concurrency';
+import {
   encoderUsesHardwareName,
   ffmpegOneFrameEncodeArgs,
   listedH264ProxyEncoders,
@@ -112,7 +116,6 @@ export interface RawMetadataBackfillAdmissionState {
 }
 import {
   countLinkedDirectoryAssets,
-  countLinkedDirectoryChildren,
   collectLinkedDirectoryPrefixes,
   directChildLinkedDirectories,
   encodeLinkedVirtualFolderId,
@@ -465,7 +468,7 @@ const AUDIO_WAVEFORM_GENERATOR = `ffmpeg@${FFMPEG_VERSION}+${AUDIO_WAVEFORM_COVE
 const VIDEO_PROXY_SCALE_FILTER =
   'scale=w=min(720\\,iw):h=min(720\\,ih):force_original_aspect_ratio=decrease:force_divisible_by=2';
 type VideoProxyProfile = {
-  codec: 'h264' | 'vp9';
+  codec: 'h264';
   encoder: string;
   extension: 'mp4' | 'webm';
   mimeType: 'video/mp4' | 'video/webm';
@@ -745,6 +748,7 @@ import {
   classifyLibraryStorage,
   type LibraryStorageKind,
 } from './network-storage';
+import { ImportDestinationDirectoryCache } from './import-destination-directory-cache';
 import {
   LibraryParentError,
   resolveWritableLibraryParent,
@@ -776,6 +780,7 @@ import {
   type CatalogAssetSummaryRow,
   type CatalogSearchGroup as SearchGroup,
 } from './catalog-read';
+import { rollupDirectFolderCounts } from '../shared/filtered-folder-counts';
 import {
   GIF_GOOD_PAGE_SCORE_THRESHOLD,
   GIF_THUMBNAIL_PROBE_SIZE,
@@ -843,6 +848,8 @@ import {
 } from '../shared/media-formats';
 import {
   isSourceDirectPreview,
+  isSourceDirectPreviewCandidate,
+  SOURCE_DIRECT_IMAGE_EXTENSIONS,
   SOURCE_DIRECT_MAX_BYTES,
   SOURCE_DIRECT_MAX_LONG_EDGE_PX,
   SOURCE_DIRECT_MAX_PIXELS,
@@ -914,10 +921,10 @@ import { inferRelinkBatchRoot } from '../shared/infer-relink-batch-root';
 import {
   DEFAULT_IMAGE_SEQUENCE_FPS,
   detectImageSequences,
-  findImageSequenceContaining,
   formatImageSequenceDisplayName,
   type ImageSequenceFrameCandidate,
 } from '../shared/image-sequence';
+import { discoverSelectedImageSequenceFrames } from './image-sequence-import-discovery';
 import { isImportConflictPlan, isImportSourceFailurePlan } from '../shared/import-outcome';
 import {
   ImportSourceFailurePause,
@@ -948,6 +955,13 @@ import {
   RemoteMediaMagicProbe,
 } from './remote-media-validation';
 import { requeueRetryableFailedArtifacts } from './derived-artifact-repair';
+import { literalOiioArgs, oiioFailureCode, OIIO_LITERAL_PATHS_MARK, requeueLegacyOiioPathFailures } from './oiio-invocation';
+import { LinkedDirectoryIndex, LINKED_DIRECTORY_INDEX_SQL } from './linked-directory-index';
+import { SingleFlightRead } from './single-flight-read';
+import { linkedDirectoryIgnored } from './linked-directory-visibility';
+import { compileLinkedFolderRules } from './linked-folder-rule-matcher';
+import { NavigationReadMetrics } from './navigation-read-metrics';
+import { collectLinkedAssetPaths } from './linked-asset-path-projection';
 import {
   SQLITE_IN_BIND_LIMIT,
   sqliteAllInChunks,
@@ -3047,6 +3061,14 @@ const FOLDER_CUSTOM_COVER_ASSET_SCHEMA_CHECKSUM = createHash('sha256')
   .update(FOLDER_CUSTOM_COVER_ASSET_SCHEMA_SQL)
   .digest('hex');
 
+const REVISION_SIZE_FINGERPRINT_INDEX_SCHEMA_SQL = `
+  CREATE INDEX revisions_size_fingerprint_idx
+    ON revisions(byte_size, content_fingerprint);
+`;
+const REVISION_SIZE_FINGERPRINT_INDEX_SCHEMA_CHECKSUM = createHash('sha256')
+  .update(REVISION_SIZE_FINGERPRINT_INDEX_SCHEMA_SQL)
+  .digest('hex');
+
 const ENTITY_APPEARANCE_TABLES = [
   'managed_folders',
   'linked_folders',
@@ -3811,6 +3833,16 @@ export const MIGRATIONS = [
     sql: FOLDER_CUSTOM_COVER_ASSET_SCHEMA_SQL,
     checksum: FOLDER_CUSTOM_COVER_ASSET_SCHEMA_CHECKSUM,
   },
+  {
+    version: 59,
+    sql: REVISION_SIZE_FINGERPRINT_INDEX_SCHEMA_SQL,
+    checksum: REVISION_SIZE_FINGERPRINT_INDEX_SCHEMA_CHECKSUM,
+  },
+  {
+    version: 60,
+    sql: LINKED_DIRECTORY_INDEX_SQL,
+    checksum: createHash('sha256').update(LINKED_DIRECTORY_INDEX_SQL).digest('hex'),
+  },
 ] as const;
 export const SUPPORTED_SCHEMA_VERSION = MIGRATIONS.at(-1)!.version;
 
@@ -4151,6 +4183,34 @@ interface ExistingAssetRow {
 interface ExistingDestination {
   actualRelativePath: string;
   size: number;
+  fileVersion?: {
+    ctimeMs: number;
+    dev: number;
+    ino: number;
+    mtimeMs: number;
+  };
+}
+
+function sameDestinationSnapshot(
+  expected: ExistingDestination | undefined,
+  current: ExistingDestination | undefined,
+): boolean {
+  if (expected === undefined || current === undefined) return expected === current;
+  if (
+    expected.actualRelativePath !== current.actualRelativePath ||
+    expected.size !== current.size
+  ) {
+    return false;
+  }
+  const expectedVersion = expected.fileVersion;
+  const currentVersion = current.fileVersion;
+  if (expectedVersion === undefined || currentVersion === undefined) {
+    return expectedVersion === currentVersion;
+  }
+  return expectedVersion.ctimeMs === currentVersion.ctimeMs
+    && expectedVersion.dev === currentVersion.dev
+    && expectedVersion.ino === currentVersion.ino
+    && expectedVersion.mtimeMs === currentVersion.mtimeMs;
 }
 
 interface PortablePathRow {
@@ -4162,6 +4222,7 @@ interface ImportAction {
   destinationRelativePath: string;
   entry: ImportSourceEntry;
   existingAsset?: ExistingAssetRow;
+  expectedDestination: ExistingDestination | undefined;
   isReplacement: boolean;
 }
 
@@ -4770,7 +4831,8 @@ class AsyncSemaphore {
 // libraries in the process, not merely within one queue drain.
 // Image decode gets a small hard-capped pool; physical CPU topology may only
 // reduce it on single-core machines, never expand native memory pressure.
-// FFmpeg and OIIO stay at one because their frame buffers are memory-bound.
+// FFmpeg concurrency adapts to current system memory; OIIO remains single-flight
+// because its frame buffers are large.
 const MEDIA_DECODE_CONCURRENCY = workerMediaDecodeConcurrency();
 const MEDIA_INTERACTIVE_DECODE_CONCURRENCY = workerMediaInteractiveDecodeConcurrency();
 // Background image work remains limited to the original two slots. Two extra
@@ -4780,9 +4842,6 @@ const MEDIA_INTERACTIVE_DECODE_CONCURRENCY = workerMediaInteractiveDecodeConcurr
 const sharpNativeDecoderSemaphore = new AsyncSemaphore(MEDIA_INTERACTIVE_DECODE_CONCURRENCY);
 const sharpDecoderSemaphore = new AsyncSemaphore(MEDIA_DECODE_CONCURRENCY);
 const interactiveSharpDecoderSemaphore = new AsyncSemaphore(MEDIA_INTERACTIVE_DECODE_CONCURRENCY);
-// FFmpeg's thumbnail filter can retain decoded frames; one native process at
-// a time is the intentional safety limit even on high-core machines.
-const ffmpegDecoderSemaphore = new AsyncSemaphore(1);
 const oiioDecoderSemaphore = new AsyncSemaphore(1);
 
 /** True when a visible/viewer Sharp job can start without aborting a running background decode. */
@@ -4857,7 +4916,7 @@ function yieldBetweenMediaClaims(): Promise<void> {
 
 interface MediaExecutionContext {
   signal?: AbortSignal;
-  /** Queue-owned video metadata is a separate durable job. */
+  /** Video metadata has a durable queue job and may share a poster probe. */
   includeVideoMetadata?: boolean;
   /** Queue-owned RAW metadata is a separate low-priority durable job. */
   includeRawMetadata?: boolean;
@@ -4869,27 +4928,34 @@ interface MediaExecutionContext {
   sourceHeight?: number | null;
 }
 
+interface VideoProbeResult {
+  durationSec: number;
+  width: number | null;
+  height: number | null;
+  hasAttachedPicture: boolean;
+}
+
 function throwIfMediaExecutionAborted(signal: AbortSignal | undefined): void {
   if (signal?.aborted) {
     throw signal.reason instanceof Error ? signal.reason : new Error('Media operation aborted.');
   }
 }
 
-async function waitForSharedMediaOperation(
+async function waitForSharedMediaOperation<T>(
   entry: {
     controller: AbortController;
-    promise: Promise<boolean>;
+    promise: Promise<T>;
     waiters: number;
   },
   signal: AbortSignal | undefined,
-): Promise<boolean> {
+): Promise<T> {
   entry.waiters += 1;
   try {
     if (!signal) return await entry.promise;
     if (signal.aborted) {
       throw signal.reason instanceof Error ? signal.reason : new Error('Media operation aborted.');
     }
-    return await new Promise<boolean>((resolve, reject) => {
+    return await new Promise<T>((resolve, reject) => {
       const onAbort = (): void => {
         cleanup();
         reject(signal.reason instanceof Error ? signal.reason : new Error('Media operation aborted.'));
@@ -5007,6 +5073,8 @@ export interface LibraryServiceOptions {
   /** HTTP(S) transport receives an already validated, pinned address per hop. */
   pinnedHttpTransport?: PinnedHttpTransport;
   destinationLstat?: (destinationPath: string) => Stats;
+  /** Test-only seam for an external destination appearing just before apply. */
+  beforeImportDestinationApply?: () => void;
   failAt?: ImportFailurePoint | ImportFailurePoint[];
   /** E2E-only hard stop used to leave an operation at a real process boundary. */
   terminateProcessAt?: ImportFailurePoint;
@@ -5017,6 +5085,8 @@ export interface LibraryServiceOptions {
   onDiagnostic?: (diagnostic: LibraryServiceDiagnostic) => void;
   onProgress?: (event: ExportProgressEvent | ImportProgressEvent | DeleteProgressEvent) => void;
   observerFactory?: AssetObserverFactory;
+  /** Deterministic slow/unavailable source-directory seam for Worker tests. */
+  sourceDirectoryOpener?: typeof opendirAsync;
   scheduler?: DebounceScheduler;
   /** Injectable Sharp-compatible decoder for deterministic concurrency tests. */
   sharpFn?: SharpModule;
@@ -5031,6 +5101,8 @@ export interface LibraryServiceOptions {
   mediaComponentProbe?: (component: MediaAutoRepairComponent) => boolean;
   /** Injectable spawn for binary subprocesses (ffmpeg/ffprobe/oiiotool). */
   spawnFn?: SpawnFunction;
+  /** Test-only system-memory seam for deterministic adaptive FFmpeg concurrency coverage. */
+  availablePhysicalMemoryBytesForTests?: () => number | undefined;
   /**
    * 永久删除一个链接资产的源文件。可注入，用于覆盖权限/占用/磁盘错误等路径。
    * 2026-09-15 起链接资产的删除**不再使用系统回收站**。
@@ -5098,6 +5170,8 @@ export interface AssetsChangedEvent {
   libraryId: string;
   missingCount: number;
   source?: 'watcher' | 'text-save' | 'content-replace' | 'client' | 'sync';
+  /** Filesystem or served drag-icon path may have changed; metadata-only edits omit it. */
+  nativeDragPathsChanged?: true;
   type: 'asset.changed';
 }
 
@@ -6870,6 +6944,7 @@ function closeIgnoringFailure(connection: DatabaseConnection | undefined): void 
 export class LibraryService {
   /** Stable for this Worker process; a new app process gets a new session. */
   private readonly applicationSessionId = randomUUID();
+  private reportedMemoryProbeUnavailable = false;
   /** App setting: audio grid thumbnails use cover art when the file has one. */
   private audioPreviewPrefersCover = true;
   private readonly openById = new Map<string, OpenLibrary>();
@@ -6955,6 +7030,13 @@ export class LibraryService {
     promise: Promise<boolean>;
     waiters: number;
   }>();
+  /** Coalesce full ffprobe metadata extraction by library and source revision. */
+  private readonly videoMetadataProbeInFlight = new Map<string, {
+    controller: AbortController;
+    promise: Promise<VideoProbeResult>;
+    waiters: number;
+    identity: object;
+  }>();
   /** Avoid synchronously probing missing tools on every visible-range request. */
   private readonly autoRepairProbeFailedAtByLibrary = new Map<
     string,
@@ -7023,6 +7105,41 @@ export class LibraryService {
    */
   private suppressWatcherNotifyUntilMs = 0;
   private artifactsDirReady = new WeakSet<OpenLibrary>();
+  private readonly linkedDirectoryIndexes = new WeakMap<OpenLibrary, LinkedDirectoryIndex>();
+  private readonly navigationBuilds = new WeakMap<OpenLibrary, SingleFlightRead<LibraryNavigationSummary>>();
+  private readonly linkedAssetPaths = new WeakMap<OpenLibrary, Map<string, { key: string; paths: string[] }>>();
+  private readonly linkedAssetCounts = new WeakMap<string[], ReturnType<typeof countLinkedDirectoryAssets>>();
+  private readonly linkedRuleMatchers = new WeakMap<LinkedFolderRule[], (relativePath: string) => boolean>();
+
+  private linkedDirectoryIndex(openLibrary: OpenLibrary): LinkedDirectoryIndex {
+    let index = this.linkedDirectoryIndexes.get(openLibrary);
+    if (!index) {
+      index = new LinkedDirectoryIndex(() => openLibrary.connection);
+      this.linkedDirectoryIndexes.set(openLibrary, index);
+    }
+    return index;
+  }
+
+  private countLinkedAssets(paths: string[]): ReturnType<typeof countLinkedDirectoryAssets> {
+    let counts = this.linkedAssetCounts.get(paths);
+    if (!counts) {
+      counts = countLinkedDirectoryAssets(paths);
+      this.linkedAssetCounts.set(paths, counts);
+    }
+    return counts;
+  }
+
+  private linkedFolderIgnored(openLibrary: OpenLibrary, rootId: string): (relativePath: string) => boolean {
+    const rows = hasTable(openLibrary.connection, 'explicit_ignored_paths')
+      ? openLibrary.connection.prepare(`
+          SELECT relative_path FROM explicit_ignored_paths
+           WHERE location_kind = 'linked' AND linked_folder_id = ? AND path_kind = 'folder'
+        `).all(rootId) as Array<{ relative_path: string }>
+      : [];
+    return linkedDirectoryIgnored(rows.map((row) => row.relative_path), (relativePath) =>
+      gitignoreMatchesPath(openLibrary.gitignoreMatcher, relativePath, 'folder', 'linked'),
+    );
+  }
 
   constructor(private readonly options: LibraryServiceOptions = {}) {
     this.networkMetadataCache = new NetworkMetadataCache(
@@ -7103,8 +7220,8 @@ export class LibraryService {
     }
   }
 
-  private emitClientAssetsChanged(libraryId: string, changedCount: number): void {
-    this.emitAssetsChanged(libraryId, changedCount, 'client');
+  private emitClientAssetsChanged(libraryId: string, changedCount: number, nativeDragPathsChanged = false): void {
+    this.emitAssetsChanged(libraryId, changedCount, 'client', nativeDragPathsChanged);
   }
 
   /**
@@ -7115,6 +7232,7 @@ export class LibraryService {
     libraryId: string,
     changedCount: number,
     source: NonNullable<AssetsChangedEvent['source']>,
+    nativeDragPathsChanged = false,
   ): void {
     if (changedCount <= 0) return;
     this.options.onAssetsChanged?.({
@@ -7123,6 +7241,7 @@ export class LibraryService {
       changedCount,
       missingCount: 0,
       source: this.syncReplayDepth > 0 && source === 'client' ? 'sync' : source,
+      ...(nativeDragPathsChanged ? { nativeDragPathsChanged: true } : {}),
     });
   }
 
@@ -7422,9 +7541,9 @@ export class LibraryService {
             modified_at: string | null;
           } | undefined;
 
-        let stat: Awaited<ReturnType<typeof lstatAsync>>;
+        let stat: Stats | BigIntStats;
         try {
-          stat = await lstatAsync(absolutePath);
+          stat = await lstatAsync(absolutePath, { bigint: true });
         } catch (error) {
           if (!isMissingPathError(error)) return null;
           if (existing) missingAssetIds.push(existing.asset_id);
@@ -7717,7 +7836,14 @@ export class LibraryService {
   ): Promise<boolean> {
     if (openLibrary.readOnly) return false;
     const existing = this.databaseBackupInFlight.get(openLibrary.summary.libraryId);
-    if (existing) return existing;
+    if (existing) {
+      if (!force) return existing;
+      // A maintenance snapshot may have started before the destructive
+      // command acquired its writer lease. Wait for it, then take a fresh
+      // snapshot under that lease; joining the old task would be stale.
+      await existing;
+      return this.createDatabaseBackupForOpenLibrary(openLibrary, reason, force);
+    }
 
     const backup1 = databaseBackupPath(openLibrary.summary.libraryPath, 1);
     if (!force && realFileExists(backup1)) {
@@ -7740,11 +7866,15 @@ export class LibraryService {
           {
             cancelled: false,
             // Open/periodic snapshots are maintenance work. Keep each native
-            // backup transfer below the event-loop budget; explicit close or
-            // export snapshots retain their existing throughput setting.
+            // backup transfer below the event-loop budget. Destructive
+            // commands must finish a verified snapshot before mutating disk;
+            // use bounded 2 MiB batches to avoid thousands of 100-page turns
+            // on a large library while still yielding between transfers.
             ...(reason === 'open' || reason === 'periodic'
               ? { backupPageBatch: 1 }
-              : {}),
+              : reason === 'destructive'
+                ? { backupPageBatch: 512 }
+                : {}),
           },
         );
 
@@ -7825,21 +7955,22 @@ export class LibraryService {
     return mediaNativeMemoryBudget.run(
       spawnOptions.signal,
       memoryBytes,
-      () => ffmpegDecoderSemaphore.run(
-        spawnOptions.signal,
-        async () => {
-          try {
-            const result = await this.spawnFn(command, boundedArgs, spawnOptions);
-            if (mediaResourceFailureFromSpawnResult(result)) {
-              throw asMediaResourceExhaustedError(result, 'ffmpeg')
-                ?? new Error('FFmpeg reported native resource pressure.');
-            }
-            return result;
-          } catch (error) {
-            throw asMediaResourceExhaustedError(error, 'ffmpeg') ?? error;
+      async () => {
+        try {
+          const result = await this.spawnFn(command, boundedArgs, spawnOptions);
+          if (mediaResourceFailureFromSpawnResult(result)) {
+            throw asMediaResourceExhaustedError(result, 'ffmpeg')
+              ?? new Error('FFmpeg reported native resource pressure.');
           }
-        },
-      ),
+          return result;
+        } catch (error) {
+          throw asMediaResourceExhaustedError(error, 'ffmpeg') ?? error;
+        }
+      },
+      {
+        key: 'ffmpeg',
+        limit: () => mediaFfmpegConcurrencyLimit(this.availablePhysicalMemoryBytes()),
+      },
     );
   }
 
@@ -7861,7 +7992,7 @@ export class LibraryService {
         spawnOptions.signal,
         async () => {
           try {
-            const result = await this.spawnFn(command, args, spawnOptions);
+            const result = await this.spawnFn(command, literalOiioArgs(args), spawnOptions);
             if (mediaResourceFailureFromSpawnResult(result)) {
               throw asMediaResourceExhaustedError(result, 'oiio')
                 ?? new Error('OpenImageIO reported native resource pressure.');
@@ -7881,6 +8012,32 @@ export class LibraryService {
     } catch {
       // Diagnostics are strictly best effort and must never replace the primary failure.
     }
+  }
+
+  private availablePhysicalMemoryBytes(): number | undefined {
+    let bytes: number | undefined;
+    try {
+      bytes = this.options.availablePhysicalMemoryBytesForTests
+        ? this.options.availablePhysicalMemoryBytesForTests()
+        : systemAvailablePhysicalMemoryBytes();
+    } catch {
+      bytes = undefined;
+    }
+
+    if (Number.isSafeInteger(bytes) && bytes! > 0) {
+      this.reportedMemoryProbeUnavailable = false;
+      return bytes;
+    }
+
+    if (!this.reportedMemoryProbeUnavailable) {
+      this.reportedMemoryProbeUnavailable = true;
+      this.diagnose(
+        'media-memory.probe-unavailable',
+        new Error('System physical memory is unavailable; FFmpeg concurrency uses the conservative limit.'),
+        { fallback: 'conservative', maxConcurrentFfmpeg: mediaFfmpegConcurrencyLimit(undefined) },
+      );
+    }
+    return undefined;
   }
 
   reportDiagnostic(scope: string, error: unknown, context?: Record<string, unknown>): void {
@@ -12917,6 +13074,8 @@ export class LibraryService {
   private portableDiskDestination(
     openLibrary: OpenLibrary,
     relativePath: string,
+    directoryCache?: ImportDestinationDirectoryCache,
+    options: { validateMissingSegments?: boolean; snapshotFile?: boolean } = {},
   ): ExistingDestination | undefined {
     const normalized = normalizeRelativeAssetPath(relativePath);
     const segments = normalized.split('/');
@@ -12925,16 +13084,17 @@ export class LibraryService {
 
     for (const [index, segment] of segments.entries()) {
       const segmentIdentity = portablePathSegmentIdentity(segment);
-      let children;
+      let matches;
       try {
-        children = readdirSync(cursor, { withFileTypes: true });
+        matches = directoryCache
+          ? directoryCache.matches(cursor, segmentIdentity)
+          : readdirSync(cursor, { withFileTypes: true }).filter(
+              (entry) => portablePathSegmentIdentity(entry.name) === segmentIdentity,
+            );
       } catch (error) {
         if (isMissingPathError(error)) return undefined;
         throw error;
       }
-      const matches = children.filter(
-        (entry) => portablePathSegmentIdentity(entry.name) === segmentIdentity,
-      );
       if (matches.length > 1) {
         throw new LibraryServiceError('IMPORT_APPLY_FAILED', {
           reason: 'NAME_NOT_SUPPORTED',
@@ -12942,6 +13102,7 @@ export class LibraryService {
       }
       const match = matches[0];
       if (!match) {
+        if (options.validateMissingSegments === false) return undefined;
         // Let the target filesystem, rather than a guessed constant, decide
         // whether this absent component is a valid candidate name.
         const candidatePath = path.join(cursor, segment);
@@ -12966,9 +13127,22 @@ export class LibraryService {
         cursor = path.join(cursor, match.name);
         continue;
       }
+      let size = -1;
+      let fileVersion: ExistingDestination['fileVersion'];
+      if (match.isFile() && options.snapshotFile !== false) {
+        const stat = lstatSync(path.join(cursor, match.name));
+        size = stat.size;
+        fileVersion = {
+          ctimeMs: stat.ctimeMs,
+          dev: stat.dev,
+          ino: stat.ino,
+          mtimeMs: stat.mtimeMs,
+        };
+      }
       return {
         actualRelativePath: actualSegments.join('/'),
-        size: match.isFile() ? lstatSync(path.join(cursor, match.name)).size : -1,
+        size,
+        ...(fileVersion ? { fileVersion } : {}),
       };
     }
     return undefined;
@@ -12981,7 +13155,8 @@ export class LibraryService {
    */
   private managedDestinationIndex(openLibrary: OpenLibrary): Map<string, ExistingDestination> {
     const assetColumns = columnsFor(openLibrary.connection, 'assets');
-    const deletedClause = assetColumns.has('deleted_at') ? 'WHERE a.deleted_at IS NULL' : '';
+    const filters = ["a.location_kind = 'managed'"];
+    if (assetColumns.has('deleted_at')) filters.push('a.deleted_at IS NULL');
     const rows = openLibrary.connection
       .prepare(
         `SELECT a.path_identity AS path_identity,
@@ -12989,7 +13164,7 @@ export class LibraryService {
                 r.byte_size AS byte_size
            FROM assets a
            LEFT JOIN revisions r ON r.revision_id = a.current_revision_id
-          ${deletedClause}`,
+          WHERE ${filters.join(' AND ')}`,
       )
       .all() as Array<{
         path_identity: string;
@@ -13010,9 +13185,19 @@ export class LibraryService {
     openLibrary: OpenLibrary,
     relativePath: string,
     index: Map<string, ExistingDestination> | undefined,
+    directoryCache?: ImportDestinationDirectoryCache,
+    options: { validateMissingSegments?: boolean } = {},
   ): ExistingDestination | undefined {
-    if (index) return index.get(portablePathIdentity(relativePath));
-    return this.portableDiskDestination(openLibrary, relativePath);
+    if (index) {
+      const indexedDestination = index.get(portablePathIdentity(relativePath));
+      if (indexedDestination !== undefined) return indexedDestination;
+    }
+    return this.portableDiskDestination(
+      openLibrary,
+      relativePath,
+      directoryCache,
+      options,
+    );
   }
 
   private assetsPath(openLibrary: OpenLibrary): string {
@@ -13119,6 +13304,8 @@ export class LibraryService {
 
   private expandImageSequenceSourcePaths(sourcePaths: readonly string[]): string[] {
     const expanded = new Map<string, string>();
+    const selectedPaths: string[] = [];
+    const selectedPathSet = new Set<string>();
     for (const rawPath of sourcePaths) {
       let selectedPath: string;
       try {
@@ -13128,16 +13315,15 @@ export class LibraryService {
         continue;
       }
       expanded.set(selectedPath, selectedPath);
-      const directory = path.dirname(selectedPath);
-      let siblingPaths: string[];
-      try {
-        siblingPaths = readdirSync(directory, { withFileTypes: true })
-          .filter((entry) => entry.isFile() && !entry.isSymbolicLink())
-          .map((entry) => path.join(directory, entry.name));
-      } catch {
-        continue;
+      if (!selectedPathSet.has(selectedPath)) {
+        selectedPathSet.add(selectedPath);
+        selectedPaths.push(selectedPath);
       }
-      const sequence = findImageSequenceContaining(selectedPath, siblingPaths);
+    }
+
+    const sequencesBySelectedPath = discoverSelectedImageSequenceFrames(selectedPaths);
+    for (const selectedPath of selectedPaths) {
+      const sequence = sequencesBySelectedPath.get(selectedPath)?.candidate;
       if (!sequence) continue;
       for (const frame of sequence.frames) {
         expanded.set(frame.value, frame.value);
@@ -13175,6 +13361,7 @@ export class LibraryService {
     if (selectedPaths.length === 0) return null;
 
     const sharp = requireSharp();
+    const sequencesBySelectedPath = discoverSelectedImageSequenceFrames(selectedPaths);
     const metadataCache = new Map<string, { width: number; height: number } | null>();
     const sequences: ImageSequenceImportOffer['sequences'] = [];
     const seenRunKeys = new Set<string>();
@@ -13214,17 +13401,11 @@ export class LibraryService {
     };
 
     for (const selectedPath of selectedPaths) {
-      const directory = path.dirname(selectedPath);
-      let siblingPaths: string[];
-      try {
-        siblingPaths = readdirSync(directory, { withFileTypes: true })
-          .filter((entry) => entry.isFile() && !entry.isSymbolicLink())
-          .map((entry) => path.join(directory, entry.name));
-      } catch {
-        continue;
-      }
-      const candidate = findImageSequenceContaining(selectedPath, siblingPaths);
+      const candidate = sequencesBySelectedPath.get(selectedPath)?.candidate;
       if (!candidate) continue;
+      const runKey = candidate.frames.map((frame) => frame.value).join('\0');
+      if (seenRunKeys.has(runKey)) continue;
+      seenRunKeys.add(runKey);
 
       await Promise.all(
         candidate.frames.map(async (frame) => {
@@ -13262,9 +13443,6 @@ export class LibraryService {
       }
       if (!complete || matching.length !== candidate.frames.length) continue;
       if (!matching.some((frame) => selectedPathSet.has(frame.value))) continue;
-      const runKey = matching.map((frame) => frame.value).join('\0');
-      if (seenRunKeys.has(runKey)) continue;
-      seenRunKeys.add(runKey);
       const firstFrame = matching[0]!.frameNumber;
       const lastFrame = matching.at(-1)!.frameNumber;
       sequences.push({
@@ -13852,7 +14030,7 @@ export class LibraryService {
       throw serviceError(error, 'LIBRARY_NOT_WRITABLE');
     }
 
-    this.emitClientAssetsChanged(input.libraryId, 1);
+    this.emitClientAssetsChanged(input.libraryId, 1, true);
     return this.summarizeManagedFolderRowRecursive(openLibrary, {
       ...row,
       name,
@@ -14220,7 +14398,7 @@ export class LibraryService {
       );
     }
 
-    this.emitClientAssetsChanged(input.libraryId, movedCount);
+    this.emitClientAssetsChanged(input.libraryId, movedCount, true);
     return { movedCount, skippedCount, folders: moved };
   }
 
@@ -14739,6 +14917,7 @@ export class LibraryService {
   ): Promise<{ removedAssetCount: number }> {
     const openLibrary = this.requireOpenLibrary(input.libraryId);
     this.assertLibraryWritable(openLibrary);
+    this.cancelReconciliationForClientMutation(input.libraryId);
     const linked = openLibrary.connection
       .prepare(
         'SELECT folder_id FROM linked_folders WHERE folder_id = ? AND library_id = ?',
@@ -14809,6 +14988,9 @@ export class LibraryService {
       }
     })();
 
+    this.linkedDirectoryIndex(openLibrary).forget(input.folderId);
+    this.linkedAssetPaths.get(openLibrary)?.delete(`${input.folderId}:true`);
+    this.linkedAssetPaths.get(openLibrary)?.delete(`${input.folderId}:false`);
     this.stopLinkedWatcher(input.libraryId, input.folderId);
     if (!silent) {
       this.emitDeleteProgress({
@@ -14842,6 +15024,7 @@ export class LibraryService {
   }): Promise<{ deletedAssetCount: number; failedCount: number }> {
     const openLibrary = this.requireOpenLibrary(input.libraryId);
     this.assertLibraryWritable(openLibrary);
+    this.cancelReconciliationForClientMutation(input.libraryId);
     const isLinkedRoot = input.relativePath === '';
     let relativePath: string;
     if (isLinkedRoot) {
@@ -14926,6 +15109,8 @@ export class LibraryService {
           },
           { progress: 'silent' },
         );
+      } else {
+        this.linkedDirectoryIndex(openLibrary).remove(input.linkedFolderId, relativePath);
       }
       return {
         deletedAssetCount: result.deletedCount,
@@ -15114,6 +15299,7 @@ export class LibraryService {
       input.relativePath,
     );
     const targetPath = this.assertLinkedDirectorySiblingAvailable(parent.absolutePath, name);
+    this.cancelReconciliationForClientMutation(input.libraryId);
     try {
       mkdirSync(targetPath);
     } catch (error) {
@@ -15125,6 +15311,7 @@ export class LibraryService {
     const relativePath = parent.relativePath === ''
       ? name
       : path.posix.join(parent.relativePath, name);
+    this.linkedDirectoryIndex(openLibrary).add(parent.linkedFolderId, relativePath);
     this.noteClientFilesystemMutation();
     return this.linkedDirectoryMutationSummary({
       linkedFolderId: parent.linkedFolderId,
@@ -15170,6 +15357,7 @@ export class LibraryService {
       });
     }
 
+    this.cancelReconciliationForClientMutation(input.libraryId);
     let renamed = false;
     try {
       renamePathWithRetry(target.absolutePath, destinationPath);
@@ -15195,6 +15383,10 @@ export class LibraryService {
         this.stopLinkedWatcher(input.libraryId, target.linkedFolderId);
         this.reconcileLinkedWatchers(openLibrary);
         this.noteClientFilesystemMutation();
+        const assetCount = openLibrary.connection
+          .prepare('SELECT COUNT(*) AS count FROM assets WHERE linked_folder_id = ?')
+          .get(target.linkedFolderId) as { count: number };
+        if (assetCount.count > 0) this.emitClientAssetsChanged(input.libraryId, assetCount.count, true);
         return this.linkedDirectoryMutationSummary({
           linkedFolderId: target.linkedFolderId,
           relativePath: '',
@@ -15269,8 +15461,11 @@ export class LibraryService {
             insert.run(ignored.location_kind, ignored.linked_folder_id, rewritten, ignored.path_kind, ignored.ignored_at);
           }
         }
+        this.linkedDirectoryIndex(openLibrary).rename(target.linkedFolderId, target.relativePath, newRelativePath);
+        this.linkedDirectoryIndex(openLibrary).add(target.linkedFolderId, newRelativePath);
       })();
       this.noteClientFilesystemMutation();
+      if (linkedAssets.length > 0) this.emitClientAssetsChanged(input.libraryId, linkedAssets.length, true);
       return this.linkedDirectoryMutationSummary({
         linkedFolderId: target.linkedFolderId,
         relativePath: newRelativePath,
@@ -15488,6 +15683,7 @@ export class LibraryService {
       changedCount: assetIds.length,
       missingCount: 0,
       source: 'client',
+      nativeDragPathsChanged: true,
     });
   }
 
@@ -16392,14 +16588,20 @@ export class LibraryService {
   }): number {
     const openLibrary = this.requireOpenLibrary(input.libraryId);
     const connection = openLibrary.connection;
+    const hasExplicitIgnores = this.catalogTableHasRows(connection, 'explicit_ignored_paths')
+      || this.catalogTableHasRows(connection, 'gitignore_ignored_paths');
     return countCatalogNavigationAssets(connection, {
       scope: input.scope,
       showIgnored: input.showIgnored,
       showMissingLinked: this.#showMissingLinkedFiles,
-      explicitIgnoreSql: this.explicitIgnoreSql(connection, 'a', input.showIgnored),
-      hasLinkedIgnoredAssets: hasTable(connection, 'linked_ignored_assets'),
-      hasSequenceFrames: hasTable(connection, 'asset_sequence_frames'),
+      explicitIgnoreSql: hasExplicitIgnores ? this.explicitIgnoreSql(connection, 'a', input.showIgnored) : '1 = 1',
+      hasLinkedIgnoredAssets: this.catalogTableHasRows(connection, 'linked_ignored_assets'),
+      hasSequenceFrames: this.catalogTableHasRows(connection, 'asset_sequence_frames'),
     });
+  }
+
+  private catalogTableHasRows(connection: DatabaseConnection, table: 'explicit_ignored_paths' | 'gitignore_ignored_paths' | 'linked_ignored_assets' | 'asset_sequence_frames'): boolean {
+    return hasTable(connection, table) && connection.prepare(`SELECT 1 FROM ${table} LIMIT 1`).get() !== undefined;
   }
 
   /**
@@ -16459,8 +16661,7 @@ export class LibraryService {
       folderCovers: this.listFolderNavigationCovers(openLibrary),
     };
     if (
-      this.getChangeSequence(input.libraryId) === changeSequence
-      && this.getBrowseChangeSequence(input.libraryId) === browseChangeSequence
+      this.getBrowseChangeSequence(input.libraryId) === browseChangeSequence
     ) {
       openLibrary.navigationSummaryCache = { key, value: summary };
     }
@@ -16481,6 +16682,43 @@ export class LibraryService {
     includeTrashedFolders?: boolean;
   }): Promise<LibraryNavigationSummary> {
     const openLibrary = this.requireOpenLibrary(input.libraryId);
+    let builds = this.navigationBuilds.get(openLibrary);
+    if (!builds) {
+      builds = new SingleFlightRead<LibraryNavigationSummary>();
+      this.navigationBuilds.set(openLibrary, builds);
+    }
+    const key = `${this.getBrowseChangeSequence(input.libraryId)}:${input.showIgnored === true}:${input.includeTrashedFolders === true}:${this.#showMissingLinkedFiles}`;
+    return builds.run(key, () => this.buildLibraryNavigationSummaryAsync(input, openLibrary));
+  }
+
+  private navigationReadCheckpoint(libraryId: string, expectedLibrary: OpenLibrary): () => Promise<void> {
+    let nextYieldAt = performance.now() + 6;
+    let nextPollAt = 0;
+    const checkpoint = async (): Promise<void> => {
+      // Windows timers can cost a full tick. Yield by work slice rather than
+      // paying that floor after every sub-millisecond catalog query.
+      if (performance.now() >= nextYieldAt) {
+        if (performance.now() >= nextPollAt) {
+          await navigationCheckpoint();
+          nextPollAt = performance.now() + 50;
+        } else {
+          await new Promise<void>((resolve) => setImmediate(resolve));
+        }
+        nextYieldAt = performance.now() + 6;
+      }
+      if (this.openById.get(libraryId) !== expectedLibrary) throw this.reconciliationAbortError();
+    };
+    return checkpoint;
+  }
+
+  private async buildLibraryNavigationSummaryAsync(input: {
+    libraryId: string;
+    showIgnored?: boolean;
+    includeTrashedFolders?: boolean;
+  }, expectedLibrary: OpenLibrary): Promise<LibraryNavigationSummary> {
+    const openLibrary = this.requireOpenLibrary(input.libraryId);
+    if (openLibrary !== expectedLibrary) throw this.reconciliationAbortError();
+    const checkpoint = this.navigationReadCheckpoint(input.libraryId, expectedLibrary);
     this.scheduleOrphanFolderCoverSweep(openLibrary);
     const showIgnored = input.showIgnored === true;
     const includeTrashedFolders = input.includeTrashedFolders === true;
@@ -16494,34 +16732,36 @@ export class LibraryService {
         : { ...cached.value, changeSequence };
     }
 
-    const allAssetCount = this.countNavigationAssets({
+    const metrics = new NavigationReadMetrics();
+    const allAssetCount = metrics.measure('all-count', () => this.countNavigationAssets({
       libraryId: input.libraryId,
       scope: 'all',
       showIgnored,
-    });
-    await navigationCheckpoint();
-    const rootAssetCount = this.countNavigationAssets({
+    }));
+    await checkpoint();
+    const rootAssetCount = metrics.measure('root-count', () => this.countNavigationAssets({
       libraryId: input.libraryId,
       scope: 'root',
       showIgnored,
-    });
-    await navigationCheckpoint();
-    const trashedAssetCount = this.countNavigationAssets({
+    }));
+    await checkpoint();
+    const trashedAssetCount = metrics.measure('trash-count', () => this.countNavigationAssets({
       libraryId: input.libraryId,
       scope: 'trash',
       showIgnored,
-    });
-    await navigationCheckpoint();
-    const folders = this.listManagedFolders(input.libraryId, showIgnored);
-    await navigationCheckpoint();
-    const linkedFolders = this.listLinkedFolders(input.libraryId);
-    await navigationCheckpoint();
-    const tags = this.listTags(input.libraryId);
-    await navigationCheckpoint();
-    const collections = this.listCollections(input.libraryId);
-    await navigationCheckpoint();
-    const smartCollections = this.listSmartCollections(input.libraryId);
-    await navigationCheckpoint();
+    }));
+    await checkpoint();
+    const folders = metrics.measure('managed-folders', () => this.listManagedFolders(input.libraryId, showIgnored));
+    await checkpoint();
+    const preparedLinkedPaths = await metrics.measureAsync('linked-asset-projection', () => this.prepareLinkedAssetPaths(openLibrary, false, checkpoint));
+    const linkedFolders = metrics.measure('linked-folders', () => this.listLinkedFolders(input.libraryId, preparedLinkedPaths));
+    await checkpoint();
+    const tags = metrics.measure('tags', () => this.listTags(input.libraryId));
+    await checkpoint();
+    const collections = metrics.measure('collections', () => this.listCollections(input.libraryId));
+    await checkpoint();
+    const smartCollections = metrics.measure('smart-collections', () => this.listSmartCollections(input.libraryId));
+    await checkpoint();
     const trashedFolders = includeTrashedFolders
       ? this.listTrashedFolders(input.libraryId)
       : [];
@@ -16541,10 +16781,13 @@ export class LibraryService {
       folderCovers: this.listFolderNavigationCovers(openLibrary),
     };
     if (
-      this.getChangeSequence(input.libraryId) === changeSequence
-      && this.getBrowseChangeSequence(input.libraryId) === browseChangeSequence
+      this.getBrowseChangeSequence(input.libraryId) === browseChangeSequence
     ) {
       openLibrary.navigationSummaryCache = { key, value: summary };
+    }
+    const timing = metrics.result();
+    if (timing.durationMs >= 250 || process.env.SERPENT_REFRESH_STAGE_LOG === '1') {
+      this.diagnose('navigation.summary', null, { libraryId: input.libraryId, ...timing });
     }
     return summary;
   }
@@ -16660,17 +16903,180 @@ export class LibraryService {
   }
 
   /**
+   * Recursive counts for the assets that match the current discovery filters.
+   * Folder ids match the sidebar: managed folder ids, linked roots, and
+   * linked virtual subdirectory ids. Folders with no matches are omitted.
+   */
+  filteredFolderCounts(input: {
+    libraryId: string;
+    filters?: FilterClause[] | null;
+    showIgnored?: boolean;
+  }): {
+    all: number;
+    root: number;
+    folders: Array<{ folderId: string; count: number }>;
+  } {
+    const openLibrary = this.requireOpenLibrary(input.libraryId);
+    const connection = openLibrary.connection;
+    const filters = input.filters ?? [];
+    const showIgnored = input.showIgnored === true;
+    const artifactColumns = columnsFor(connection, 'revision_artifacts');
+    const hasIgnoreTable = hasTable(connection, 'linked_ignored_assets');
+    const hasAiContent = hasTable(connection, 'ai_content');
+    const hasAiAssetTags = hasTable(connection, 'ai_asset_tags');
+    const hasSequenceFrames = hasTable(connection, 'asset_sequence_frames');
+    const filterFields = new Set(filters.map((filter) => filter.field));
+    const { sql: filterWhere, params: filterParams } = this.buildFilterWhere(filters, {
+      hasAiContent,
+      hasAiAssetTags,
+    });
+    const needsDurationMeta =
+      filterFields.has('width') ||
+      filterFields.has('height') ||
+      filterFields.has('duration_ms') ||
+      filterFields.has('long_edge') ||
+      filterFields.has('aspect_ratio');
+    const needsPaletteMeta = filterFields.has('color');
+    const needsTechnicalThumbnail =
+      filterFields.has('width') ||
+      filterFields.has('height') ||
+      filterFields.has('long_edge') ||
+      filterFields.has('aspect_ratio');
+    const needsMetadata =
+      filterFields.has('rating') ||
+      filterFields.has('favorite') ||
+      filterFields.has('source_url');
+    const durationMetaJoin = needsDurationMeta
+      ? `LEFT JOIN revision_artifacts duration_meta
+           ON duration_meta.revision_id = a.current_revision_id
+          AND duration_meta.kind = 'extracted_metadata'
+          ${artifactColumns.has('status') ? "AND duration_meta.status = 'ready'" : ''}
+          AND duration_meta.invalidated_at IS NULL`
+      : '';
+    const paletteMetaJoin = needsPaletteMeta
+      ? `LEFT JOIN revision_artifacts palette_meta
+           ON palette_meta.revision_id = a.current_revision_id
+          AND palette_meta.kind = 'extracted_palette'
+          ${artifactColumns.has('status') ? "AND palette_meta.status = 'ready'" : ''}
+          AND palette_meta.invalidated_at IS NULL`
+      : '';
+    const technicalThumbnailJoin = needsTechnicalThumbnail
+      ? singleDisplayArtifactJoin(
+          'technical_thumbnail',
+          artifactColumns.has('status') ? "AND chosen.status = 'ready'" : '',
+        )
+      : '';
+    const from = `FROM assets a
+         ${needsMetadata ? 'LEFT JOIN asset_metadata m ON m.asset_id = a.asset_id' : ''}
+         ${durationMetaJoin}
+         ${paletteMetaJoin}
+         ${technicalThumbnailJoin}`;
+    const whereParts = buildCatalogAssetVisibilityPredicates({
+      scopeKind: 'all',
+      showIgnored,
+      showMissingLinked: this.#showMissingLinkedFiles,
+      explicitIgnoreSql: this.explicitIgnoreSql(connection, 'a', showIgnored),
+      hasLinkedIgnoredAssets: hasIgnoreTable,
+      hasSequenceFrames,
+    });
+    const params: unknown[] = [];
+    if (filterWhere.length > 0) {
+      whereParts.push(filterWhere);
+      params.push(...filterParams);
+    }
+    const rows = connection.prepare(
+      `SELECT a.location_kind AS location_kind,
+              a.managed_folder_id AS managed_folder_id,
+              a.linked_folder_id AS linked_folder_id,
+              a.relative_file_path AS relative_file_path
+         ${from}
+        WHERE ${whereParts.join(' AND ')}`,
+    ).all(...params) as Array<{
+      location_kind: 'managed' | 'linked';
+      managed_folder_id: string | null;
+      linked_folder_id: string | null;
+      relative_file_path: string;
+    }>;
+
+    const direct = new Map<string, number>();
+    const linkedPaths = new Map<string, string[]>();
+    let root = 0;
+    for (const row of rows) {
+      if (row.location_kind === 'linked' && row.linked_folder_id) {
+        const paths = linkedPaths.get(row.linked_folder_id) ?? [];
+        paths.push(row.relative_file_path);
+        linkedPaths.set(row.linked_folder_id, paths);
+        continue;
+      }
+      if (row.managed_folder_id) {
+        direct.set(row.managed_folder_id, (direct.get(row.managed_folder_id) ?? 0) + 1);
+      } else {
+        root += 1;
+      }
+    }
+
+    const managedFolders = connection.prepare(
+      'SELECT folder_id, parent_folder_id FROM managed_folders',
+    ).all() as Array<{ folder_id: string; parent_folder_id: string | null }>;
+    const rolled = rollupDirectFolderCounts(
+      managedFolders.map((folder) => ({
+        folderId: folder.folder_id,
+        parentFolderId: folder.parent_folder_id,
+      })),
+      direct,
+    );
+    const folders: Array<{ folderId: string; count: number }> = [];
+    for (const [folderId, count] of rolled) {
+      if (count > 0) folders.push({ folderId, count });
+    }
+    for (const [linkedFolderId, paths] of linkedPaths) {
+      const counts = this.countLinkedAssets(paths);
+      for (const [relativePath, count] of counts) {
+        if (count.recursive <= 0) continue;
+        folders.push({
+          folderId: relativePath === ''
+            ? linkedFolderId
+            : encodeLinkedVirtualFolderId(linkedFolderId, relativePath),
+          count: count.recursive,
+        });
+      }
+    }
+    return { all: rows.length, root, folders };
+  }
+
+  /**
    * Direct child folder cards for the browse canvas (REQ-FOLDER-001/002/003).
    * Counts and covers are batched — never N+1 per card.
    */
+  async listFolderBrowseEntriesAsync(input: {
+    libraryId: string; parentFolderId: string | null; showIgnored?: boolean;
+  }): Promise<FolderBrowseEntry[]> {
+    const openLibrary = this.requireOpenLibrary(input.libraryId);
+    const scope = input.parentFolderId === null ? null : this.resolveLinkedFolderScope(openLibrary, input.parentFolderId);
+    const prepared = scope ? await this.prepareLinkedAssetPaths(openLibrary, input.showIgnored === true,
+      this.navigationReadCheckpoint(input.libraryId, openLibrary), [scope.linkedFolderId], false) : undefined;
+    return this.listFolderBrowseEntries(input, prepared);
+  }
+
+  async folderEntriesByRefsAsync(input: {
+    libraryId: string; refs: Array<{ locationKind: 'managed' | 'linked'; folderId: string }>;
+  }): Promise<FolderBrowseEntry[]> {
+    const openLibrary = this.requireOpenLibrary(input.libraryId);
+    const roots = input.refs.filter((ref) => ref.locationKind === 'linked')
+      .flatMap((ref) => this.resolveLinkedFolderScope(openLibrary, ref.folderId)?.linkedFolderId ?? []);
+    const prepared = roots.length ? await this.prepareLinkedAssetPaths(openLibrary, false,
+      this.navigationReadCheckpoint(input.libraryId, openLibrary), roots, false) : undefined;
+    return this.folderEntriesByRefs(input, prepared);
+  }
+
   listFolderBrowseEntries(input: {
     libraryId: string;
     parentFolderId: string | null;
     showIgnored?: boolean;
-  }): FolderBrowseEntry[] {
+  }, preparedPaths?: ReadonlyMap<string, string[]>): FolderBrowseEntry[] {
     const openLibrary = this.requireOpenLibrary(input.libraryId);
     if (input.parentFolderId !== null) {
-      const linkedEntries = this.listLinkedFolderBrowseEntries(openLibrary, input);
+      const linkedEntries = this.listLinkedFolderBrowseEntries(openLibrary, input, preparedPaths);
       if (linkedEntries !== null) return linkedEntries;
       const parent = openLibrary.connection
         .prepare('SELECT folder_id FROM managed_folders WHERE folder_id = ?')
@@ -16755,7 +17161,7 @@ export class LibraryService {
   folderEntriesByRefs(input: {
     libraryId: string;
     refs: Array<{ locationKind: 'managed' | 'linked'; folderId: string }>;
-  }): FolderBrowseEntry[] {
+  }, preparedPaths?: ReadonlyMap<string, string[]>): FolderBrowseEntry[] {
     const openLibrary = this.requireOpenLibrary(input.libraryId);
     const results: FolderBrowseEntry[] = [];
 
@@ -16833,13 +17239,13 @@ export class LibraryService {
     for (const ref of linkedRefs) {
       const resolved = this.resolveLinkedFolderScope(openLibrary, ref.folderId);
       if (!resolved) continue;
-      const paths = this.listLinkedAssetRelativePaths(
+      const paths = preparedPaths?.get(resolved.linkedFolderId) ?? this.listLinkedAssetRelativePaths(
         openLibrary,
         resolved.linkedFolderId,
         false,
       );
       const isRoot = resolved.relativePath === '';
-      const assetCounts = countLinkedDirectoryAssets(paths);
+      const assetCounts = this.countLinkedAssets(paths);
       const directoryCounts = assetCounts.get(resolved.relativePath);
       const directAssetCount = directoryCounts?.direct ?? 0;
       const recursiveAssetCount = directoryCounts?.recursive ?? 0;
@@ -16899,47 +17305,40 @@ export class LibraryService {
   private listLinkedFolderBrowseEntries(
     openLibrary: OpenLibrary,
     input: { parentFolderId: string | null; showIgnored?: boolean },
+    preparedPaths?: ReadonlyMap<string, string[]>,
   ): FolderBrowseEntry[] | null {
     if (input.parentFolderId === null) return null;
     const resolved = this.resolveLinkedFolderScope(openLibrary, input.parentFolderId);
     if (!resolved) return null;
 
-    const paths = this.listLinkedAssetRelativePaths(
+    const paths = preparedPaths?.get(resolved.linkedFolderId) ?? this.listLinkedAssetRelativePaths(
       openLibrary,
       resolved.linkedFolderId,
       input.showIgnored === true,
     );
-    const assetCounts = countLinkedDirectoryAssets(paths);
+    const assetCounts = this.countLinkedAssets(paths);
     const assetPrefixes = [...assetCounts.keys()].filter((prefix) => prefix !== '');
-    const diskPrefixes = resolved.status === 'available' && !this.linkedRootIsGone(resolved.absoluteRootPath)
-      ? this.collectLinkedDirectoryPrefixesFromDisk(
-        openLibrary,
-        resolved.linkedFolderId,
-        resolved.absoluteRootPath,
-        this.getLinkedFolderRules({
-          libraryId: openLibrary.summary.libraryId,
-          folderId: resolved.linkedFolderId,
-        }),
-      )
-      : [];
-    const prefixes = [...new Set([...assetPrefixes, ...diskPrefixes])].sort();
-    const children = directChildLinkedDirectories(prefixes, resolved.relativePath)
-      .filter((relativePath) =>
-        input.showIgnored === true
-        || !this.explicitFolderIgnored(openLibrary, 'linked', resolved.linkedFolderId, relativePath),
-      );
+    const rules = this.getLinkedFolderRules({ libraryId: openLibrary.summary.libraryId, folderId: resolved.linkedFolderId });
+    const diskChildren = (parent: string) => this.indexedLinkedDirectoryPrefixes(openLibrary,
+      resolved.linkedFolderId, rules, input.showIgnored === true, parent);
+    const folderIgnored = this.linkedFolderIgnored(openLibrary, resolved.linkedFolderId);
+    const children = [...new Set([...directChildLinkedDirectories(assetPrefixes, resolved.relativePath),
+      ...diskChildren(resolved.relativePath)])].sort()
+      .filter((relativePath) => input.showIgnored === true || !folderIgnored(relativePath));
     if (children.length === 0) return [];
-    const directoryChildCounts = countLinkedDirectoryChildren(prefixes);
+    const diskGrandchildren = this.linkedDirectoryIndex(openLibrary).childrenByParent(resolved.linkedFolderId, children);
+    const childDirectories = new Map(children.map((relativePath) => [relativePath,
+      [...new Set([...directChildLinkedDirectories(assetPrefixes, relativePath), ...(diskGrandchildren.get(relativePath) ?? []).filter((path) => !this.linkedPathIsIgnored(`${path}/__serpent_probe__`, rules)
+        && (input.showIgnored === true || !folderIgnored(path)))])],
+    ]));
 
     return this.withSequenceFolderCovers(openLibrary, children.map((relativePath) => {
       const folderId = encodeLinkedVirtualFolderId(resolved.linkedFolderId, relativePath);
       const directoryAssetCounts = assetCounts.get(relativePath);
       const directAssetCount = directoryAssetCounts?.direct ?? 0;
       const recursiveAssetCount = directoryAssetCounts?.recursive ?? 0;
-      const childFolderCount = directoryChildCounts.get(relativePath) ?? 0;
-      const directChildDirs = childFolderCount === 0
-        ? []
-        : prefixes.filter((prefix) => parentLinkedRelativePath(prefix) === relativePath);
+      const directChildDirs = childDirectories.get(relativePath) ?? [];
+      const childFolderCount = directChildDirs.length;
       const pureChildDirs = directAssetCount === 0 && childFolderCount > 0 ? directChildDirs : [];
       return {
         folderId,
@@ -17008,26 +17407,93 @@ export class LibraryService {
     };
   }
 
+  private linkedAssetPathKey(openLibrary: OpenLibrary, linkedFolderId: string, showIgnored: boolean): string {
+    const membershipVersion = this.linkedDirectoryIndex(openLibrary).membershipVersion(linkedFolderId)
+      ?? this.getBrowseChangeSequence(openLibrary.summary.libraryId);
+    return `${membershipVersion}:${showIgnored}:${this.#showMissingLinkedFiles}`;
+  }
+
+  private async prepareLinkedAssetPaths(
+    openLibrary: OpenLibrary,
+    showIgnored: boolean,
+    checkpoint: () => Promise<void>,
+    rootIds?: readonly string[],
+    prepareDirectories = true,
+  ): Promise<Map<string, string[]>> {
+    const prepared = new Map<string, string[]>();
+    let roots = this.linkedAssetPaths.get(openLibrary);
+    if (!roots) {
+      roots = new Map();
+      this.linkedAssetPaths.set(openLibrary, roots);
+    }
+    const rows = rootIds ? [...new Set(rootIds)].map((folder_id) => ({ folder_id }))
+      : openLibrary.connection.prepare('SELECT folder_id FROM linked_folders').all() as Array<{ folder_id: string }>;
+    for (const row of rows) {
+      if (!rootIds && !showIgnored && this.linkedFolderIgnored(openLibrary, row.folder_id)('')) continue;
+      if (prepareDirectories) await this.linkedDirectoryIndex(openLibrary).prepare(row.folder_id, checkpoint);
+      const key = this.linkedAssetPathKey(openLibrary, row.folder_id, showIgnored);
+      const rootKey = `${row.folder_id}:${showIgnored}`;
+      const cached = roots.get(rootKey);
+      if (cached?.key === key) {
+        prepared.set(row.folder_id, cached.paths);
+        continue;
+      }
+      const projection = await collectLinkedAssetPaths(
+        (after, limit) => this.readLinkedAssetPaths(openLibrary, row.folder_id, showIgnored, { after, limit }),
+        checkpoint,
+      );
+      prepared.set(row.folder_id, projection.paths);
+      this.linkedAssetCounts.set(projection.paths, projection.counts);
+      if (this.linkedAssetPathKey(openLibrary, row.folder_id, showIgnored) === key) {
+        roots.set(rootKey, { key, paths: projection.paths });
+      }
+    }
+    return prepared;
+  }
+
   private listLinkedAssetRelativePaths(
     openLibrary: OpenLibrary,
     linkedFolderId: string,
     showIgnored: boolean,
   ): string[] {
+    const key = this.linkedAssetPathKey(openLibrary, linkedFolderId, showIgnored);
+    let roots = this.linkedAssetPaths.get(openLibrary);
+    if (!roots) {
+      roots = new Map();
+      this.linkedAssetPaths.set(openLibrary, roots);
+    }
+    const rootKey = `${linkedFolderId}:${showIgnored}`;
+    const cached = roots.get(rootKey);
+    if (cached?.key === key) return cached.paths;
+    const paths = this.readLinkedAssetPaths(openLibrary, linkedFolderId, showIgnored);
+    roots.set(rootKey, { key, paths });
+    return paths;
+  }
+
+  private readLinkedAssetPaths(
+    openLibrary: OpenLibrary,
+    linkedFolderId: string,
+    showIgnored: boolean,
+    page?: { after: string | null; limit: number },
+  ): string[] {
     const connection = openLibrary.connection;
-    const hasIgnoreTable = hasTable(connection, 'linked_ignored_assets');
-    const hasSequenceFrames = hasTable(connection, 'asset_sequence_frames');
+    const hasIgnoreTable = this.catalogTableHasRows(connection, 'linked_ignored_assets');
+    const hasSequenceFrames = this.catalogTableHasRows(connection, 'asset_sequence_frames');
+    const hasExplicitIgnores = this.catalogTableHasRows(connection, 'explicit_ignored_paths')
+      || this.catalogTableHasRows(connection, 'gitignore_ignored_paths');
     const rows = connection
       .prepare(
         `SELECT a.relative_file_path
            FROM assets a
           WHERE a.linked_folder_id = ?
+            ${page?.after === null || page === undefined ? '' : 'AND a.relative_file_path > ?'}
             AND a.location_kind = 'linked'
             AND a.deleted_at IS NULL
             ${this.#showMissingLinkedFiles ? '' : "AND a.availability <> 'missing'"}
             ${hasIgnoreTable
               ? 'AND NOT EXISTS (SELECT 1 FROM linked_ignored_assets ignored WHERE ignored.asset_id = a.asset_id)'
               : ''}
-            AND ${this.explicitIgnoreSql(connection, 'a', showIgnored)}
+            AND ${hasExplicitIgnores ? this.explicitIgnoreSql(connection, 'a', showIgnored) : '1 = 1'}
             ${hasSequenceFrames
               ? `AND NOT EXISTS (
               SELECT 1
@@ -17035,9 +17501,10 @@ export class LibraryService {
                WHERE hidden_sequence_frame.asset_id = a.asset_id
                  AND hidden_sequence_frame.position > 0
             )`
-              : ''}`,
+              : ''}
+            ${page === undefined ? '' : 'ORDER BY a.relative_file_path LIMIT ?'}`,
       )
-      .all(linkedFolderId) as Array<{ relative_file_path: string }>;
+      .all(linkedFolderId, ...(page?.after === null || page === undefined ? [] : [page.after]), ...(page === undefined ? [] : [page.limit])) as Array<{ relative_file_path: string }>;
     return rows.map((row) => row.relative_file_path);
   }
 
@@ -17961,45 +18428,30 @@ export class LibraryService {
    * remain visible after refresh/reopen, so include real directories from the
    * linked root as well.  Symlinks and ignored directories are never followed.
    */
-  private collectLinkedDirectoryPrefixesFromDisk(
+  private indexedLinkedDirectoryPrefixes(
     openLibrary: OpenLibrary,
     linkedFolderId: string,
-    rootPath: string,
     rules: LinkedFolderRule[],
     includeGitignoreHidden = false,
+    parent?: string,
   ): string[] {
-    const prefixes = new Set<string>();
-    const visit = (directoryPath: string, relativeDirectory: string): void => {
-      let entries;
-      try {
-        entries = readdirSync(directoryPath, { withFileTypes: true });
-      } catch {
-        return;
-      }
-      for (const entry of entries) {
-        if (!entry.isDirectory() || entry.isSymbolicLink()) continue;
-        const relativePath = relativeDirectory === ''
-          ? entry.name
-          : path.posix.join(relativeDirectory, entry.name);
-        let normalized: string;
-        try {
-          normalized = normalizeRelativeAssetPath(relativePath);
-        } catch {
-          continue;
-        }
-        // Probe the folder target so folder rules (including default hidden
-        // directories) are applied with the same matcher as asset scans.
-        if (this.linkedPathIsIgnored(`${normalized}/__serpent_probe__`, rules)) continue;
-        if (!includeGitignoreHidden && this.explicitFolderIgnored(openLibrary, 'linked', linkedFolderId, normalized)) continue;
-        prefixes.add(normalized);
-        visit(path.join(directoryPath, entry.name), normalized);
-      }
-    };
-    visit(rootPath, '');
-    return [...prefixes].sort();
+    const folderIgnored = this.linkedFolderIgnored(openLibrary, linkedFolderId);
+    const index = this.linkedDirectoryIndex(openLibrary);
+    const paths = parent === undefined ? index.paths(linkedFolderId) : index.children(linkedFolderId, parent);
+    return paths.filter((relativePath) =>
+      !this.linkedPathIsIgnored(`${relativePath}/__serpent_probe__`, rules)
+      && (includeGitignoreHidden || !folderIgnored(relativePath)),
+    );
   }
 
-  listLinkedFolders(libraryId: string): LinkedFolderSummary[] {
+  async listLinkedFoldersAsync(libraryId: string): Promise<LinkedFolderSummary[]> {
+    const openLibrary = this.requireOpenLibrary(libraryId);
+    const paths = await this.prepareLinkedAssetPaths(openLibrary, false,
+      this.navigationReadCheckpoint(libraryId, openLibrary));
+    return this.listLinkedFolders(libraryId, paths);
+  }
+
+  listLinkedFolders(libraryId: string, preparedPaths?: ReadonlyMap<string, string[]>): LinkedFolderSummary[] {
     const openLibrary = this.requireOpenLibrary(libraryId);
     const rows = openLibrary.connection
       .prepare(
@@ -18021,18 +18473,17 @@ export class LibraryService {
     return rows
       .filter((row) => !this.explicitFolderIgnored(openLibrary, 'linked', row.folder_id, ''))
       .flatMap((row) => {
-        const paths = this.listLinkedAssetRelativePaths(openLibrary, row.folder_id, false);
-        const assetCounts = countLinkedDirectoryAssets(paths);
+        const paths = preparedPaths?.get(row.folder_id)
+          ?? this.listLinkedAssetRelativePaths(openLibrary, row.folder_id, false);
+        const assetCounts = this.countLinkedAssets(paths);
         const assetPrefixes = [...assetCounts.keys()].filter((prefix) => prefix !== '');
-        const diskPrefixes = row.status === 'available' && !this.linkedRootIsGone(row.absolute_root_path)
-          ? this.collectLinkedDirectoryPrefixesFromDisk(
+        const diskPrefixes = this.indexedLinkedDirectoryPrefixes(
             openLibrary,
             row.folder_id,
-            row.absolute_root_path,
             this.getLinkedFolderRules({ libraryId, folderId: row.folder_id }),
-          )
-          : [];
+          );
         const prefixes = [...new Set([...assetPrefixes, ...diskPrefixes])].sort();
+        const folderIgnored = this.linkedFolderIgnored(openLibrary, row.folder_id);
         const root: LinkedFolderSummary = {
           folderId: row.folder_id,
           displayName: row.display_name,
@@ -18051,7 +18502,7 @@ export class LibraryService {
           }),
         };
         const children = prefixes
-          .filter((prefix) => !this.explicitFolderIgnored(openLibrary, 'linked', row.folder_id, prefix))
+          .filter((prefix) => !folderIgnored(prefix))
           .map((relativePath) => {
             const parentPath = parentLinkedRelativePath(relativePath);
             return {
@@ -18493,6 +18944,7 @@ export class LibraryService {
       const assetIds = new Set(linkedAssets.map((asset) => asset.asset_id));
       const assets = this.listAssets({ libraryId: input.libraryId, folderId: managedFolderId, recursive: true })
         .filter((asset) => assetIds.has(asset.assetId));
+      if (linkedAssets.length > 0) this.emitClientAssetsChanged(input.libraryId, linkedAssets.length, true);
       return { managedFolderId, convertedCount: entries.length, assets };
     } catch (error) {
       if (error instanceof SimulatedCrashError) {
@@ -19327,6 +19779,7 @@ export class LibraryService {
     try {
       emitLinkedProgress('validate', 0, 0, 0, 0, true);
       let scannedBytes = 0;
+      const directories: string[] = [];
       const entries = this.enumerateLinkedSources(
         canonicalRoot,
         folderId,
@@ -19342,6 +19795,7 @@ export class LibraryService {
           scannedBytes += entryBytes;
           emitLinkedProgress('validate', foundCount, 0, scannedBytes, 0);
         },
+        (relativePath) => directories.push(relativePath),
       );
       const totalBytes = scannedBytes;
       emitLinkedProgress('copy', 0, entries.length, 0, totalBytes, true);
@@ -19384,7 +19838,7 @@ export class LibraryService {
            (asset_id, location_kind, managed_folder_id, linked_folder_id, relative_file_path,
             path_identity, current_revision_id, availability, source_device, source_inode,
             created_at, updated_at)
-         VALUES (?, 'linked', NULL, ?, ?, ?, NULL, 'available', ?, ?, ?, ?)`,
+         VALUES (?, 'linked', NULL, ?, ?, ?, ?, 'available', ?, ?, ?, ?)`,
         );
         const insertRevision = openLibrary.connection.prepare(
           `INSERT INTO revisions
@@ -19392,8 +19846,13 @@ export class LibraryService {
             original_filename, origin, accepted_at)
          VALUES (?, ?, NULL, ?, ?, ?, 'import', ?)`,
         );
-        const setCurrentRevision = openLibrary.connection.prepare(
-          'UPDATE assets SET current_revision_id = ?, updated_at = ? WHERE asset_id = ?',
+        // These assets have just been created and cannot have tags, metadata,
+        // or a prior search row. Build their initial FTS content from the
+        // import snapshot instead of rereading four tables for every file.
+        const insertInitialSearch = openLibrary.connection.prepare(
+          `INSERT INTO asset_search_index
+           (asset_id, filename, tags, description, source_url, author, folder_path, metadata_text)
+           VALUES (?, ?, '', '', '', '', ?, ?)`,
         );
         let filesProcessed = 0;
         let bytesProcessed = 0;
@@ -19406,6 +19865,7 @@ export class LibraryService {
             folderId,
             entry.relativePath,
             assetPathIdentity,
+            revisionId,
             entry.sourceDevice,
             entry.sourceInode,
             now,
@@ -19419,8 +19879,16 @@ export class LibraryService {
             entry.originalFilename,
             now,
           );
-          setCurrentRevision.run(revisionId, now, assetId);
-          this.syncAssetSearchContent(openLibrary.connection, assetId);
+          insertInitialSearch.run(
+            assetId,
+            normalizeSearchText(buildFileName(entry.relativePath)),
+            normalizeSearchText(buildFolderPath(entry.relativePath)),
+            normalizeSearchText(buildMetadataText({
+              availability: 'available',
+              byteSize: entry.byteSize,
+              relativeFilePath: entry.relativePath,
+            })),
+          );
           importedAssetIds.push(assetId);
           filesProcessed += 1;
           bytesProcessed += entry.byteSize;
@@ -19433,6 +19901,7 @@ export class LibraryService {
             filesProcessed === entries.length,
           );
         }
+        this.linkedDirectoryIndex(openLibrary).replace(folderId, directories);
       })();
       // GitHub #45: emit complete as soon as catalog rows are committed so
       // the renderer can drop “正在导入”. Header probes still run next for
@@ -19475,6 +19944,15 @@ export class LibraryService {
       emitLinkedProgress('failed', 0, 0, 0, 0, true);
       throw error;
     }
+  }
+
+  async relinkMissingFolderAsync(input: {
+    libraryId: string; folderId: string; newRootPath: string;
+  }): Promise<LinkedFolderSummary> {
+    const result = this.relinkMissingFolder(input);
+    // Watcher registration does not deliver an initial event for existing directories.
+    await this.runWatcherReconciliation(input.libraryId, 'watcher', 'linked-folder.relink', [input.folderId]);
+    return result;
   }
 
   relinkMissingFolder(input: {
@@ -19540,6 +20018,7 @@ export class LibraryService {
     );
     const now = new Date().toISOString();
 
+    let linkedAssetCount = 0;
     openLibrary.connection.transaction(() => {
       openLibrary.connection
         .prepare(
@@ -19549,6 +20028,7 @@ export class LibraryService {
             WHERE folder_id = ?`,
         )
         .run(canonicalNewRoot, sourceDeviceHintValue, newPathIdentity, now, input.folderId);
+      this.linkedDirectoryIndex(openLibrary).replace(input.folderId, []);
 
       const assets = openLibrary.connection
         .prepare(
@@ -19560,6 +20040,7 @@ export class LibraryService {
           current_revision_id: string;
           availability: 'available' | 'missing';
         }>;
+      linkedAssetCount = assets.length;
       for (const asset of assets) {
         const assetPath = path.join(canonicalNewRoot, ...asset.relative_file_path.split('/'));
         let fileStat;
@@ -19623,6 +20104,7 @@ export class LibraryService {
                         AND hidden_sequence_frame.position > 0
                    )`)
       .get(input.folderId) as { count: number };
+    if (linkedAssetCount > 0) this.emitClientAssetsChanged(input.libraryId, linkedAssetCount, true);
     return {
       folderId: input.folderId,
       displayName: folder.display_name,
@@ -20876,6 +21358,7 @@ export class LibraryService {
       changedCount: 1,
       missingCount: 0,
       source: 'client',
+      nativeDragPathsChanged: true,
     });
     return { assetId: input.assetId, colorSpaceOverride: normalized };
   }
@@ -23003,6 +23486,16 @@ export class LibraryService {
     return mediaJobCountsFromRows(rows);
   }
 
+  hasQueuedPrimaryPreviewJobs(libraryId: string): boolean {
+    const openLibrary = this.requireOpenLibrary(libraryId);
+    return openLibrary.connection.prepare(
+      `SELECT 1 FROM jobs
+        WHERE library_id = ? AND status = 'queued'
+          AND kind IN ('generate_thumbnail', 'generate_video_poster')
+        LIMIT 1`,
+    ).get(libraryId) !== undefined;
+  }
+
   listMediaJobs(libraryId: string, options: {
     summaryOnly?: boolean;
     cursor?: MediaJobListCursor;
@@ -23585,7 +24078,7 @@ export class LibraryService {
     } catch (error) {
       throw new LibraryServiceError('LIBRARY_NOT_WRITABLE', { cause: error });
     }
-    this.emitClientAssetsChanged(libraryId, 1);
+    this.emitClientAssetsChanged(libraryId, 1, true);
     return { baked: true, revisionId };
   }
 
@@ -23834,13 +24327,15 @@ export class LibraryService {
   readonly #pluginThumbnailExtensions = new Map<string, Set<string>>();
 
   /** Extensions a thumbnail provider claimed for this library, without a leading dot. */
-  setPluginThumbnailExtensions(libraryId: string, extensions: readonly string[]): void {
+  setPluginThumbnailExtensions(libraryId: string, extensions: readonly string[]): boolean {
+    const previous = this.#pluginThumbnailExtensions.get(libraryId);
     const normalized = new Set<string>();
     for (const value of extensions) {
       const extension = value.trim().replace(/^\./u, '').toLowerCase();
       if (/^[a-z0-9][a-z0-9+_-]*$/u.test(extension)) normalized.add(extension);
     }
     this.#pluginThumbnailExtensions.set(libraryId, normalized);
+    return [...normalized].some((extension) => !previous?.has(extension));
   }
 
   private claimsPluginThumbnail(libraryId: string, relativePath: string): boolean {
@@ -25561,7 +26056,14 @@ export class LibraryService {
   backfillMissingImageDimensions(
     libraryId: string,
     limit = 32,
-  ): Array<{ assetId: string; width: number; height: number }> {
+  ): Array<{
+    assetId: string;
+    width: number;
+    height: number;
+    revisionId: string;
+    previewKind: 'source' | null;
+    previewRevisionId: string | null;
+  }> {
     const openLibrary = this.requireOpenLibrary(libraryId);
     const imageSql = IMAGE_EXTENSIONS
       .map(() => 'LOWER(a.relative_file_path) LIKE ?')
@@ -25569,8 +26071,10 @@ export class LibraryService {
     const rows = openLibrary.connection
       .prepare(
         `SELECT a.asset_id, a.relative_file_path, a.location_kind, a.linked_folder_id,
-                a.current_revision_id
+                a.current_revision_id, source_revision.byte_size AS source_byte_size
            FROM assets a
+           JOIN revisions source_revision
+             ON source_revision.revision_id = a.current_revision_id
           WHERE a.deleted_at IS NULL
             AND a.availability = 'available'
             AND a.current_revision_id IS NOT NULL
@@ -25594,8 +26098,16 @@ export class LibraryService {
         location_kind: 'managed' | 'linked';
         linked_folder_id: string | null;
         current_revision_id: string | null;
+      source_byte_size: number;
       }>;
-    const out: Array<{ assetId: string; width: number; height: number }> = [];
+    const out: Array<{
+      assetId: string;
+      width: number;
+      height: number;
+      revisionId: string;
+      previewKind: 'source' | null;
+      previewRevisionId: string | null;
+    }> = [];
     for (const row of rows) {
       if (!row.current_revision_id) continue;
       const size = this.persistSourceImageDimensions(
@@ -25604,7 +26116,21 @@ export class LibraryService {
         row,
       );
       if (size) {
-        out.push({ assetId: row.asset_id, width: size.width, height: size.height });
+        const sourceDirect = isSourceDirectPreview({
+          fileName: row.relative_file_path,
+          mediaType: 'image',
+          byteSize: row.source_byte_size,
+          width: size.width,
+          height: size.height,
+        });
+        out.push({
+          assetId: row.asset_id,
+          width: size.width,
+          height: size.height,
+          revisionId: row.current_revision_id,
+          previewKind: sourceDirect ? 'source' : null,
+          previewRevisionId: sourceDirect ? row.current_revision_id : null,
+        });
       }
     }
     return out;
@@ -25619,16 +26145,27 @@ export class LibraryService {
   persistVisibleWindowImageDimensions(
     libraryId: string,
     assetIds: string[],
-  ): Array<{ assetId: string; width: number; height: number }> {
+  ): Array<{
+    assetId: string;
+    width: number;
+    height: number;
+    revisionId: string;
+    previewKind: 'source' | null;
+    previewRevisionId: string | null;
+  }> {
     const openLibrary = this.requireOpenLibrary(libraryId);
     if (assetIds.length === 0) return [];
     const capped = assetIds.slice(0, 64);
     const placeholders = capped.map(() => '?').join(',');
     const rows = openLibrary.connection
       .prepare(
-        `SELECT asset_id, relative_file_path, location_kind, linked_folder_id, current_revision_id
+        `SELECT assets.asset_id, assets.relative_file_path, assets.location_kind,
+                assets.linked_folder_id, assets.current_revision_id,
+                source_revision.byte_size AS source_byte_size
            FROM assets
-          WHERE asset_id IN (${placeholders})
+           JOIN revisions source_revision
+             ON source_revision.revision_id = assets.current_revision_id
+          WHERE assets.asset_id IN (${placeholders})
             AND NOT EXISTS (
               SELECT 1 FROM revision_artifacts ra
                WHERE ra.revision_id = assets.current_revision_id
@@ -25643,8 +26180,16 @@ export class LibraryService {
         location_kind: 'managed' | 'linked';
         linked_folder_id: string | null;
         current_revision_id: string | null;
+        source_byte_size: number;
       }>;
-    const out: Array<{ assetId: string; width: number; height: number }> = [];
+    const out: Array<{
+      assetId: string;
+      width: number;
+      height: number;
+      revisionId: string;
+      previewKind: 'source' | null;
+      previewRevisionId: string | null;
+    }> = [];
     for (const row of rows) {
       if (!row.current_revision_id) continue;
       const size = this.persistSourceImageDimensions(
@@ -25653,7 +26198,21 @@ export class LibraryService {
         row,
       );
       if (size) {
-        out.push({ assetId: row.asset_id, width: size.width, height: size.height });
+        const sourceDirect = isSourceDirectPreview({
+          fileName: row.relative_file_path,
+          mediaType: 'image',
+          byteSize: row.source_byte_size,
+          width: size.width,
+          height: size.height,
+        });
+        out.push({
+          assetId: row.asset_id,
+          width: size.width,
+          height: size.height,
+          revisionId: row.current_revision_id,
+          previewKind: sourceDirect ? 'source' : null,
+          previewRevisionId: sourceDirect ? row.current_revision_id : null,
+        });
       }
     }
     return out;
@@ -25673,16 +26232,27 @@ export class LibraryService {
     libraryId: string,
     assetIds: string[],
     signal?: AbortSignal,
-  ): Promise<Array<{ assetId: string; width: number; height: number }>> {
+  ): Promise<Array<{
+    assetId: string;
+    width: number;
+    height: number;
+    revisionId: string;
+    previewKind: 'source' | null;
+    previewRevisionId: string | null;
+  }>> {
     const openLibrary = this.requireOpenLibrary(libraryId);
     if (assetIds.length === 0) return [];
     const capped = assetIds.slice(0, 64);
     const placeholders = capped.map(() => '?').join(',');
     const rows = openLibrary.connection
       .prepare(
-        `SELECT asset_id, relative_file_path, location_kind, linked_folder_id, current_revision_id
+        `SELECT assets.asset_id, assets.relative_file_path, assets.location_kind,
+                assets.linked_folder_id, assets.current_revision_id,
+                source_revision.byte_size AS source_byte_size
            FROM assets
-          WHERE asset_id IN (${placeholders})
+           JOIN revisions source_revision
+             ON source_revision.revision_id = assets.current_revision_id
+          WHERE assets.asset_id IN (${placeholders})
             AND NOT EXISTS (
               SELECT 1 FROM revision_artifacts ra
                WHERE ra.revision_id = assets.current_revision_id
@@ -25697,8 +26267,16 @@ export class LibraryService {
         location_kind: 'managed' | 'linked';
         linked_folder_id: string | null;
         current_revision_id: string | null;
+        source_byte_size: number;
       }>;
-    const out: Array<{ assetId: string; width: number; height: number }> = [];
+    const out: Array<{
+      assetId: string;
+      width: number;
+      height: number;
+      revisionId: string;
+      previewKind: 'source' | null;
+      previewRevisionId: string | null;
+    }> = [];
     for (const row of rows) {
       if (signal?.aborted) {
         throw new DOMException('Visible-window probe aborted.', 'AbortError');
@@ -25710,7 +26288,21 @@ export class LibraryService {
       }
       if (!size) continue;
       this.persistExtractedImageDimensions(openLibrary, row.current_revision_id, size);
-      out.push({ assetId: row.asset_id, width: size.width, height: size.height });
+      const sourceDirect = isSourceDirectPreview({
+        fileName: row.relative_file_path,
+        mediaType: 'image',
+        byteSize: row.source_byte_size,
+        width: size.width,
+        height: size.height,
+      });
+      out.push({
+        assetId: row.asset_id,
+        width: size.width,
+        height: size.height,
+        revisionId: row.current_revision_id,
+        previewKind: sourceDirect ? 'source' : null,
+        previewRevisionId: sourceDirect ? row.current_revision_id : null,
+      });
     }
     return out;
   }
@@ -26017,7 +26609,7 @@ export class LibraryService {
           .run(randomUUID(), libraryId, existing.asset_id, revisionId, now, now);
       }
       this.syncAssetSearchContent(openLibrary.connection, existing.asset_id);
-      this.emitClientAssetsChanged(libraryId, 1);
+      this.emitClientAssetsChanged(libraryId, 1, true);
       return { assetId: existing.asset_id, created: false };
     });
   }
@@ -26077,7 +26669,7 @@ export class LibraryService {
       });
       this.pruneEmptyManagedFoldersAfterSyncRelocate(openLibrary, existing.managed_folder_id);
       this.noteClientFilesystemMutation();
-      this.emitClientAssetsChanged(libraryId, 1);
+      this.emitClientAssetsChanged(libraryId, 1, true);
     });
   }
 
@@ -26805,10 +27397,10 @@ export class LibraryService {
 
     let hasAttachedPicture = false;
     try {
-      const probe = await this.probeVideoAsset(
+      const probe = await this.probeVideoMetadataForRevision(
         input, openLibrary, assetPath, revisionId, ffprobePath, execution,
       );
-      hasAttachedPicture = probe.hasAttachedPicture;
+      hasAttachedPicture = probe?.hasAttachedPicture ?? false;
     } catch (error) {
       const resourceError = asMediaResourceExhaustedError(error, 'ffmpeg-audio');
       if (resourceError) throw resourceError;
@@ -27125,9 +27717,10 @@ export class LibraryService {
   // ── Video artifacts (ffprobe + ffmpeg) ─────────────────────────────
 
   /**
-   * Generate a video poster, and (for direct requests) metadata. Queue-owned
-   * imports set `includeMetadata` false: durable metadata and contact-sheet
-   * jobs then run independently of the browsing poster.
+   * Generate a video poster and its revision's full metadata from one ffprobe.
+   * The durable metadata job reuses the same in-flight or persisted result;
+   * the poster falls back to a duration-only probe only when full metadata is
+   * unavailable or has no usable duration.
    * Returns the poster artifact ID (the primary visual thumbnail).
    */
   private async generateVideoArtifacts(
@@ -27146,21 +27739,25 @@ export class LibraryService {
     let posterArtifactId: string | null = null;
     let durationSec: number | null = null;
 
-    if (includeMetadata) {
-      // Direct callers retain the historical all-in-one behavior. The queue
-      // deliberately keeps this out of the poster job so AI can proceed
-      // without waiting for the card preview.
-      try {
-        const probed = await this.probeVideoAsset(
-          input, openLibrary, assetPath, revisionId, ffprobePath, execution,
-        );
-        durationSec = probed.durationSec > 0 ? probed.durationSec : null;
-      } catch (error) {
-        const resourceError = asMediaResourceExhaustedError(error, 'ffprobe');
-        if (resourceError) throw resourceError;
-        this.diagnose('video-probe', error, { libraryId: input.libraryId, assetId: input.assetId });
-        // Continue with the poster even if probing fails.
-      }
+    try {
+      // Queue poster jobs used to run a duration-only ffprobe while the
+      // separate metadata job ran a full ffprobe for the same revision. A
+      // shared full probe supplies both the poster seek point and Inspector
+      // metadata without waiting for another queue job.
+      const probed = await this.probeVideoMetadataForRevision(
+        input, openLibrary, assetPath, revisionId, ffprobePath, execution,
+      );
+      durationSec = probed && probed.durationSec > 0 ? probed.durationSec : null;
+    } catch (error) {
+      const resourceError = asMediaResourceExhaustedError(error, 'ffprobe');
+      if (resourceError) throw resourceError;
+      this.diagnose(
+        includeMetadata ? 'video-probe' : 'video-poster-metadata-probe',
+        error,
+        { libraryId: input.libraryId, assetId: input.assetId },
+      );
+      // Continue with the poster even if full metadata probing fails. The
+      // poster helper can still make a duration-only attempt.
     }
 
     // 2. Video poster
@@ -28071,7 +28668,11 @@ export class LibraryService {
     // UNIQUE(revision_id, kind) and mask the real outcome.
     const inFlightKey = `${libraryId}\u0000${revisionId}`;
     const inFlight = this.videoContactSheetInFlight.get(inFlightKey);
-    if (inFlight) return await waitForSharedMediaOperation(inFlight, execution.signal);
+    // The last waiter can abort a producer before its promise settles. A new
+    // request must start fresh instead of joining that abandoned generation.
+    if (inFlight && !inFlight.controller.signal.aborted) {
+      return await waitForSharedMediaOperation(inFlight, execution.signal);
+    }
     if (existing) {
       // Explicit retry: clear the previous terminal row so either outcome —
       // a fresh ready sheet or a renewed failed marker — can register without
@@ -28218,7 +28819,7 @@ export class LibraryService {
     ).get(assetId) as { current_revision_id: string | null } | undefined;
     if (!asset?.current_revision_id) throw new LibraryServiceError('ASSET_NOT_FOUND');
     if (asset.current_revision_id !== queuedRevisionId) return false;
-    await this.probeVideoAsset(
+    const probed = await this.probeVideoMetadataForRevision(
       { libraryId, assetId },
       openLibrary,
       this.resolveAssetPath(libraryId, assetId),
@@ -28226,10 +28827,116 @@ export class LibraryService {
       resolveFfprobePath(),
       execution,
     );
+    if (!probed) return false;
     const currentAfterProbe = openLibrary.connection
       .prepare('SELECT current_revision_id FROM assets WHERE asset_id = ?')
       .get(assetId) as { current_revision_id: string | null } | undefined;
     return currentAfterProbe?.current_revision_id === queuedRevisionId;
+  }
+
+  private readReadyVideoMetadataForRevision(
+    openLibrary: OpenLibrary,
+    revisionId: string,
+  ): VideoProbeResult | null {
+    const artifact = openLibrary.connection.prepare(
+      `SELECT file_path FROM revision_artifacts
+        WHERE revision_id = ?
+          AND kind = 'extracted_metadata'
+          AND status = 'ready'
+          AND invalidated_at IS NULL
+          AND generator_version = ?
+        ORDER BY generated_at DESC, artifact_id DESC
+        LIMIT 1`,
+    ).get(revisionId, FFMPEG_METADATA_GENERATOR) as { file_path: string } | undefined;
+    if (!artifact) return null;
+    try {
+      const metadata = JSON.parse(
+        readFileSync(this.artifactFilePathFromRow(openLibrary, artifact.file_path), 'utf-8'),
+      ) as {
+        durationMs?: unknown;
+        width?: unknown;
+        height?: unknown;
+        hasCoverArt?: unknown;
+      };
+      if (
+        typeof metadata.durationMs !== 'number'
+        || !Number.isFinite(metadata.durationMs)
+        || metadata.durationMs < 0
+      ) return null;
+      return {
+        durationSec: metadata.durationMs / 1000,
+        width: typeof metadata.width === 'number'
+          && Number.isFinite(metadata.width)
+          && metadata.width > 0
+          ? metadata.width
+          : null,
+        height: typeof metadata.height === 'number'
+          && Number.isFinite(metadata.height)
+          && metadata.height > 0
+          ? metadata.height
+          : null,
+        hasAttachedPicture: metadata.hasCoverArt === true,
+      };
+    } catch {
+      // A missing or unreadable artifact is a cache miss. The source revision
+      // remains authoritative and can be probed again without trusting bytes
+      // from a different revision.
+      return null;
+    }
+  }
+
+  private async probeVideoMetadataForRevision(
+    input: { libraryId: string; assetId: string },
+    openLibrary: OpenLibrary,
+    assetPath: string,
+    revisionId: string,
+    ffprobePath: string,
+    execution: MediaExecutionContext,
+  ): Promise<VideoProbeResult | null> {
+    throwIfMediaExecutionAborted(execution.signal);
+    const current = openLibrary.connection.prepare(
+      'SELECT current_revision_id FROM assets WHERE asset_id = ?',
+    ).get(input.assetId) as { current_revision_id: string | null } | undefined;
+    if (!current?.current_revision_id) throw new LibraryServiceError('ASSET_NOT_FOUND');
+    if (current.current_revision_id !== revisionId) return null;
+
+    const cached = this.readReadyVideoMetadataForRevision(openLibrary, revisionId);
+    if (cached) return cached;
+
+    const inFlightKey = `${input.libraryId}\u0000${revisionId}`;
+    let entry = this.videoMetadataProbeInFlight.get(inFlightKey);
+    // An aborted producer may still be unwinding its subprocess. Its finally
+    // guard uses identity, so replacing it cannot remove the new probe.
+    if (entry?.controller.signal.aborted) entry = undefined;
+    if (!entry) {
+      const controller = new AbortController();
+      const identity = {};
+      const promise = (async () => {
+        try {
+          return await this.probeVideoAsset(
+            input,
+            openLibrary,
+            assetPath,
+            revisionId,
+            ffprobePath,
+            { ...execution, signal: controller.signal },
+          );
+        } finally {
+          if (this.videoMetadataProbeInFlight.get(inFlightKey)?.identity === identity) {
+            this.videoMetadataProbeInFlight.delete(inFlightKey);
+          }
+        }
+      })();
+      const createdEntry = { controller, promise, waiters: 0, identity };
+      this.videoMetadataProbeInFlight.set(inFlightKey, createdEntry);
+      entry = createdEntry;
+    }
+
+    const probed = await waitForSharedMediaOperation(entry, execution.signal);
+    const currentAfterProbe = openLibrary.connection.prepare(
+      'SELECT current_revision_id FROM assets WHERE asset_id = ?',
+    ).get(input.assetId) as { current_revision_id: string | null } | undefined;
+    return currentAfterProbe?.current_revision_id === revisionId ? probed : null;
   }
 
   private async generateQueuedRawImageMetadata(
@@ -28327,12 +29034,7 @@ export class LibraryService {
     revisionId: string,
     ffprobePath: string,
     execution: MediaExecutionContext,
-  ): Promise<{
-    durationSec: number;
-    width: number | null;
-    height: number | null;
-    hasAttachedPicture: boolean;
-  }> {
+  ): Promise<VideoProbeResult> {
     const artifactId = randomUUID();
     const artifactsDir = this.artifactsDir(openLibrary);
     mkdirSync(artifactsDir, { recursive: true });
@@ -28700,31 +29402,10 @@ export class LibraryService {
     };
   }
 
-  private vp9VideoProxyProfile(): VideoProxyProfile {
-    return {
-      codec: 'vp9',
-      encoder: 'libvpx-vp9',
-      extension: 'webm',
-      mimeType: 'video/webm',
-      args: [
-        '-c:v', 'libvpx-vp9',
-        '-threads', '1',
-        '-b:v', '1M',
-        '-deadline', 'realtime',
-        '-cpu-used', '8',
-        '-row-mt', '1',
-        '-g', '60',
-        '-c:a', 'libopus',
-        '-b:a', '128k',
-      ],
-    };
-  }
-
   /**
    * Listing an encoder in `ffmpeg -encoders` is not a capability proof.
-   * Probe a 1-frame lavfi encode and keep the first encoder that writes a
-   * non-empty file. Hardware names that fail fall through to the next listed
-   * candidate, then to VP9.
+   * Probe a 1-frame lavfi encode and keep the first H.264 encoder that writes
+   * a non-empty file. If none works, proxy generation fails without trying VP9.
    */
   private async probeVideoProxyEncoder(
     ffmpegPath: string,
@@ -28793,12 +29474,10 @@ export class LibraryService {
       this.videoProxyEncoderByFfmpegPath.set(ffmpegPath, encoder);
     }
 
-    return encoder === null
-      ? [this.vp9VideoProxyProfile()]
-      : [this.h264VideoProxyProfile(encoder), this.vp9VideoProxyProfile()];
+    return encoder === null ? [] : [this.h264VideoProxyProfile(encoder)];
   }
 
-  /** Generate an H.264/MP4 proxy, with fast VP9/WebM fallback. */
+  /** Generate an H.264/MP4 proxy; VP9 is deliberately never used. */
   private async generateVideoProxy(
     input: { libraryId: string; assetId: string },
     openLibrary: OpenLibrary,
@@ -28810,8 +29489,8 @@ export class LibraryService {
   ): Promise<string> {
     const artifactId = randomUUID();
     const profiles = await this.resolveVideoProxyProfiles(ffmpegPath, execution);
-    let lastError: unknown = new Error('No video proxy encoder is available.');
-    let failedProfile = profiles[0] ?? this.vp9VideoProxyProfile();
+    let lastError: unknown = new Error('No H.264 video proxy encoder is available.');
+    let failedProfile = profiles[0] ?? this.h264VideoProxyProfile('unavailable');
 
     for (const profile of profiles) {
       failedProfile = profile;
@@ -29159,7 +29838,7 @@ export class LibraryService {
 
       if (result.exitCode !== 0) {
         throw new OiioInvocationError(
-          isRawAsset ? 'OIIO_GENERATION_FAILED' : 'OIIO_COLOR_TRANSFORM_FAILED',
+          oiioFailureCode(result.stderr),
           `oiiotool ${isRawAsset ? 'RAW decode' : 'OCIO display transform'} exited with code ${result.exitCode}: ${result.stderr.slice(-8192)}`,
         );
       }
@@ -29179,11 +29858,11 @@ export class LibraryService {
            VALUES (?, ?, ?, 'image/png', ?, ?, ?, 'ready', ?)`,
         )
         .run(artifactId, revisionId, artifactKind, outputStat.size, artifactRelPath,
-          isRawAsset
+          (isRawAsset
             ? `oiio@${OIIO_VERSION};raw-${isViewerImage ? 'viewer-full' : 'default'}-srgb;subimage=${subimage};display-uint8`
             : isIcoAsset
               ? `oiio@${OIIO_VERSION};ico-largest-v1;subimage=${subimage};display-uint8`
-              : `oiio@${OIIO_VERSION};${isViewerImage ? 'viewer-full;' : ''}ocio=studio-v4-aces2;colorspace=${inputColorSpace ?? 'auto'};exposure=${exposureStops};subimage=${subimage};display-uint8`,
+              : `oiio@${OIIO_VERSION};${isViewerImage ? 'viewer-full;' : ''}ocio=studio-v4-aces2;colorspace=${inputColorSpace ?? 'auto'};exposure=${exposureStops};subimage=${subimage};display-uint8`) + `;${OIIO_LITERAL_PATHS_MARK}`,
           new Date().toISOString());
       if (rawMetadata) {
         await this.persistRawImageMetadata(openLibrary, input.assetId, revisionId, assetPath, rawMetadata, {
@@ -29220,11 +29899,11 @@ export class LibraryService {
         )
         .run(
           artifactId, revisionId, artifactKind, artifactRelPath,
-          isRawImageExtension(assetPath)
+          (isRawImageExtension(assetPath)
             ? `oiio@${OIIO_VERSION};raw-${isViewerImage ? 'viewer-full' : 'default'}-srgb;subimage=${subimage}`
             : isIcoAsset
               ? `oiio@${OIIO_VERSION};ico-largest-v1;subimage=${subimage}`
-              : `oiio@${OIIO_VERSION};${isViewerImage ? 'viewer-full;' : ''}ocio=studio-v4-aces2;subimage=${subimage}`,
+              : `oiio@${OIIO_VERSION};${isViewerImage ? 'viewer-full;' : ''}ocio=studio-v4-aces2;subimage=${subimage}`) + `;${OIIO_LITERAL_PATHS_MARK}`,
           errorCode,
           new Date().toISOString(),
         );
@@ -30888,6 +31567,20 @@ export class LibraryService {
     }
   }
 
+  private async artifactRootPathAsync(openLibrary: OpenLibrary): Promise<string> {
+    const artifactsDir = this.artifactsDir(openLibrary);
+    try {
+      const rootEntry = await lstatAsync(artifactsDir);
+      if (!rootEntry.isDirectory() || rootEntry.isSymbolicLink()) {
+        throw new LibraryServiceError('INVALID_LIBRARY_PATH');
+      }
+      return await realpathAsync(artifactsDir);
+    } catch (error) {
+      if (error instanceof LibraryServiceError) throw error;
+      throw new LibraryServiceError('INVALID_LIBRARY_PATH', { cause: error });
+    }
+  }
+
   private artifactFilePathFromRoot(
     artifactsRoot: string,
     relativeFilePath: string,
@@ -30922,6 +31615,41 @@ export class LibraryService {
     }
   }
 
+  /** Async equivalent for bounded bulk serving; keep the sync point API intact. */
+  private async artifactFilePathFromRootAsync(
+    artifactsRoot: string,
+    relativeFilePath: string,
+  ): Promise<string> {
+    const targetPath = path.resolve(artifactsRoot, ...relativeFilePath.split('/'));
+    const relation = path.relative(artifactsRoot, targetPath);
+    if (
+      relation === '' ||
+      relation.startsWith(`..${path.sep}`) ||
+      path.isAbsolute(relation)
+    ) {
+      throw new LibraryServiceError('INVALID_LIBRARY_PATH');
+    }
+    try {
+      const targetEntry = await lstatAsync(targetPath);
+      if (!targetEntry.isFile() || targetEntry.isSymbolicLink()) {
+        throw new LibraryServiceError('INVALID_LIBRARY_PATH');
+      }
+      const realTarget = await realpathAsync(targetPath);
+      const realRelation = path.relative(artifactsRoot, realTarget);
+      if (
+        realRelation === '' ||
+        realRelation.startsWith(`..${path.sep}`) ||
+        path.isAbsolute(realRelation)
+      ) {
+        throw new LibraryServiceError('INVALID_LIBRARY_PATH');
+      }
+      return realTarget;
+    } catch (error) {
+      if (error instanceof LibraryServiceError) throw error;
+      throw new LibraryServiceError('ASSET_NOT_FOUND', { cause: error });
+    }
+  }
+
   /**
    * Batched native-drag priming entries (Serpent-v4jf).
    *
@@ -30936,14 +31664,14 @@ export class LibraryService {
    * exact safety boundary of the single-entry resolvers. Missing entries are
    * skipped like the legacy loop; hard failures still throw.
    */
-  resolveAssetDragInfos(
+  async resolveAssetDragInfos(
     libraryId: string,
     assetIds: readonly string[],
-  ): Array<{
+  ): Promise<Array<{
     assetId: string;
     absolutePath: string;
     thumbnailAbsolutePath?: string;
-  }> {
+  }>> {
     const openLibrary = this.requireOpenLibrary(libraryId);
     const uniqueIds = [...new Set(assetIds)];
     if (uniqueIds.length === 0) return [];
@@ -31017,56 +31745,69 @@ export class LibraryService {
       assetId: string;
       absolutePath: string;
       thumbnailAbsolutePath?: string;
-    }> = [];
-    for (const row of assetRows) {
-      let absolutePath: string;
-      try {
-        absolutePath =
-          row.location_kind === 'managed'
-            ? this.folderPath(openLibrary, row.relative_file_path)
-            : this.linkedAssetPath(
-                openLibrary,
-                row.linked_folder_id,
-                row.relative_file_path,
-              );
-      } catch (error) {
-        if (
-          error instanceof LibraryServiceError &&
-          error.code === 'ASSET_NOT_FOUND'
-        ) {
-          continue;
-        }
-        throw error;
-      }
-      const thumbnail =
-        row.current_revision_id === null
-          ? undefined
-          : thumbnailByRevision.get(row.current_revision_id);
-      let thumbnailAbsolutePath: string | undefined;
-      if (thumbnail) {
+    } | null> = Array.from({ length: assetRows.length }, () => null);
+    const failures: unknown[] = [];
+    let nextIndex = 0;
+    // The SQL reads are short, but synchronous path validation across a drag
+    // primer's page can hold the only Worker event loop for over a second.
+    // Preserve each containment check while letting interactive requests run
+    // between bounded filesystem operations.
+    await Promise.all(Array.from({ length: Math.min(8, assetRows.length) }, async () => {
+      for (;;) {
+        const index = nextIndex++;
+        if (index >= assetRows.length) return;
+        const row = assetRows[index]!;
+        let absolutePath: string;
         try {
-          thumbnailAbsolutePath = this.artifactFilePathFromRow(
-            openLibrary,
-            thumbnail.filePath,
-          );
+          absolutePath =
+            row.location_kind === 'managed'
+              ? await this.folderPathAsync(openLibrary, row.relative_file_path)
+              : await this.linkedAssetPathAsync(
+                  openLibrary,
+                  row.linked_folder_id,
+                  row.relative_file_path,
+                );
         } catch (error) {
           if (
-            !(error instanceof LibraryServiceError) ||
-            error.code !== 'ASSET_NOT_FOUND'
+            error instanceof LibraryServiceError &&
+            error.code === 'ASSET_NOT_FOUND'
           ) {
-            throw error;
+            continue;
+          }
+          failures.push(error);
+          continue;
+        }
+        const thumbnail =
+          row.current_revision_id === null
+            ? undefined
+            : thumbnailByRevision.get(row.current_revision_id);
+        let thumbnailAbsolutePath: string | undefined;
+        if (thumbnail) {
+          try {
+            thumbnailAbsolutePath = await this.artifactFilePathFromRootAsync(
+              await this.artifactRootPathAsync(openLibrary), thumbnail.filePath,
+            );
+          } catch (error) {
+            if (
+              !(error instanceof LibraryServiceError) ||
+              error.code !== 'ASSET_NOT_FOUND'
+            ) {
+              failures.push(error);
+              continue;
+            }
           }
         }
+        entries[index] = {
+          assetId: row.asset_id,
+          absolutePath,
+          ...(thumbnailAbsolutePath === undefined
+            ? {}
+            : { thumbnailAbsolutePath }),
+        };
       }
-      entries.push({
-        assetId: row.asset_id,
-        absolutePath,
-        ...(thumbnailAbsolutePath === undefined
-          ? {}
-          : { thumbnailAbsolutePath }),
-      });
-    }
-    return entries;
+    }));
+    if (failures.length > 0) throw failures[0];
+    return entries.filter((entry): entry is NonNullable<typeof entry> => entry !== null);
   }
 
   getCurrentMediaSource(
@@ -32066,6 +32807,8 @@ export class LibraryService {
         readLibraryIdentity(openLibrary.connection, { skipQuickCheck: true });
         markStage('identity');
         await this.yieldReconciliation(task);
+        await this.linkedDirectoryIndex(openLibrary).recover(() => this.yieldReconciliation(task));
+        markStage('directory-index-recovery');
 
         // The first pass is source reconciliation: it repairs the browse
         // surface before optional maintenance touches old rows. This keeps a
@@ -32701,6 +33444,7 @@ export class LibraryService {
       // stay marked failed and are never retried.
       requeueRetryableFailedArtifacts(openLibrary.connection, {
         priority: options.priority ?? 0,
+        ...(options.assetIds === undefined ? {} : { assetIds: selectedIds }),
         ...(limit === undefined ? {} : { limit }),
       });
     }
@@ -32736,6 +33480,13 @@ export class LibraryService {
     // while the media bundle lacked a RAW reader. Re-open only those
     // RAW-scoped failures; other decode failures remain terminal until an
     // explicit user retry.
+    const legacyPathRepairEnqueued = options.retryFailed
+      ? requeueLegacyOiioPathFailures(openLibrary.connection, {
+        libraryPath: openLibrary.summary.libraryPath,
+        assetIds: selectedIds,
+        limit,
+      })
+      : 0;
     const legacyRawRepairEnqueued = options.retryFailed
       ? this.requeueLegacyRawColorTransformFailures(openLibrary, {
         assetIds: selectedIds,
@@ -32748,7 +33499,7 @@ export class LibraryService {
         ...(options.assetIds === undefined ? {} : { assetIds: selectedIds }),
         limit,
       });
-    let enqueued = repairEnqueued + legacyRawRepairEnqueued + importedNormalizationEnqueued;
+    let enqueued = repairEnqueued + legacyPathRepairEnqueued + legacyRawRepairEnqueued + importedNormalizationEnqueued;
     // Model extensions join the queue (slice E, Serpent-hnmg): the offscreen
     // GPU renderer in Main produces model thumbnails, stored as the standard
     // `thumbnail` artifact. The dedupe below (terminal artifact / active job)
@@ -32993,6 +33744,30 @@ export class LibraryService {
            ORDER BY source_metadata.generated_at DESC
            LIMIT 1) AS source_height`
       : ', NULL AS source_width, NULL AS source_height';
+    const sourceDirectExtensionSql = SOURCE_DIRECT_IMAGE_EXTENSIONS
+      .map(() => 'LOWER(a.relative_file_path) LIKE ?')
+      .join(' OR ');
+    const sourceDirectCandidateSql = artifactColumns.has('width') && artifactColumns.has('height')
+      ? `
+            AND NOT (
+              (${sourceDirectExtensionSql})
+              AND source_revision.byte_size BETWEEN 1 AND ${SOURCE_DIRECT_MAX_BYTES}
+              AND EXISTS (
+                SELECT 1 FROM revision_artifacts source_metadata
+                 WHERE source_metadata.revision_id = a.current_revision_id
+                   AND source_metadata.kind = 'extracted_metadata'
+                   AND source_metadata.status = 'ready'
+                   AND source_metadata.invalidated_at IS NULL
+                   AND source_metadata.width > 0
+                   AND source_metadata.height > 0
+                   AND source_metadata.width <= ${SOURCE_DIRECT_MAX_LONG_EDGE_PX}
+                   AND source_metadata.height <= ${SOURCE_DIRECT_MAX_LONG_EDGE_PX}
+                   AND source_metadata.width * source_metadata.height <= ${SOURCE_DIRECT_MAX_PIXELS}
+                 ORDER BY source_metadata.generated_at DESC
+                 LIMIT 1
+              )
+            )`
+      : '';
     const queryLimit = limit === undefined ? '' : 'LIMIT ?';
     // Serpent-xoaz: background fill (no assetIds) drains most-recently
     // imported assets first (created_at DESC, path as a deterministic
@@ -33018,6 +33793,7 @@ export class LibraryService {
             ${notOfflineLinkedFolderSql}
             ${hiddenSequenceMemberSql}
             AND (${extensionSql})
+            ${sourceDirectCandidateSql}
             AND NOT EXISTS (
               SELECT 1 FROM revision_artifacts ra
               WHERE ra.revision_id = a.current_revision_id
@@ -33058,6 +33834,9 @@ export class LibraryService {
       .all(
         ...selectedIds,
         ...supportedExtensions.map((extension) => `%.${extension}`),
+        ...(artifactColumns.has('width') && artifactColumns.has('height')
+          ? SOURCE_DIRECT_IMAGE_EXTENSIONS.map((extension) => `%${extension}`)
+          : []),
         ...(limit === undefined ? [] : [limit]),
       ) as Array<{
         asset_id: string;
@@ -33235,6 +34014,7 @@ export class LibraryService {
             AND ra.kind = 'thumbnail'
             AND ra.status = 'failed'
             AND ra.invalidated_at IS NULL
+            AND COALESCE(ra.generator_version, '') NOT LIKE '%${OIIO_LITERAL_PATHS_MARK}%'
             AND (
               (
                 ra.error_code = 'OIIO_COLOR_TRANSFORM_FAILED'
@@ -33313,6 +34093,9 @@ export class LibraryService {
         width?: number;
         height?: number;
         durationMs?: number;
+        revisionId?: string;
+        previewKind?: 'source' | null;
+        previewRevisionId?: string | null;
       }) => void;
       /** Fired once a durable visual input is ready for automatic AI. */
       onAiInputReady?: (event: { assetId: string; artifactId: string }) => void;
@@ -33323,6 +34106,9 @@ export class LibraryService {
         width?: number;
         height?: number;
         durationMs?: number;
+        revisionId?: string;
+        previewKind?: 'source' | null;
+        previewRevisionId?: string | null;
       }) => void;
       pluginMediaProvider?: (input: {
         assetId: string;
@@ -33384,9 +34170,10 @@ export class LibraryService {
     // for the same revision. This matters even with a single FFmpeg decoder
     // slot: a proxy claimed first can hold that slot while the poster waits
     // forever for a user-visible result (the proxy may be waiting on an
-    // encoder or a slow source). Metadata probes are intentionally excluded;
-    // ffprobe is short-lived and the metadata lane must remain independent of
-    // poster generation. The claim-time guard also covers the second queue
+    // encoder or a slow source). Metadata jobs are intentionally excluded:
+    // either they or poster jobs may start a revision-scoped full ffprobe and
+    // share the result without waiting for the other durable job. The
+    // claim-time guard also covers the second queue
     // worker, which could otherwise see the primary as `running` and still
     // claim the secondary job concurrently. A proxy-only pump keeps its
     // explicit playback request independent of this browse-lane preference.
@@ -33459,14 +34246,51 @@ export class LibraryService {
     // bound the JOIN work over a large history.
     if (jobKinds.some((kind) => primaryPreviewKinds.has(kind))) {
       const now = new Date().toISOString();
-      const sourceDirectExtensionSql = ['jpg', 'jpeg', 'jfif', 'png', 'webp', 'gif']
-        .map((extension) => `LOWER(source_asset.relative_file_path) LIKE '%.${extension}'`)
+      const sourceDirectExtensionSql = SOURCE_DIRECT_IMAGE_EXTENSIONS
+        .map((extension) => `LOWER(source_asset.relative_file_path) LIKE '%${extension}'`)
         .join(' OR ');
       if (
         pumpAssetIds !== undefined
         && processArtifactColumns.has('width')
         && processArtifactColumns.has('height')
       ) {
+        const sourceDirectRows = pumpAssetIds.length === 0
+          ? []
+          : openLibrary.connection
+          .prepare(
+            `SELECT jobs.asset_id, jobs.revision_id, source_metadata.width, source_metadata.height
+               FROM jobs
+               JOIN assets source_asset
+                 ON source_asset.asset_id = jobs.asset_id
+                AND source_asset.current_revision_id = jobs.revision_id
+               JOIN revisions source_revision
+                 ON source_revision.revision_id = jobs.revision_id
+               JOIN revision_artifacts source_metadata
+                 ON source_metadata.revision_id = jobs.revision_id
+                AND source_metadata.kind = 'extracted_metadata'
+                AND source_metadata.status = 'ready'
+                AND source_metadata.invalidated_at IS NULL
+                AND source_metadata.width > 0
+                AND source_metadata.height > 0
+                AND source_metadata.width <= ${SOURCE_DIRECT_MAX_LONG_EDGE_PX}
+                AND source_metadata.height <= ${SOURCE_DIRECT_MAX_LONG_EDGE_PX}
+                AND source_metadata.width * source_metadata.height <= ${SOURCE_DIRECT_MAX_PIXELS}
+              WHERE jobs.library_id = ?
+                AND jobs.status = 'queued'
+                AND jobs.kind = 'generate_thumbnail'
+                AND COALESCE(jobs.error_code, '') <> '${IMPORTED_THUMBNAIL_NORMALIZATION_JOB}'
+                AND jobs.asset_id IN (${pumpAssetIds.map(() => '?').join(',')})
+                AND source_asset.deleted_at IS NULL
+                AND source_asset.availability = 'available'
+                AND source_revision.byte_size BETWEEN 1 AND ${SOURCE_DIRECT_MAX_BYTES}
+                AND (${sourceDirectExtensionSql})`,
+          )
+          .all(libraryId, ...pumpAssetIds) as Array<{
+            asset_id: string;
+            revision_id: string;
+            width: number;
+            height: number;
+          }>;
         openLibrary.connection
           .prepare(
             `UPDATE jobs
@@ -33505,6 +34329,17 @@ export class LibraryService {
                 )`,
           )
           .run(now, libraryId, ...(pumpAssetIds ?? []));
+        for (const row of sourceDirectRows) {
+          options.onResult?.({
+            assetId: row.asset_id,
+            errorCode: 'SOURCE_DIRECT',
+            width: row.width,
+            height: row.height,
+            revisionId: row.revision_id,
+            previewKind: 'source',
+            previewRevisionId: row.revision_id,
+          });
+        }
       }
       // Use the same media-aware policy as claim-time admission for both
       // thumbnail and video-poster jobs. `generate_thumbnail` produces
@@ -33969,6 +34804,60 @@ export class LibraryService {
             "UPDATE jobs SET status = 'cancelled', error_code = ?, updated_at = ? WHERE job_id = ? AND status = 'running'",
           )
           .run(errorCode, new Date().toISOString(), job.job_id);
+        if (
+          claimAdmission.reason === 'source-direct'
+          && claimAsset?.current_revision_id === job.revision_id
+          && claimAsset.source_width != null
+          && claimAsset.source_height != null
+        ) {
+          options.onResult?.({
+            assetId: job.asset_id,
+            errorCode: 'SOURCE_DIRECT',
+            width: claimAsset.source_width,
+            height: claimAsset.source_height,
+            revisionId: job.revision_id,
+            previewKind: 'source',
+            previewRevisionId: job.revision_id,
+          });
+        }
+        if (
+          claimAdmission.reason === 'already-ready'
+          && job.kind === 'extract_metadata'
+          && claimMediaType === 'video'
+          && claimAsset?.current_revision_id === job.revision_id
+        ) {
+          // A poster may have completed the shared ffprobe before this durable
+          // metadata job is claimed. Publish the ready facts before cancelling
+          // the redundant job so Inspector receives the same update as when
+          // the metadata job itself performs the probe.
+          const metadata = openLibrary.connection.prepare(
+            `SELECT width, height, duration_ms
+               FROM revision_artifacts
+              WHERE revision_id = ?
+                AND kind = 'extracted_metadata'
+                AND status = 'ready'
+                AND invalidated_at IS NULL
+                AND generator_version = ?
+              ORDER BY generated_at DESC, artifact_id DESC
+              LIMIT 1`,
+          ).get(job.revision_id, FFMPEG_METADATA_GENERATOR) as {
+            width: number | null;
+            height: number | null;
+            duration_ms: number | null;
+          } | undefined;
+          if (metadata) {
+            options.onDerivedReady?.({
+              assetId: job.asset_id,
+              kind: 'extract_metadata',
+              revisionId: job.revision_id,
+              ...(metadata.width == null ? {} : { width: metadata.width }),
+              ...(metadata.height == null ? {} : { height: metadata.height }),
+              ...(metadata.duration_ms == null ? {} : { durationMs: metadata.duration_ms }),
+              previewKind: null,
+              previewRevisionId: null,
+            });
+          }
+        }
         processed += 1;
         continue;
       }
@@ -34052,6 +34941,68 @@ export class LibraryService {
             processed += 1;
             continue;
           }
+          let probedSourceSize: { width: number; height: number } | null = null;
+          // Fresh linked images often have no dimensions yet. The queue used
+          // to decode and encode a thumbnail before discovering that the
+          // original qualified for source-direct serving. A bounded header
+          // read resolves that policy first, without taking a Sharp slot.
+          if (job.kind === 'generate_thumbnail'
+            && !isImportedThumbnailNormalization
+            && claimAsset
+            && (claimAsset.source_width == null || claimAsset.source_height == null)
+            && isSourceDirectPreviewCandidate({
+              fileName: claimAsset.relative_file_path,
+              mediaType: LibraryService.toSummaryMediaType(claimMediaType),
+              byteSize: claimAsset.source_byte_size ?? 0,
+            })) {
+            try {
+              probedSourceSize = await readImageDimensions(this.resolveAssetPath(libraryId, job.asset_id));
+            } catch {
+              // Preserve the decoder's existing missing/corrupt-source path.
+            }
+            if (controller.signal.aborted || this.mediaJobState(libraryId, job.job_id) !== 'running') {
+              processed += 1;
+              continue;
+            }
+            if (probedSourceSize) {
+              const latest = openLibrary.connection.prepare(
+                'SELECT current_revision_id FROM assets WHERE asset_id = ?',
+              ).get(job.asset_id) as { current_revision_id: string | null } | undefined;
+              if (latest?.current_revision_id !== job.revision_id) {
+                openLibrary.connection.prepare(
+                  "UPDATE jobs SET status = 'cancelled', error_code = 'STALE_REVISION', updated_at = ? WHERE job_id = ? AND status = 'running'",
+                ).run(new Date().toISOString(), job.job_id);
+                processed += 1;
+                continue;
+              }
+              jobLease.assertCurrent();
+              this.persistExtractedImageDimensions(openLibrary, job.revision_id, probedSourceSize);
+              if (isSourceDirectPreview({
+                fileName: claimAsset.relative_file_path,
+                mediaType: LibraryService.toSummaryMediaType(claimMediaType),
+                byteSize: claimAsset.source_byte_size ?? 0,
+                width: probedSourceSize.width,
+                height: probedSourceSize.height,
+              })) {
+                const cancelled = openLibrary.connection.prepare(
+                  "UPDATE jobs SET status = 'cancelled', error_code = 'SOURCE_DIRECT', updated_at = ? WHERE job_id = ? AND status = 'running'",
+                ).run(new Date().toISOString(), job.job_id);
+                if (cancelled.changes > 0) {
+                  options.onResult?.({
+                    assetId: job.asset_id,
+                    errorCode: 'SOURCE_DIRECT',
+                    width: probedSourceSize.width,
+                    height: probedSourceSize.height,
+                    revisionId: job.revision_id,
+                    previewKind: 'source',
+                    previewRevisionId: job.revision_id,
+                  });
+                }
+                processed += 1;
+                continue;
+              }
+            }
+          }
           const pluginArtifactId = !isImportedThumbnailNormalization && options.pluginMediaProvider
             ? await options.pluginMediaProvider({
               assetId: job.asset_id,
@@ -34100,8 +35051,8 @@ export class LibraryService {
                     includeVideoMetadata: false,
                     includeRawMetadata: false,
                     sourceByteSize: claimAsset?.source_byte_size,
-                    sourceWidth: claimAsset?.source_width,
-                    sourceHeight: claimAsset?.source_height,
+                    sourceWidth: claimAsset?.source_width ?? probedSourceSize?.width,
+                    sourceHeight: claimAsset?.source_height ?? probedSourceSize?.height,
                     // Only image jobs use the interactive image lane. The
                     // lane is selected by user intent, never by source size,
                     // dimensions, or detected machine capacity.
@@ -34233,6 +35184,10 @@ export class LibraryService {
           let derivedWidth: number | undefined;
           let derivedHeight: number | undefined;
           let derivedDurationMs: number | undefined;
+          let sourceDirectRoute: {
+            previewKind: 'source' | null;
+            previewRevisionId: string | null;
+          } | undefined;
           if (job.kind === 'extract_metadata' && processArtifactColumns.has('width')) {
             const durationSelect = processArtifactColumns.has('duration_ms')
               ? ', duration_ms'
@@ -34258,6 +35213,19 @@ export class LibraryService {
             if (extracted?.duration_ms != null && extracted.duration_ms >= 0) {
               derivedDurationMs = extracted.duration_ms;
             }
+            if (claimAsset) {
+              const sourceDirect = isSourceDirectPreview({
+                fileName: claimAsset.relative_file_path,
+                mediaType: LibraryService.toSummaryMediaType(claimMediaType),
+                byteSize: claimAsset.source_byte_size ?? 0,
+                width: extracted?.width,
+                height: extracted?.height,
+              });
+              sourceDirectRoute = {
+                previewKind: sourceDirect ? 'source' : null,
+                previewRevisionId: sourceDirect ? job.revision_id : null,
+              };
+            }
           }
           options.onDerivedReady?.({
             assetId: job.asset_id,
@@ -34265,6 +35233,13 @@ export class LibraryService {
             ...(derivedWidth === undefined ? {} : { width: derivedWidth }),
             ...(derivedHeight === undefined ? {} : { height: derivedHeight }),
             ...(derivedDurationMs === undefined ? {} : { durationMs: derivedDurationMs }),
+            ...(job.kind !== 'extract_metadata'
+              ? {}
+              : {
+                revisionId: job.revision_id,
+                previewKind: sourceDirectRoute?.previewKind ?? null,
+                previewRevisionId: sourceDirectRoute?.previewRevisionId ?? null,
+              }),
           });
         }
         // Serpent-xoaz: deferred to the worker's batched flush (see
@@ -36742,7 +37717,7 @@ export class LibraryService {
     };
     this.applyManagedMoveOperation(openLibrary, operationId, manifest);
     this.noteClientFilesystemMutation();
-    this.emitClientAssetsChanged(input.libraryId, files.length);
+    this.emitClientAssetsChanged(input.libraryId, files.length, true);
     return { movedCount: files.length, skippedCount, operationId,
       assets: this.managedMoveSummaries(openLibrary, files.map((file) => file.assetId)) };
   }
@@ -36821,7 +37796,7 @@ export class LibraryService {
     };
     this.applyManagedMoveOperation(openLibrary, undoOperationId, manifest);
     this.noteClientFilesystemMutation();
-    this.emitClientAssetsChanged(input.libraryId, files.length);
+    this.emitClientAssetsChanged(input.libraryId, files.length, true);
     return { undoneCount: files.length, skippedCount,
       assets: this.managedMoveSummaries(openLibrary, files.map((file) => file.assetId)) };
   }
@@ -37330,8 +38305,8 @@ export class LibraryService {
   }
 
   /**
-   * Read UTF-8 text for a text-classified asset with a hard byte cap (Serpent-sh7).
-   * Linked assets are readable; only managed assets are editable via saveTextAsset.
+   * Read text for a text-classified asset with a hard byte cap (Serpent-sh7).
+   * Managed and linked assets are editable. Trashed assets stay read-only.
    */
   private textAssetPreviewCacheKey(
     libraryId: string,
@@ -37599,7 +38574,7 @@ export class LibraryService {
       truncated,
       byteSize: truncated ? maxBytes : buffer.length,
       lineCount: countTextLines(content),
-      editable: row.location_kind === 'managed' && !isTrashed,
+      editable: !isTrashed,
       mimeType: textMimeForExtension(extension) ?? 'text/plain',
     };
     this.cacheTextAssetPreview(cacheKey, value);
@@ -37607,8 +38582,9 @@ export class LibraryService {
   }
 
   /**
-   * Save UTF-8 text back to a managed asset source. Linked assets are rejected
-   * with LIBRARY_NOT_WRITABLE so the UI can show a clear read-only reason.
+   * Save UTF-8 text back to the asset source. Managed files stay inside the
+   * library. Linked files are written to their source path. Trashed assets
+   * are rejected.
    */
   saveTextAsset(input: {
     libraryId: string;
@@ -37643,9 +38619,6 @@ export class LibraryService {
       } | undefined;
     if (!row || row.deleted_at || row.availability !== 'available' || !row.current_revision_id) {
       throw new LibraryServiceError('ASSET_NOT_FOUND', { reason: 'SOURCE_NOT_FOUND' });
-    }
-    if (row.location_kind !== 'managed') {
-      throw new LibraryServiceError('LIBRARY_NOT_WRITABLE');
     }
     if (LibraryService.detectMediaType(row.relative_file_path) !== 'text') {
       throw new LibraryServiceError('UNSUPPORTED_MEDIA_TYPE');
@@ -37764,6 +38737,7 @@ export class LibraryService {
       changedCount: 1,
       missingCount: 0,
       source: 'text-save',
+      nativeDragPathsChanged: true,
     });
     return {
       asset,
@@ -38082,6 +39056,7 @@ export class LibraryService {
       changedCount: 1,
       missingCount: 0,
       source: 'content-replace',
+      nativeDragPathsChanged: true,
     });
     return {
       assetId: input.assetId,
@@ -38440,6 +39415,7 @@ export class LibraryService {
       changedCount: resultItems.length,
       missingCount: 0,
       source: 'content-replace',
+      nativeDragPathsChanged: true,
     });
     return { operationId, items: resultItems };
   }
@@ -38740,6 +39716,7 @@ export class LibraryService {
       changedCount: 1,
       missingCount: 0,
       source: 'client',
+      nativeDragPathsChanged: true,
     });
     return { asset };
   }
@@ -39046,7 +40023,7 @@ export class LibraryService {
       // Soft-delete is a library mutation, not only a local UI action. Emit
       // after the filesystem move and DB transaction both succeed so other
       // renderer windows, plugins, and automation refresh their trash count.
-      this.emitClientAssetsChanged(input.libraryId, assetIds.length);
+      this.emitClientAssetsChanged(input.libraryId, assetIds.length, true);
 
       this.emitDeleteProgress({
         operationId,
@@ -39798,6 +40775,7 @@ export class LibraryService {
           changedCount: restoredAssets.length,
           missingCount: 0,
           source: 'client',
+          nativeDragPathsChanged: true,
         });
       }
 
@@ -40233,6 +41211,7 @@ export class LibraryService {
         changedCount: deletedAssetIds.length,
         missingCount: 0,
         source: 'client',
+        nativeDragPathsChanged: true,
       });
     }
 
@@ -41458,6 +42437,7 @@ export class LibraryService {
       } | undefined;
     if (!updated) throw new LibraryServiceError('ASSET_NOT_FOUND');
 
+    this.emitClientAssetsChanged(input.libraryId, 1, true);
     return { asset: this.assetSummaryFromRow(updated), batchFollowUpRoot };
   }
 
@@ -41896,6 +42876,7 @@ export class LibraryService {
       }
     }
 
+    if (restoredCount > 0) this.emitClientAssetsChanged(input.libraryId, restoredCount, true);
     return { restoredCount, unchangedMissingCount, assets: restoredAssets };
   }
 
@@ -42371,11 +43352,9 @@ export class LibraryService {
 
     const libraryId = openLibrary.summary.libraryId;
     for (const folder of linkedFolders) {
-      if (folder.status !== 'available' || this.linkedRootIsGone(folder.absolute_root_path)) continue;
-      const prefixes = this.collectLinkedDirectoryPrefixesFromDisk(
+      const prefixes = this.indexedLinkedDirectoryPrefixes(
         openLibrary,
         folder.folder_id,
-        folder.absolute_root_path,
         this.getLinkedFolderRules({ libraryId, folderId: folder.folder_id }),
         true,
       );
@@ -42514,26 +43493,12 @@ export class LibraryService {
   private linkedPathIsIgnored(relativePath: string, rules: LinkedFolderRule[]): boolean {
     const normalizedPath = normalizeRelativeAssetPath(relativePath);
     if (isAlwaysIgnoredAssetPath(normalizedPath)) return true;
-    const segments = normalizedPath.split('/');
-    const filename = segments.at(-1)!;
-    const folders = segments.slice(0, -1);
-    const extension = path.posix.extname(filename).replace(/^\./u, '');
-    const fold = (value: string): string => value.normalize('NFC').toLocaleLowerCase('en-US');
-    let ignored = false;
-    for (const rawRule of rules) {
-      if (!rawRule.enabled) continue;
-      const rule = this.normalizeLinkedFolderRule(rawRule);
-      const pattern = fold(rule.pattern);
-      const matches = rule.target === 'path'
-        ? fold(normalizedPath) === pattern || fold(normalizedPath).startsWith(`${pattern}/`)
-        : rule.target === 'filename'
-          ? fold(filename) === pattern
-          : rule.target === 'extension'
-            ? fold(extension) === pattern
-            : folders.some((folder) => fold(folder) === pattern);
-      if (matches) ignored = rule.action === 'exclude';
+    let matches = this.linkedRuleMatchers.get(rules);
+    if (!matches) {
+      matches = compileLinkedFolderRules(rules.filter((rule) => rule.enabled).map((rule) => this.normalizeLinkedFolderRule(rule)));
+      this.linkedRuleMatchers.set(rules, matches);
     }
-    return ignored;
+    return matches(normalizedPath);
   }
 
   private enumerateLinkedSources(
@@ -42542,6 +43507,7 @@ export class LibraryService {
     suppliedRules?: LinkedFolderRule[],
     explicitlyIgnored?: (relativePath: string, pathKind: 'asset' | 'folder') => boolean,
     onDiscovered?: (foundCount: number, entryBytes: number) => void,
+    onDirectory?: (relativePath: string) => void,
   ): Array<{
     relativePath: string;
     byteSize: number;
@@ -42566,7 +43532,7 @@ export class LibraryService {
           folderId: linkedFolderId,
         })
       : []);
-    const visit = (directoryPath: string, relativeDirectory: string): void => {
+    const visit = (directoryPath: string, relativeDirectory: string, assetsHidden = false): void => {
       let children;
       try {
         children = readdirSync(directoryPath, { withFileTypes: true }).sort((left, right) =>
@@ -42593,14 +43559,16 @@ export class LibraryService {
           continue;
         }
         if (child.isDirectory()) {
-          if (explicitlyIgnored?.(childRelative, 'folder')) continue;
           const canPrune = !rules.some((rule) => rule.enabled && rule.action === 'include')
             && this.linkedPathIsIgnored(path.posix.join(childRelative, '__serpent_probe__'), rules);
           if (canPrune) continue;
-          visit(path.join(directoryPath, child.name), childRelative);
+          const hidden = assetsHidden || explicitlyIgnored?.(childRelative, 'folder') === true;
+          if (hidden && !onDirectory) continue;
+          onDirectory?.(normalizeRelativeAssetPath(childRelative));
+          visit(path.join(directoryPath, child.name), childRelative, hidden);
           continue;
         }
-        if (!child.isFile()) continue;
+        if (!child.isFile() || assetsHidden) continue;
         const childPath = path.join(directoryPath, child.name);
         let stat: BigIntStats | Stats;
         try {
@@ -42998,10 +43966,12 @@ export class LibraryService {
       SELECT a.asset_id, a.relative_file_path,
              ra.artifact_id AS thumbnail_artifact_id,
              ra.status AS thumbnail_status
-        FROM assets a
-        JOIN revisions r ON r.revision_id = a.current_revision_id
+        FROM revisions AS r INDEXED BY revisions_size_fingerprint_idx
+        JOIN assets a
+          ON a.asset_id = r.asset_id
+         AND a.current_revision_id = r.revision_id
        LEFT JOIN revision_artifacts ra
-          ON ra.revision_id = a.current_revision_id
+          ON ra.revision_id = r.revision_id
          AND ra.kind = CASE
            WHEN LOWER(a.relative_file_path) LIKE '%.mp4'
              OR LOWER(a.relative_file_path) LIKE '%.webm'
@@ -43034,18 +44004,20 @@ export class LibraryService {
     // Revisions already store a SHA-1 of file bytes. Matching that avoids
     // hashing every same-size library file for each imported item.
     if (contentFingerprint) {
-      const fingerprinted = openLibrary.connection
-        .prepare(`${selectSameSize} AND r.content_fingerprint = ?`)
+      const fingerprinted = this.prepareCached<Statement>(
+        openLibrary,
+        `${selectSameSize} AND r.content_fingerprint = ?`,
+      )
         .get(byteSize, contentFingerprint) as MatchedAssetRow | undefined;
       if (fingerprinted) return toMatch(fingerprinted);
     }
 
-    const rows = openLibrary.connection
-      .prepare(
-        contentFingerprint
-          ? `${selectSameSize} AND r.content_fingerprint IS NULL`
-          : selectSameSize,
-      )
+    const rows = this.prepareCached<Statement>(
+      openLibrary,
+      contentFingerprint
+        ? `${selectSameSize} AND r.content_fingerprint IS NULL`
+        : selectSameSize,
+    )
       .all(byteSize) as MatchedAssetRow[];
 
     for (const row of rows) {
@@ -43077,9 +44049,9 @@ export class LibraryService {
     displayName: string;
     thumbnailArtifactId: string | null;
   } | null {
-    const row = openLibrary.connection
-      .prepare(
-        `SELECT a.asset_id, a.relative_file_path,
+    const row = this.prepareCached<Statement>(
+      openLibrary,
+      `SELECT a.asset_id, a.relative_file_path,
                 ra.artifact_id AS thumbnail_artifact_id,
                 ra.status AS thumbnail_status
            FROM assets a
@@ -43101,9 +44073,8 @@ export class LibraryService {
           WHERE a.deleted_at IS NULL
             AND a.location_kind = 'managed'
             AND a.current_revision_id IS NOT NULL
-            AND LOWER(a.relative_file_path) = LOWER(?)`,
-      )
-      .get(relativeFilePath) as {
+            AND a.path_identity = ?`,
+    ).get(portablePathIdentity(relativeFilePath)) as {
       asset_id: string;
       relative_file_path: string;
       thumbnail_artifact_id: string | null;
@@ -43208,6 +44179,7 @@ export class LibraryService {
       expandImageSequences: input.expandImageSequences === true,
     });
     const seenDestinations = new Map<string, number>();
+    const destinationDirectoryCache = new ImportDestinationDirectoryCache();
     const contentHashCache = new Map<string, string>();
     const seenContentHashes = new Set<string>();
     const sequenceBatchPaths = new Set<string>();
@@ -43239,6 +44211,7 @@ export class LibraryService {
         const destination = this.portableDiskDestination(
           openLibrary,
           entry.destinationRelativePath,
+          destinationDirectoryCache,
         );
         existingSize = destination?.size;
         if (destination && destination.size !== -1) {
@@ -43384,6 +44357,7 @@ export class LibraryService {
     const destinationIndex = skipContentHash
       ? (input.destinationIndex ?? this.managedDestinationIndex(openLibrary))
       : undefined;
+    const manifestDirectoryCache = new ImportDestinationDirectoryCache();
     let preparingManifest: OperationManifest;
     try {
       preparingManifest = {
@@ -43397,13 +44371,15 @@ export class LibraryService {
               openLibrary,
               entry.destinationRelativePath,
               destinationIndex,
+              manifestDirectoryCache,
+              { validateMissingSegments: !skipContentHash },
             ) !== undefined,
           stageName: String(index),
         })),
         directories: directories.map((relativePath) => ({
           existed: skipContentHash
             ? existsSync(this.folderPath(openLibrary, relativePath))
-            : this.portableDiskDestination(openLibrary, relativePath) !== undefined,
+            : this.portableDiskDestination(openLibrary, relativePath, manifestDirectoryCache) !== undefined,
           relativePath,
         })),
       };
@@ -43607,6 +44583,9 @@ export class LibraryService {
       preparingManifest,
     } = context;
     const seenDestinations = new Map<string, number>();
+    // Staging may take a long time. Do not reuse the initial manifest's disk
+    // view; this snapshot belongs only to post-stage classification.
+    const destinationDirectoryCache = new ImportDestinationDirectoryCache();
     const contentHashCache = new Map<string, string>();
     const seenContentHashes = new Set<string>();
     // Intra-batch identical bytes are common in particle/VFX sequences (clear frames).
@@ -43637,6 +44616,8 @@ export class LibraryService {
             openLibrary,
             entry.destinationRelativePath,
             destinationIndex,
+            destinationDirectoryCache,
+            { validateMissingSegments: !skipContentHash },
           );
           existingSize = destination?.size;
           if (destination && destination.size !== -1) {
@@ -43698,6 +44679,8 @@ export class LibraryService {
               openLibrary,
               entry.destinationRelativePath,
               destinationIndex,
+              destinationDirectoryCache,
+              { validateMissingSegments: !skipContentHash },
             );
             const existing =
               destination && destination.size !== -1
@@ -43748,6 +44731,8 @@ export class LibraryService {
             openLibrary,
             entry.destinationRelativePath,
             destinationIndex,
+            destinationDirectoryCache,
+            { validateMissingSegments: !skipContentHash },
           ) !== undefined,
         stageName: String(index),
       })),
@@ -44516,6 +45501,7 @@ export class LibraryService {
               changedCount: completion.importedCount + completion.replacedCount,
               missingCount: 0,
               source: 'client',
+              nativeDragPathsChanged: true,
             });
           }
         }
@@ -44779,6 +45765,7 @@ export class LibraryService {
               changedCount: completion.importedCount + completion.replacedCount,
               missingCount: 0,
               source: 'client',
+              nativeDragPathsChanged: true,
             });
           }
         }
@@ -44937,6 +45924,7 @@ export class LibraryService {
     }
 
     const openLibrary = this.requireOpenLibrary(pending.libraryId);
+    const destinationDirectoryCache = new ImportDestinationDirectoryCache();
     const directoryByIdentity = new Map<string, string>();
     let resolvedDirectories: string[];
     try {
@@ -44950,7 +45938,11 @@ export class LibraryService {
           resolvedParent === '.'
             ? path.posix.basename(relativeDirectory)
             : path.posix.join(resolvedParent, path.posix.basename(relativeDirectory));
-        const existing = this.portableDiskDestination(openLibrary, candidate);
+        const existing = this.portableDiskDestination(
+          openLibrary,
+          candidate,
+          destinationDirectoryCache,
+        );
         if (existing && existing.size !== -1) {
           throw new LibraryServiceError('IMPORT_APPLY_FAILED', {
             reason: 'NAME_NOT_SUPPORTED',
@@ -44973,7 +45965,13 @@ export class LibraryService {
     const destination = (relativePath: string): ExistingDestination | undefined => {
       const identity = portablePathIdentity(relativePath);
       return occupied.get(identity)
-        ?? this.lookupImportDestination(openLibrary, relativePath, pending.destinationIndex);
+        ?? this.lookupImportDestination(
+          openLibrary,
+          relativePath,
+          pending.destinationIndex,
+          destinationDirectoryCache,
+          { validateMissingSegments: !pending.skipContentHash },
+        );
     };
     const copyPath = (relativePath: string): string => {
       const directory = path.posix.dirname(relativePath);
@@ -45089,11 +46087,13 @@ export class LibraryService {
           } else {
             const retainedAssetId = existingDestination
               ? (
-                  openLibrary.connection
-                    .prepare(
-                      'SELECT asset_id FROM assets WHERE path_identity = ?',
-                    )
-                    .get(portablePathIdentity(destinationRelativePath)) as
+                  this.prepareCached<Statement>(
+                    openLibrary,
+                    `SELECT asset_id FROM assets
+                      WHERE path_identity = ?
+                        AND location_kind = 'managed'
+                        AND deleted_at IS NULL`,
+                  ).get(portablePathIdentity(destinationRelativePath)) as
                     | { asset_id: string }
                     | undefined
                 )?.asset_id
@@ -45135,11 +46135,21 @@ export class LibraryService {
         }
 
         const pathIdentity = portablePathIdentity(destinationRelativePath);
-        const existingAsset = openLibrary.connection
-          .prepare(
-            'SELECT asset_id, current_revision_id FROM assets WHERE path_identity = ?',
-          )
-          .get(pathIdentity) as ExistingAssetRow | undefined;
+        const existingAsset = this.prepareCached<Statement>(
+          openLibrary,
+          `SELECT asset_id, current_revision_id
+             FROM assets
+            WHERE path_identity = ?
+              AND location_kind = 'managed'
+              AND deleted_at IS NULL`,
+        ).get(pathIdentity) as ExistingAssetRow | undefined;
+        const expectedDestination = pending.skipContentHash
+          ? undefined
+          : this.portableDiskDestination(
+              openLibrary,
+              destinationRelativePath,
+              destinationDirectoryCache,
+            );
         occupied.set(pathIdentity, {
           actualRelativePath: destinationRelativePath,
           size: entry.byteSize,
@@ -45153,6 +46163,7 @@ export class LibraryService {
           destinationRelativePath,
           entry,
           existingAsset,
+          expectedDestination,
           isReplacement,
         });
         occupiedContentHashes.set(pathIdentity, entrySha256);
@@ -45289,6 +46300,7 @@ export class LibraryService {
     let importedCount = 0;
     let replacedCount = 0;
     let committed = false;
+    let destinationGuardFailed = false;
 
     const completeCommittedImport = (): ImportCompletion => {
       const affected = [...new Set([...affectedAssetIds, ...mergedAssetIds])];
@@ -45341,6 +46353,42 @@ export class LibraryService {
         } else if (!lstatSync(directoryPath).isDirectory()) {
           throw new Error('An imported directory conflicts with a file.');
         }
+      }
+
+      // Directory creation and durable operation bookkeeping happen after
+      // classification. Take one final filesystem snapshot immediately
+      // before touching destinations so a file created while the user was
+      // deciding cannot be silently overwritten.
+      try {
+        this.options.beforeImportDestinationApply?.();
+        const applicationDirectoryCache = new ImportDestinationDirectoryCache();
+        for (const action of actions) {
+          const currentDestination = this.portableDiskDestination(
+            openLibrary,
+            action.destinationRelativePath,
+            applicationDirectoryCache,
+            pending.skipContentHash
+              ? { validateMissingSegments: false, snapshotFile: false }
+              : undefined,
+          );
+          if (pending.skipContentHash) {
+            // Bulk import actions are always keep-both placements; any physical
+            // occupant absent from the identity index is an unapproved target.
+            if (currentDestination !== undefined) {
+              throw new LibraryServiceError('IMPORT_APPLY_FAILED');
+            }
+            continue;
+          }
+          if (
+            !sameDestinationSnapshot(action.expectedDestination, currentDestination)
+            || (currentDestination !== undefined && !action.isReplacement)
+          ) {
+            throw new LibraryServiceError('IMPORT_APPLY_FAILED');
+          }
+        }
+      } catch (error) {
+        destinationGuardFailed = true;
+        throw error;
       }
 
       actions.forEach((action, index) => {
@@ -45605,7 +46653,7 @@ export class LibraryService {
           }
           if (!bulkCommit) this.noteClientFilesystemMutation();
           if (!pending.suppressAssetChangeEvents) {
-            this.emitClientAssetsChanged(pending.libraryId, 1);
+            this.emitClientAssetsChanged(pending.libraryId, 1, true);
           }
         }
       }
@@ -45730,7 +46778,44 @@ export class LibraryService {
       if (error instanceof SimulatedCrashError) {
         throw new LibraryServiceError('IMPORT_APPLY_FAILED', { cause: error });
       }
-      const rolledBack = rollbackFiles();
+      const untouchedGuardFailure = destinationGuardFailed
+        && backups.length === 0
+        && placedPaths.length === 0;
+      const rolledBack = untouchedGuardFailure
+        ? (() => {
+            let succeeded = true;
+            for (const directoryPath of [...createdDirectories].reverse()) {
+              try {
+                rmdirSync(directoryPath);
+              } catch (cleanupError) {
+                if (
+                  isMissingPathError(cleanupError)
+                  || hasErrorCode(cleanupError, 'ENOTEMPTY')
+                  || hasErrorCode(cleanupError, 'EEXIST')
+                ) {
+                  // The guard may have found a newly-created external file in
+                  // this directory. Preserve that occupied directory.
+                  continue;
+                }
+                succeeded = false;
+                this.diagnose('import-apply.preflight-directory-cleanup', cleanupError, {
+                  libraryId: pending.libraryId,
+                  operationId,
+                });
+              }
+            }
+            try {
+              this.removeOperation(operationPath);
+            } catch (cleanupError) {
+              succeeded = false;
+              this.diagnose('import-apply.preflight-operation-cleanup', cleanupError, {
+                libraryId: pending.libraryId,
+                operationId,
+              });
+            }
+            return succeeded;
+          })()
+        : rollbackFiles();
       try {
         openLibrary.connection
           .prepare(
@@ -46143,6 +47228,7 @@ export class LibraryService {
         libraryId,
         folderId: folder.folder_id,
       });
+      const directories: string[] = [];
       linkedEntriesByFolder.set(
         folder.folder_id,
         this.enumerateLinkedSources(
@@ -46156,8 +47242,11 @@ export class LibraryService {
             relativePath,
             pathKind,
           ),
+          undefined,
+          (relativePath) => directories.push(relativePath),
         ),
       );
+      this.linkedDirectoryIndex(openLibrary).replace(folder.folder_id, directories);
     }
 
     return {
@@ -46274,10 +47363,11 @@ export class LibraryService {
     locationKind: 'managed' | 'linked';
     rootPath: string;
     task: OpenReconciliationTask;
+    onDirectory?: (relativePath: string) => void;
   }): Promise<DiscoveredSourceEntry[]> {
     const entries: DiscoveredSourceEntry[] = [];
-    const pendingDirectories: Array<{ absolutePath: string; relativePath: string }> = [
-      { absolutePath: input.rootPath, relativePath: '' },
+    const pendingDirectories: Array<{ absolutePath: string; relativePath: string; assetsHidden: boolean }> = [
+      { absolutePath: input.rootPath, relativePath: '', assetsHidden: false },
     ];
     let sliceStartedAt = performance.now();
 
@@ -46286,7 +47376,7 @@ export class LibraryService {
       const directory = pendingDirectories.pop()!;
       let handle;
       try {
-        handle = await opendirAsync(directory.absolutePath);
+        handle = await (this.options.sourceDirectoryOpener ?? opendirAsync)(directory.absolutePath);
       } catch (error) {
         throw new LibraryServiceError(input.errorCode, { cause: error });
       }
@@ -46320,19 +47410,22 @@ export class LibraryService {
             if (
               !(input.locationKind === 'managed' && isDefaultIgnoredAssetEntry(child.name, 'directory'))
               && !input.isDirectoryIgnored?.(relativePath)
-              && !input.explicitlyIgnored(relativePath, 'folder')
             ) {
-              pendingDirectories.push({ absolutePath, relativePath });
+              const assetsHidden = directory.assetsHidden || input.explicitlyIgnored(relativePath, 'folder');
+              if (!assetsHidden || input.onDirectory) {
+                input.onDirectory?.(normalizeRelativeAssetPath(relativePath));
+                pendingDirectories.push({ absolutePath, relativePath, assetsHidden });
+              }
             }
-          } else if (child.isFile()) {
-            let stat: Awaited<ReturnType<typeof lstatAsync>>;
+          } else if (child.isFile() && !directory.assetsHidden) {
+            let stat: Stats | BigIntStats;
             try {
               // Keep the existing synchronous stat seam for deterministic tests;
               // production uses the promise API so a slow volume cannot block the
               // Worker event loop during open reconciliation.
               stat = this.options.assetLstat
                 ? this.options.assetLstat(absolutePath)
-                : await lstatAsync(absolutePath);
+                : await lstatAsync(absolutePath, { bigint: true });
             } catch (error) {
               if (isUnreadablePathError(error)) continue;
               throw new LibraryServiceError(input.errorCode, { cause: error });
@@ -46349,7 +47442,7 @@ export class LibraryService {
                   && isDefaultIgnoredAssetEntry(child.name, 'file'))
                 && !input.explicitlyIgnored(normalized, 'asset')
               ) {
-                const byteSize = stat.size;
+                const byteSize = Number(stat.size);
                 if (!Number.isSafeInteger(byteSize)) {
                   throw new LibraryServiceError(input.errorCode, {
                     reason: 'UNSUPPORTED_FILE_ENTRY',
@@ -46436,6 +47529,9 @@ export class LibraryService {
       }
       existingLinkedAssetIdsByFolder.set(folder.folder_id, existingAssetIdsByIdentity);
       const linkedScanStartedAt = performance.now();
+      const directoryIndex = this.linkedDirectoryIndex(openLibrary);
+      const directoryVersion = directoryIndex.beginScan(folder.folder_id);
+      const directories: string[] = [];
       const entries = await this.enumerateSourcesAsync({
         errorCode: 'INVALID_IMPORT_SOURCE',
         explicitlyIgnored: (relativePath, pathKind) => this.isExplicitlyIgnored(
@@ -46460,7 +47556,9 @@ export class LibraryService {
         locationKind: 'linked',
         rootPath: folder.absolute_root_path,
         task,
+        onDirectory: (relativePath) => directories.push(relativePath),
       });
+      await directoryIndex.publish(folder.folder_id, directories, directoryVersion, () => this.yieldReconciliation(task));
       if (process.env.SERPENT_REFRESH_STAGE_LOG === '1') {
         this.options.onDiagnostic?.({
           scope: 'open.refresh-managed-assets.source-scan',
@@ -47369,7 +48467,7 @@ export class LibraryService {
         verificationConnection.close();
       }
 
-      renameSync(partialPath, finalPath);
+      renamePathWithRetry(partialPath, finalPath);
       renamed = true;
       return this.openLibrary(finalPath);
     } catch (error) {
@@ -47377,8 +48475,8 @@ export class LibraryService {
       const cleanupPath = renamed ? finalPath : partialPath;
       try {
         if (existsSync(cleanupPath)) {
-          if (renamed) renameSync(finalPath, partialPath);
-          rmSync(partialPath, { force: true, recursive: true });
+          if (renamed) renamePathWithRetry(finalPath, partialPath);
+          removePathWithSyncRetry(partialPath);
         }
       } catch (cleanupError) {
         throw new LibraryServiceError('LIBRARY_CLEANUP_FAILED', { cause: cleanupError });

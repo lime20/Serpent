@@ -333,6 +333,7 @@ describe('禁用原因（disabledReason 是唯一禁用来源）', () => {
     expect(findItem(menu, 'asset.delete-from-disk')).toMatchObject({
       disabled: false,
       disabledReason: null,
+      shortcutLabel: '⌥⌘Delete',
     });
   });
 

@@ -20,9 +20,39 @@ import {
 } from "../../shared/ai-endpoints";
 import type { LocalAiDiscoveryResult } from "../ai-local-endpoint-probe";
 import { aiSearchFailureReason, planAiSearch } from "../ai-search-planner";
+import {
+  AiProfileStorageError,
+  AiProfileValidationError,
+  type AiConnectionProfileDraft,
+  type AiConnectionProfileSummary,
+} from "../ai-profile-store";
+
+type AiConfigRead =
+  | { ok: true; config: AiOwnedConfig }
+  | { ok: false; result: RendererResult };
+
+function readAiConfigForRequest(
+  runtime: AiOwnedRequestRuntime,
+  operation: string,
+): AiConfigRead {
+  try {
+    return { ok: true, config: runtime.loadAiConfig() };
+  } catch (error) {
+    runtime.logError("ai.profile-storage.read", error, { operation });
+    return {
+      ok: false,
+      result: {
+        ok: false,
+        error: createPublicError("AI_PROFILE_STORAGE_FAILED"),
+      } satisfies RendererResult,
+    };
+  }
+}
 
 export type AiOwnedConfig = {
   hasKey: boolean;
+  activeProfileId: string | null;
+  profiles: AiConnectionProfileSummary[];
   apiFormat: AiApiFormat;
   model: string;
   baseUrl: string;
@@ -38,13 +68,16 @@ export type AiOwnedConfig = {
   disclaimerAccepted: boolean;
 };
 
-export type AiOwnedSavedConfig = Omit<AiOwnedConfig, "hasKey">;
+export type AiOwnedSavedConfig = Omit<AiOwnedConfig, "hasKey" | "activeProfileId" | "profiles">;
 
 export type AiOwnedRequestRuntime = {
   loadAiConfig: () => AiOwnedConfig;
   getDecryptedApiKey: () => string;
+  getDecryptedProfileApiKey: (profileId: string) => string;
   saveAiConfig: (config: AiOwnedSavedConfig) => void;
-  saveEncryptedApiKey: (apiKey: string) => void;
+  saveConnectionProfile: (profile: AiConnectionProfileDraft & { apiKey?: string; clearCredential?: boolean }) => string;
+  activateConnectionProfile: (profileId: string) => void;
+  deleteConnectionProfile: (profileId: string) => void;
   workerAvailable: () => boolean;
   requestWorker: (command: WorkerCommand) => Promise<WorkerResult>;
   processAiQueue: (libraryId: string) => void;
@@ -65,7 +98,9 @@ export async function tryHandleAiOwnedRequest(
 ): Promise<RendererResult | undefined> {
   switch (request.type) {
     case "assets.analyze.request": {
-      const config = runtime.loadAiConfig();
+      const configRead = readAiConfigForRequest(runtime, request.type);
+      if (!configRead.ok) return configRead.result;
+      const config = configRead.config;
       // `hasKey` alone is not the gate: a keyless local runtime has nothing to
       // store, so readiness comes from the shared credential helper.
       if (
@@ -81,7 +116,14 @@ export async function tryHandleAiOwnedRequest(
       }
       try {
         runtime.getDecryptedApiKey();
-      } catch {
+      } catch (error) {
+        if (error instanceof AiProfileStorageError) {
+          runtime.logError("ai.profile-storage.read", error, { operation: request.type });
+          return {
+            ok: false,
+            error: createPublicError("AI_PROFILE_STORAGE_FAILED"),
+          } satisfies RendererResult;
+        }
         return {
           ok: false,
           error: createPublicError("AI_ANALYSIS_FAILED", "AI_NOT_CONFIGURED"),
@@ -123,7 +165,9 @@ export async function tryHandleAiOwnedRequest(
       } satisfies RendererResult;
     }
     case "asset.analyze.request": {
-      const config = runtime.loadAiConfig();
+      const configRead = readAiConfigForRequest(runtime, request.type);
+      if (!configRead.ok) return configRead.result;
+      const config = configRead.config;
       // `hasKey` alone is not the gate: a keyless local runtime has nothing to
       // store, so readiness comes from the shared credential helper.
       if (
@@ -139,7 +183,14 @@ export async function tryHandleAiOwnedRequest(
       }
       try {
         runtime.getDecryptedApiKey();
-      } catch {
+      } catch (error) {
+        if (error instanceof AiProfileStorageError) {
+          runtime.logError("ai.profile-storage.read", error, { operation: request.type });
+          return {
+            ok: false,
+            error: createPublicError("AI_PROFILE_STORAGE_FAILED"),
+          } satisfies RendererResult;
+        }
         return {
           ok: false,
           error: createPublicError("AI_ANALYSIS_FAILED", "AI_NOT_CONFIGURED"),
@@ -203,10 +254,14 @@ export async function tryHandleAiOwnedRequest(
       return undefined;
     }
     case "ai.config.get.request": {
-      const config = runtime.loadAiConfig();
+      const configRead = readAiConfigForRequest(runtime, request.type);
+      if (!configRead.ok) return configRead.result;
+      const config = configRead.config;
       return {
         ok: true,
         type: "ai.config.got",
+        activeProfileId: config.activeProfileId,
+        profiles: config.profiles,
         apiFormat: config.apiFormat,
         model: config.model,
         baseUrl: config.baseUrl ?? "",
@@ -227,29 +282,19 @@ export async function tryHandleAiOwnedRequest(
       } satisfies RendererResult;
     }
     case "ai.config.set.request": {
-      const currentConfig = runtime.loadAiConfig();
+      const configRead = readAiConfigForRequest(runtime, request.type);
+      if (!configRead.ok) return configRead.result;
+      const currentConfig = configRead.config;
       if (request.autoAnalyzeEnabled && !request.disclaimerAccepted) {
         return {
           ok: false,
           error: createPublicError("CONFIRMATION_REQUIRED"),
         } satisfies RendererResult;
       }
-      if (
-        !request.apiKey &&
-        !aiConfigHasCredentials({
-          hasKey: currentConfig.hasKey,
-          apiFormat: request.apiFormat,
-        })
-      ) {
-        return {
-          ok: false,
-          error: createPublicError("AI_SETTINGS_INCOMPLETE"),
-        } satisfies RendererResult;
-      }
       const savedConfig: AiOwnedSavedConfig = {
-        apiFormat: request.apiFormat,
-        model: request.model,
-        baseUrl: (request.baseUrl ?? "").trim(),
+        apiFormat: currentConfig.apiFormat,
+        model: currentConfig.model,
+        baseUrl: currentConfig.baseUrl,
         descriptionEnabled: request.enabledFields?.description ?? true,
         tagEnabled: request.enabledFields?.tags ?? true,
         ratingEnabled: request.enabledFields?.rating ?? true,
@@ -276,8 +321,15 @@ export async function tryHandleAiOwnedRequest(
         autoAnalyzeEnabled: request.autoAnalyzeEnabled,
         disclaimerAccepted: request.disclaimerAccepted,
       };
-      runtime.saveAiConfig(savedConfig);
-      if (request.apiKey) runtime.saveEncryptedApiKey(request.apiKey);
+      try {
+        runtime.saveAiConfig(savedConfig);
+      } catch (error) {
+        runtime.logError("ai.analysis-preferences.save", error);
+        return {
+          ok: false,
+          error: createPublicError("AI_PROFILE_STORAGE_FAILED"),
+        } satisfies RendererResult;
+      }
       if (runtime.workerAvailable()) {
         try {
           const update = await runtime.requestWorker({
@@ -301,35 +353,118 @@ export async function tryHandleAiOwnedRequest(
       }
       return { ok: true, type: "ai.config.saved" } satisfies RendererResult;
     }
+    case "ai.profiles.save.request": {
+      try {
+        const id = runtime.saveConnectionProfile({
+          ...(request.id ? { id: request.id } : {}),
+          name: request.name,
+          apiFormat: request.apiFormat,
+          model: request.model,
+          baseUrl: request.baseUrl,
+          ...(request.apiKey !== undefined ? { apiKey: request.apiKey } : {}),
+          ...(request.clearCredential !== undefined
+            ? { clearCredential: request.clearCredential }
+            : {}),
+        });
+        return { ok: true, type: "ai.profiles.saved", id } satisfies RendererResult;
+      } catch (error) {
+        if (error instanceof AiProfileValidationError) {
+          return {
+            ok: false,
+            error: createPublicError("AI_SETTINGS_INCOMPLETE"),
+          } satisfies RendererResult;
+        }
+        runtime.logError("ai.profile.save", error, { profileId: request.id ?? null });
+        return {
+          ok: false,
+          error: createPublicError("AI_PROFILE_STORAGE_FAILED"),
+        } satisfies RendererResult;
+      }
+    }
+    case "ai.profiles.activate.request": {
+      try {
+        runtime.activateConnectionProfile(request.id);
+        return {
+          ok: true,
+          type: "ai.profiles.activated",
+          id: request.id,
+        } satisfies RendererResult;
+      } catch (error) {
+        if (error instanceof AiProfileValidationError) {
+          return {
+            ok: false,
+            error: createPublicError("AI_SETTINGS_INCOMPLETE"),
+          } satisfies RendererResult;
+        }
+        runtime.logError("ai.profile.activate", error, { profileId: request.id });
+        return {
+          ok: false,
+          error: createPublicError("AI_PROFILE_STORAGE_FAILED"),
+        } satisfies RendererResult;
+      }
+    }
+    case "ai.profiles.delete.request": {
+      try {
+        runtime.deleteConnectionProfile(request.id);
+        return {
+          ok: true,
+          type: "ai.profiles.deleted",
+          id: request.id,
+        } satisfies RendererResult;
+      } catch (error) {
+        if (error instanceof AiProfileValidationError) {
+          return {
+            ok: false,
+            error: createPublicError("AI_SETTINGS_INCOMPLETE"),
+          } satisfies RendererResult;
+        }
+        runtime.logError("ai.profile.delete", error, { profileId: request.id });
+        return {
+          ok: false,
+          error: createPublicError("AI_PROFILE_STORAGE_FAILED"),
+        } satisfies RendererResult;
+      }
+    }
     case "ai.test-connection.request": {
       // Resolve credentials here so a missing key returns AI_NOT_CONFIGURED
       // instead of the generic CANCELLED path from commandFor().
       let apiKey = request.apiKey?.trim() ?? "";
-      if (!apiKey) {
+      const apiFormat = request.apiFormat;
+      const model = request.model;
+      const baseUrl = request.baseUrl;
+      if (!apiKey && (request.profileId || aiApiFormatRequiresApiKey(apiFormat))) {
         try {
-          apiKey = runtime.getDecryptedApiKey();
-        } catch {
-          // The request tests the *draft* profile, which may be a keyless local
-          // endpoint that has never been saved. Demanding a stored key here
-          // would report "AI_ANALYSIS_FAILED" for a perfectly reachable server
-          // just because the stored profile is still a cloud format.
-          if (aiApiFormatRequiresApiKey(request.apiFormat)) {
+          if (request.profileId) {
+            // The selected profile supplies only its saved credential; probe
+            // the protocol, model, and endpoint currently in the editor.
+            apiKey = runtime.getDecryptedProfileApiKey(request.profileId);
+          } else {
+            apiKey = runtime.getDecryptedApiKey();
+          }
+        } catch (error) {
+          if (error instanceof AiProfileStorageError) {
+            runtime.logError("ai.profile-storage.read", error, { operation: request.type });
+            return {
+              ok: false,
+              error: createPublicError("AI_PROFILE_STORAGE_FAILED"),
+            } satisfies RendererResult;
+          }
+          if (aiApiFormatRequiresApiKey(apiFormat)) {
             return {
               ok: false,
               error: createPublicError("AI_ANALYSIS_FAILED", "AI_NOT_CONFIGURED"),
             } satisfies RendererResult;
           }
-          apiKey = "";
         }
       }
       if (!runtime.workerAvailable()) throw new Error("Library Worker is unavailable.");
       const workerResult = await runtime.requestWorker({
         type: "ai.test-connection",
-        apiFormat: request.apiFormat,
-        model: request.model,
+        apiFormat,
+        model,
         apiKey,
-        ...(request.baseUrl?.trim()
-          ? { baseUrl: request.baseUrl.trim() }
+        ...(baseUrl?.trim()
+          ? { baseUrl: baseUrl.trim() }
           : {}),
       });
       if (!workerResult.ok) {
@@ -356,11 +491,26 @@ export async function tryHandleAiOwnedRequest(
     }
     case "ai.list-models.request": {
       let apiKey = request.apiKey?.trim() ?? "";
-      if (!apiKey) {
+      const apiFormat = request.apiFormat;
+      const baseUrl = request.baseUrl;
+      if (!apiKey && (request.profileId || aiApiFormatRequiresApiKey(apiFormat))) {
         const keyless = !aiApiFormatRequiresApiKey(request.apiFormat);
         try {
-          apiKey = runtime.getDecryptedApiKey();
-        } catch {
+          if (request.profileId) {
+            // Keep the current editor settings and use the profile only as a
+            // secure credential reference.
+            apiKey = runtime.getDecryptedProfileApiKey(request.profileId);
+          } else {
+            apiKey = runtime.getDecryptedApiKey();
+          }
+        } catch (error) {
+          if (error instanceof AiProfileStorageError) {
+            runtime.logError("ai.profile-storage.read", error, { operation: request.type });
+            return {
+              ok: false,
+              error: createPublicError("AI_PROFILE_STORAGE_FAILED"),
+            } satisfies RendererResult;
+          }
           if (!keyless) {
             return {
               ok: true,
@@ -373,9 +523,9 @@ export async function tryHandleAiOwnedRequest(
         }
       }
       const listed = await listAiModels({
-        apiFormat: request.apiFormat,
+        apiFormat,
         apiKey,
-        baseUrl: request.baseUrl,
+        baseUrl,
       });
       if (!listed.ok) {
         return {
@@ -415,7 +565,9 @@ export async function tryHandleAiOwnedRequest(
       } satisfies RendererResult;
     }
     case "ai.search-plan.request": {
-      const config = runtime.loadAiConfig();
+      const configRead = readAiConfigForRequest(runtime, request.type);
+      if (!configRead.ok) return configRead.result;
+      const config = configRead.config;
       if (
         !aiConfigHasCredentials({
           hasKey: config.hasKey,
@@ -441,6 +593,13 @@ export async function tryHandleAiOwnedRequest(
       try {
         apiKey = runtime.getDecryptedApiKey();
       } catch (caught) {
+        if (caught instanceof AiProfileStorageError) {
+          runtime.logError("ai.profile-storage.read", caught, { operation: request.type });
+          return {
+            ok: false,
+            error: createPublicError("AI_PROFILE_STORAGE_FAILED"),
+          } satisfies RendererResult;
+        }
         runtime.logError("ai.search-plan.credentials", caught, {
           apiFormat: config.apiFormat,
         });

@@ -413,6 +413,8 @@ export const assetChangeEventSchema = z.strictObject({
    * 导航与画布；自动同步调度器必须忽略，避免回放后再 `sync.run`。
    */
   source: z.enum(['watcher', 'text-save', 'client', 'content-replace', 'sync']).optional(),
+  /** Main invalidates native drag paths only for filesystem/drag-icon changes. */
+  nativeDragPathsChanged: z.literal(true).optional(),
 });
 
 export type AssetChangeEvent = z.infer<typeof assetChangeEventSchema>;
@@ -501,6 +503,9 @@ export const thumbnailEventSchema = z.discriminatedUnion('type', [
     width: z.number().int().positive(),
     height: z.number().int().positive(),
     durationMs: z.number().int().nonnegative().optional(),
+    revisionId: nonBlankString.optional(),
+    previewKind: z.enum(['source']).nullable().optional(),
+    previewRevisionId: nonBlankString.nullable().optional(),
   }),
   z.strictObject({
     type: z.literal('asset.derived.ready'),
@@ -820,6 +825,16 @@ const assetOperationSuccessSchemas = [
     ok: z.literal(true),
     type: z.literal('folder.browse-entries'),
     entries: z.array(folderBrowseEntrySchema),
+  }),
+  z.strictObject({
+    ok: z.literal(true),
+    type: z.literal('folder.filtered-counts'),
+    all: z.number().int().nonnegative(),
+    root: z.number().int().nonnegative(),
+    folders: z.array(z.strictObject({
+      folderId: z.string().min(1).max(4096),
+      count: z.number().int().nonnegative(),
+    })).max(50_000),
   }),
   z.strictObject({
     ok: z.literal(true),
@@ -1737,6 +1752,21 @@ const assetOperationSuccessSchemas = [
   }),
   z.strictObject({
     ok: z.literal(true),
+    type: z.literal('ai.profiles.saved'),
+    id: z.string().regex(/^ai_[a-f0-9]{24}$/u),
+  }),
+  z.strictObject({
+    ok: z.literal(true),
+    type: z.literal('ai.profiles.activated'),
+    id: z.string().regex(/^ai_[a-f0-9]{24}$/u),
+  }),
+  z.strictObject({
+    ok: z.literal(true),
+    type: z.literal('ai.profiles.deleted'),
+    id: z.string().regex(/^ai_[a-f0-9]{24}$/u),
+  }),
+  z.strictObject({
+    ok: z.literal(true),
     type: z.literal('asset.import-eagle.completed'),
     result: eagleImportResultSchema,
   }),
@@ -2602,6 +2632,15 @@ const rendererSuccessResultSchema = z.discriminatedUnion('type', [
   z.strictObject({
     ok: z.literal(true),
     type: z.literal('ai.config.got'),
+    activeProfileId: z.string().regex(/^ai_[a-f0-9]{24}$/u).nullable(),
+    profiles: z.array(z.strictObject({
+      id: z.string().regex(/^ai_[a-f0-9]{24}$/u),
+      name: nonBlankString.max(80),
+      apiFormat: z.enum(['dashscope_native', 'openai_chat', 'openai_responses', 'anthropic', 'gemini_native', 'local_openai']),
+      model: nonBlankString.max(255),
+      baseUrl: z.string().max(2048),
+      hasCredential: z.boolean(),
+    })).max(100),
     apiFormat: z.enum(['dashscope_native', 'openai_chat', 'openai_responses', 'anthropic', 'gemini_native', 'local_openai']).nullable(),
     model: nonBlankString.nullable(),
     /** Empty string means official default for the selected API format. */
@@ -2870,6 +2909,13 @@ const libraryLifecycleOperationSchema = z.enum([
 ]);
 
 export const rendererLifecycleEventSchema = z.discriminatedUnion('type', [
+  z.strictObject({ type: z.literal('worker.recovering') }),
+  z.strictObject({
+    type: z.literal('worker.recovered'),
+    libraryIds: z.array(nonBlankString),
+    failedLibraryIds: z.array(nonBlankString),
+  }),
+  z.strictObject({ type: z.literal('worker.failed') }),
   z.strictObject({
     type: z.literal('library.opening'),
     operation: libraryLifecycleOperationSchema,

@@ -71,7 +71,10 @@ afterEach(async () => {
   await closeSemanticIndexWorkerLibrary();
   await Promise.all(services.splice(0).map((service) => service.closeAllAsync()));
   for (const root of temporaryRoots.splice(0)) {
-    removePathWithSyncRetry(root);
+    // Defender and thumbnail scanners can retain a just-closed library tree
+    // longer than the short default retry window on Windows. Keep retrying
+    // cleanup, but still fail visibly if the owned fixture cannot be removed.
+    removePathWithSyncRetry(root, { retryLimit: 10, retryDelayMs: 200 });
   }
 });
 

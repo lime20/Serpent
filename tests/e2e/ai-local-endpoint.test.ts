@@ -179,7 +179,7 @@ test("analyzes through a keyless local OpenAI-compatible endpoint", async () => 
     const dialog = window.getByRole("dialog", { name: "通用设置" });
     await expect(dialog).toBeVisible();
     await dialog.getByRole("tab", { name: "AI分析", exact: true }).click();
-    await expect(dialog.locator("#ai-config-api-format")).toHaveValue("local_openai");
+    await expect(dialog.locator("#ai-config-api-format")).toHaveAttribute("data-value", "local_openai");
     await expect(
       dialog.getByRole("button", { name: "检测本地/WSL 服务" }),
     ).toBeVisible();
@@ -231,7 +231,7 @@ test("analyzes through a keyless local OpenAI-compatible endpoint", async () => 
  * "cannot reach the local service" hint — for a server that was reachable all
  * along. A user could only get past it by saving blindly.
  */
-test("tests a hand-typed local endpoint before anything is saved", async () => {
+test("tests, saves and activates a hand-typed local endpoint without a key", async () => {
   const probeRequests: Array<{ authorization: string | undefined }> = [];
   const server: Server = createServer((request: IncomingMessage, response) => {
     request.resume();
@@ -290,7 +290,9 @@ test("tests a hand-typed local endpoint before anything is saved", async () => {
 
     // A hand-typed endpoint on a non-stock port, exactly like a llama.cpp
     // server started with --port 8000.
-    await dialog.locator("#ai-config-api-format").selectOption("local_openai");
+    await dialog.locator("#ai-config-api-format").click();
+    await window.getByRole("listbox").locator('[data-value="local_openai"]').click();
+    await expect(dialog.locator("#ai-config-api-format")).toHaveAttribute("data-value", "local_openai");
     // Selecting the format kicks off an automatic stock-port probe that may
     // fill the fields. Let it settle before overriding them by hand, otherwise
     // this machine's own local server decides the outcome of the test.
@@ -330,6 +332,34 @@ test("tests a hand-typed local endpoint before anything is saved", async () => {
 
     // Nothing was saved yet, so the probe must have used the draft values.
     expect(existsSync(path.join(userDataPath, "ai-config.json"))).toBe(false);
+
+    const profileName = "无密钥本地服务";
+    await dialog.locator("#ai-config-profile-name").fill(profileName);
+    await expect(dialog.locator("#ai-config-api-key")).toHaveValue("");
+    await dialog.getByRole("button", { name: /保存配置|Save configuration/ }).click();
+    const profileSelector = dialog.locator("#ai-config-profile");
+    await expect(profileSelector).toContainText(profileName);
+    const profileId = await profileSelector.getAttribute("data-value");
+    if (!profileId) throw new Error("Expected the keyless local profile to be saved.");
+    await expect(profileSelector).not.toContainText(/需要 API Key|API key needed/);
+    await expect(dialog.getByText(/保存 API Key 后才能启用/)).toHaveCount(0);
+    await dialog.getByRole("button", { name: /设为当前|Set as current/ }).click();
+    await expect(profileSelector).toContainText(/当前使用|In use/);
+    await dialog.press("Escape");
+    await expect(dialog).toBeHidden({ timeout: 15_000 });
+
+    await window.getByRole("button", { name: "主菜单" }).click();
+    await window.getByRole("menuitem", { name: "设置", exact: true }).click();
+    await expect(dialog).toBeVisible();
+    await dialog.getByRole("tab", { name: "AI分析", exact: true }).click();
+    await expect(dialog.locator("#ai-config-profile")).toHaveAttribute("data-value", profileId);
+    await expect(dialog.locator("#ai-config-profile")).toContainText(/当前使用|In use/);
+    await expect(dialog.locator("#ai-config-profile-name")).toHaveValue(profileName);
+    await expect(dialog.locator("#ai-config-api-format")).toHaveAttribute("data-value", "local_openai");
+    await expect(dialog.locator("#ai-config-base-url")).toHaveValue(`http://127.0.0.1:${port}/v1`);
+    await expect(dialog.locator("#ai-config-model")).toHaveValue("/home/me/models/local.gguf");
+    await expect(dialog.locator("#ai-config-api-key")).toHaveValue("");
+    expect(probeRequests.filter((entry) => entry.authorization !== undefined)).toEqual([]);
   } finally {
     await new Promise<void>((resolve) => server.close(() => resolve()));
     await application.close();

@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { createShellPortal } from "./ui/ShellStyleScope";
 
 import {
@@ -30,9 +30,11 @@ import {
 } from "../shared/ai-local-endpoints";
 import { Icon } from "./Icons";
 import { AiConfigNumberInput } from "./ai-config-number-input";
+import { buildAiModelsFetchKey } from "./ai-model-fetch-key";
 import { iconActionAttrs } from "./icon-action-attrs";
 import { useT } from "./i18n";
 import { DialogShell } from "./ui/patterns";
+import { Select } from "./ui/primitives/Select";
 
 export type AiConnectionState =
   | "idle"
@@ -46,6 +48,17 @@ export interface AiConfigDialogProps {
   /** Renders inside the settings center instead of a modal dialog. */
   variant?: "dialog" | "embedded";
   apiKey: string;
+  profiles: Array<{
+    id: string;
+    name: string;
+    apiFormat: AiApiFormat;
+    model: string;
+    baseUrl: string;
+    hasCredential: boolean;
+  }>;
+  activeProfileId: string | null;
+  profileDraftId: string | null;
+  profileName: string;
   apiFormat: AiApiFormat;
   model: string;
   baseUrl: string;
@@ -65,6 +78,12 @@ export interface AiConfigDialogProps {
   /** Shown while save is waiting on a connection probe. */
   saveVerifying?: boolean;
   onApiKeyChange: (value: string) => void;
+  onProfileNameChange: (value: string) => void;
+  onNewProfile: () => void;
+  onSelectProfile: (id: string) => void;
+  onActivateProfile: (id: string) => void;
+  onDeleteProfile: (id: string) => void;
+  onClearCredential: () => void;
   onApiFormatChange: (value: AiApiFormat) => void;
   onModelChange: (value: string) => void;
   onBaseUrlChange: (value: string) => void;
@@ -111,6 +130,10 @@ export function AiConfigDialog({
   open,
   variant = "dialog",
   apiKey,
+  profiles,
+  activeProfileId,
+  profileDraftId,
+  profileName,
   apiFormat,
   model,
   baseUrl,
@@ -129,6 +152,12 @@ export function AiConfigDialog({
   connectionReason,
   saveVerifying = false,
   onApiKeyChange,
+  onProfileNameChange,
+  onNewProfile,
+  onSelectProfile,
+  onActivateProfile,
+  onDeleteProfile,
+  onClearCredential,
   onApiFormatChange,
   onModelChange,
   onBaseUrlChange,
@@ -150,23 +179,23 @@ export function AiConfigDialog({
   onDiscoverLocalEndpoints,
 }: AiConfigDialogProps) {
   const t = useT();
-  const [modelOptions, setModelOptions] = useState<string[]>([]);
-  /**
-   * Vision capability as *reported by the endpoint* (llama.cpp and newer
-   * Ollama list `capabilities`). When the server answers this question we must
-   * not second-guess it with a name heuristic — that produced false "may not
-   * accept images" warnings for perfectly multimodal GGUF models.
-   */
-  const [visionModels, setVisionModels] = useState<string[]>([]);
-  const [capabilitiesReported, setCapabilitiesReported] = useState(false);
-  const [busyAction, setBusyAction] = useState<"test" | "models" | "local" | null>(
-    null,
-  );
-  const [modelsMessage, setModelsMessage] = useState<string | null>(null);
+  const [modelOptionsState, setModelOptions] = useState<{
+    fetchKey: string;
+    models: string[];
+    visionModels: string[];
+    capabilitiesReported: boolean;
+  } | null>(null);
+  const [modelsFetchRetry, setModelsFetchRetry] = useState(0);
+  const [busyAction, setBusyAction] = useState<"test" | "models" | "local" | null>(null);
+  const [modelsMessageState, setModelsMessage] = useState<{
+    fetchKey: string;
+    message: string | null;
+  } | null>(null);
   const [localDiscovery, setLocalDiscovery] =
     useState<AiLocalEndpointDiscovery | null>(null);
   const [localMessage, setLocalMessage] = useState<string | null>(null);
-  const [testInline, setTestInline] = useState<{
+  const [testInlineState, setTestInline] = useState<{
+    fetchKey: string;
     ok: boolean;
     text: string;
   } | null>(null);
@@ -191,26 +220,52 @@ export function AiConfigDialog({
    */
   const keylessFormat = !aiApiFormatRequiresApiKey(apiFormat);
   const canUseCredentials = canUseKey || keylessFormat;
+  const selectedProfile = profiles.find((profile) => profile.id === profileDraftId);
+  const selectedProfileCanActivate = selectedProfile !== undefined && (
+    selectedProfile.hasCredential || !aiApiFormatRequiresApiKey(selectedProfile.apiFormat)
+  );
+  const profileDraftIsDirty = selectedProfile !== undefined && (
+    selectedProfile.name !== profileName.trim()
+    || selectedProfile.apiFormat !== apiFormat
+    || selectedProfile.model !== model.trim()
+    || selectedProfile.baseUrl !== baseUrl.trim()
+    || Boolean(apiKey.trim())
+  );
   const language = languages[0] ?? "zh-CN";
-  const modelsFetchKey = `${apiFormat}|${baseUrl.trim()}|${apiKey.trim() ? "typed" : hasKey ? "stored" : "none"}`;
-  const localFailed =
-    apiFormat === "local_openai" &&
-    (testInline?.ok === false || connectionState === "error");
+  const modelsFetchKey = buildAiModelsFetchKey({
+    profileId: profileDraftId,
+    apiFormat,
+    baseUrl,
+    apiKey,
+    hasStoredKey: hasKey,
+  });
+  const modelsFetchKeyRef = useRef(modelsFetchKey);
+  const modelRef = useRef(model);
+  useLayoutEffect(() => {
+    modelsFetchKeyRef.current = modelsFetchKey;
+    modelRef.current = model;
+  }, [modelsFetchKey, model]);
+  const modelsMessage = modelsMessageState?.fetchKey === modelsFetchKey
+    ? modelsMessageState.message
+    : null;
+  const modelOptions = modelOptionsState?.fetchKey === modelsFetchKey
+    ? modelOptionsState.models
+    : [];
+  const visionModels = modelOptionsState?.fetchKey === modelsFetchKey
+    ? modelOptionsState.visionModels
+    : [];
+  const capabilitiesReported = modelOptionsState?.fetchKey === modelsFetchKey
+    && modelOptionsState.capabilitiesReported;
+  const testInline = testInlineState?.fetchKey === modelsFetchKey
+    ? testInlineState
+    : null;
+  const localFailed = apiFormat === "local_openai"
+    && (testInline?.ok === false || connectionState === "error");
 
-  /**
-   * `vision` — the endpoint (or a known model family) accepts images.
-   * `no-vision` — the endpoint reported capabilities and omitted vision.
-   * `unknown` — nobody said anything; the name looks text-only.
-   */
-  function visionVerdict(modelId: string): "vision" | "no-vision" | "unknown" {
-    if (visionModels.includes(modelId)) return "vision";
-    if (capabilitiesReported) return "no-vision";
-    return localModelLikelySupportsVision(modelId) ? "vision" : "unknown";
-  }
-
-  /** Warn only when there is a reason to: reported text-only, or an unknown name. */
   function showsVisionWarning(modelId: string): boolean {
-    return visionVerdict(modelId) !== "vision";
+    // The endpoint's explicit capability report takes precedence over names.
+    if (visionModels.includes(modelId)) return false;
+    return capabilitiesReported || !localModelLikelySupportsVision(modelId);
   }
 
   function patchSettings(patch: Partial<AiAnalysisSettingsWire>) {
@@ -226,11 +281,14 @@ export function AiConfigDialog({
   }
 
   async function runTest() {
+    const requestFetchKey = modelsFetchKey;
     setBusyAction("test");
     setTestInline(null);
     try {
       const result = await onTestConnection();
+      if (modelsFetchKeyRef.current !== requestFetchKey) return;
       setTestInline({
+        fetchKey: requestFetchKey,
         ok: result.success,
         text: result.success
           ? t("aiConfig.testOk")
@@ -243,31 +301,44 @@ export function AiConfigDialog({
 
   async function runFetchModels(options?: { quiet?: boolean }) {
     if (!canUseCredentials || modelsFetchInFlightRef.current) return;
+    const requestFetchKey = modelsFetchKey;
     modelsFetchInFlightRef.current = true;
     setBusyAction("models");
-    if (!options?.quiet) setModelsMessage(null);
+    if (!options?.quiet) {
+      setModelsMessage({ fetchKey: requestFetchKey, message: null });
+    }
     try {
       const result = await onFetchModels();
-      fetchedForRef.current = modelsFetchKey;
-      setVisionModels(result.visionModels ?? []);
-      setCapabilitiesReported(result.capabilitiesReported === true);
+      if (modelsFetchKeyRef.current !== requestFetchKey) return;
+      fetchedForRef.current = requestFetchKey;
+      setModelOptions({
+        fetchKey: requestFetchKey,
+        models: result.models,
+        visionModels: result.visionModels ?? [],
+        capabilitiesReported: result.capabilitiesReported === true,
+      });
       if (result.models.length > 0) {
-        setModelOptions(result.models);
-        setModelsMessage(
-          options?.quiet
+        setModelsMessage({
+          fetchKey: requestFetchKey,
+          message: options?.quiet
             ? null
             : t("aiConfig.fetchModelsOk").replace(
                 "{count}",
                 String(result.models.length),
               ),
-        );
+        });
       } else {
-        setModelOptions([]);
-        setModelsMessage(result.reason ?? t("aiConfig.fetchModelsFailed"));
+        setModelsMessage({
+          fetchKey: requestFetchKey,
+          message: result.reason ?? t("aiConfig.fetchModelsFailed"),
+        });
       }
     } finally {
       modelsFetchInFlightRef.current = false;
       setBusyAction(null);
+      if (modelsFetchKeyRef.current !== requestFetchKey) {
+        setModelsFetchRetry((retry) => retry + 1);
+      }
     }
   }
 
@@ -276,13 +347,18 @@ export function AiConfigDialog({
    * does not actually serve is replaced, so a deliberate choice survives.
    */
   function applyLocalEndpoint(endpoint: AiLocalEndpointDescriptor) {
+    const endpointFetchKey = buildAiModelsFetchKey({
+      profileId: profileDraftId,
+      apiFormat: "local_openai",
+      baseUrl: endpoint.baseUrl,
+      apiKey,
+      hasStoredKey: hasKey,
+    });
     onBaseUrlChange(endpoint.baseUrl);
-    const currentModel = model.trim();
+    const currentModel = modelRef.current.trim();
     // Trust the runtime's own capability report for the model we auto-pick.
     const declaredVision = endpoint.visionModels ?? [];
     const capabilitiesKnown = endpoint.capabilitiesReported === true;
-    setVisionModels(declaredVision);
-    setCapabilitiesReported(capabilitiesKnown);
     if (!currentModel || !endpoint.models.includes(currentModel)) {
       const preferred =
         declaredVision[0] ??
@@ -290,16 +366,21 @@ export function AiConfigDialog({
         endpoint.models[0];
       if (preferred) onModelChange(preferred);
     }
-    setModelOptions(endpoint.models);
-    setModelsMessage(null);
+    setModelOptions({
+      fetchKey: endpointFetchKey,
+      models: endpoint.models,
+      visionModels: declaredVision,
+      capabilitiesReported: capabilitiesKnown,
+    });
+    setModelsMessage({ fetchKey: endpointFetchKey, message: null });
     setTestInline(null);
-    fetchedForRef.current = null;
+    fetchedForRef.current = endpointFetchKey;
   }
 
   function applyLocalPreset(preset: LocalAiProviderPreset) {
     onBaseUrlChange(preset.baseUrl);
     if (!model.trim()) onModelChange(preset.suggestedModel);
-    setModelOptions([]);
+    setModelOptions(null);
     setModelsMessage(null);
     setTestInline(null);
     fetchedForRef.current = null;
@@ -308,11 +389,15 @@ export function AiConfigDialog({
   async function runDiscoverLocalEndpoints(options?: {
     /** Fill the draft automatically when exactly one server answers. */
     autoApplySingle?: boolean;
+    /** A format change can start discovery before its new props render. */
+    requestFetchKey?: string;
   }) {
+    const requestFetchKey = options?.requestFetchKey ?? modelsFetchKey;
     setBusyAction("local");
     setLocalMessage(null);
     try {
       const result = await onDiscoverLocalEndpoints();
+      if (modelsFetchKeyRef.current !== requestFetchKey) return;
       setLocalDiscovery({
         endpoints: result.endpoints,
         wslAvailable: result.wslAvailable,
@@ -389,9 +474,7 @@ export function AiConfigDialog({
       // stock Ollama root instead of an empty field.
       onBaseUrlChange(next === "local_openai" ? DEFAULT_AI_BASE_URLS[next] : "");
     }
-    setModelOptions([]);
-    setVisionModels([]);
-    setCapabilitiesReported(false);
+    setModelOptions(null);
     setModelsMessage(null);
     setLocalDiscovery(null);
     setLocalMessage(null);
@@ -402,7 +485,16 @@ export function AiConfigDialog({
     if (next === "local_openai" && usedDefaultEndpoint) {
       // The stock default is Ollama's port. Rather than leave the user on an
       // endpoint that may not exist, probe once and fill in a single answer.
-      void runDiscoverLocalEndpoints({ autoApplySingle: true });
+      void runDiscoverLocalEndpoints({
+        autoApplySingle: true,
+        requestFetchKey: buildAiModelsFetchKey({
+          profileId: profileDraftId,
+          apiFormat: next,
+          baseUrl: DEFAULT_AI_BASE_URLS[next],
+          apiKey,
+          hasStoredKey: hasKey,
+        }),
+      });
     }
   }
 
@@ -421,7 +513,7 @@ export function AiConfigDialog({
     }
     void runFetchModels({ quiet: true });
     // eslint-disable-next-line react-hooks/exhaustive-deps -- fingerprint-driven
-  }, [open, modelsFetchKey, canUseCredentials]);
+  }, [open, modelsFetchKey, canUseCredentials, modelsFetchRetry]);
 
   useEffect(() => {
     if (!modelPickerOpen) return;
@@ -449,6 +541,7 @@ export function AiConfigDialog({
   if (!open) return null;
 
   const busy = busyAction !== null || saveVerifying;
+  const canSaveProfile = Boolean(model.trim()) && !busy;
   const embedded = variant === "embedded";
   const pickerLabel =
     busyAction === "models"
@@ -509,24 +602,83 @@ export function AiConfigDialog({
         ) : null}
         <div className="ai-config-dialog-body">
           <p className="ai-config-note">{t("aiConfig.note")}</p>
+          <div className="micro-label ai-config-section-title">{t("aiConfig.modelConfiguration")}</div>
+          <div className="ai-config-profile-row">
+            <div className="editor-field ai-config-field">
+              <label className="micro-label" htmlFor="ai-config-profile">
+                {t("aiConfig.savedProfiles")}
+              </label>
+              <Select
+                className="text-field ai-config-input"
+                id="ai-config-profile"
+                onValueChange={onSelectProfile}
+                options={[
+                  { value: "", label: t("aiConfig.newProfileOption") },
+                  ...profiles.map((profile) => ({
+                    value: profile.id,
+                    label: `${profile.name}${profile.id === activeProfileId ? ` · ${t("aiConfig.activeProfile")}` : ""}${!profile.hasCredential && aiApiFormatRequiresApiKey(profile.apiFormat) ? ` · ${t("aiConfig.missingCredential")}` : ""}`,
+                  })),
+                ]}
+                value={profileDraftId ?? ""}
+              />
+            </div>
+            <button className="secondary-button" onClick={onNewProfile} type="button">
+              {t("aiConfig.addProfile")}
+            </button>
+            {profileDraftId ? (
+              <button
+                className="secondary-button"
+                onClick={() => {
+                  onDeleteProfile(profileDraftId);
+                }}
+                type="button"
+              >
+                {t("aiConfig.deleteProfile")}
+              </button>
+            ) : null}
+            {profileDraftId && profileDraftId !== activeProfileId ? (
+              <button
+                className="secondary-button"
+                disabled={!selectedProfileCanActivate || profileDraftIsDirty || busy}
+                onClick={() => onActivateProfile(profileDraftId)}
+                type="button"
+              >
+                {t("aiConfig.activateProfile")}
+              </button>
+            ) : null}
+          </div>
+          {selectedProfile && !selectedProfileCanActivate ? (
+            <p className="ai-config-hint">{t("aiConfig.profileNeedsKey")}</p>
+          ) : null}
+          {profileDraftId && selectedProfileCanActivate && profileDraftIsDirty ? (
+            <p className="ai-config-hint">{t("aiConfig.profileSaveBeforeActivate")}</p>
+          ) : null}
+          <div className="editor-field ai-config-field">
+            <label className="micro-label" htmlFor="ai-config-profile-name">
+              {t("aiConfig.profileName")}
+            </label>
+            <input
+              className="text-field ai-config-input"
+              id="ai-config-profile-name"
+              maxLength={80}
+              onChange={(event) => onProfileNameChange(event.target.value)}
+              value={profileName}
+            />
+          </div>
           <div className="editor-field ai-config-field">
             <label className="micro-label" htmlFor="ai-config-api-format">
               {t("aiConfig.apiFormat")}
             </label>
-            <select
+            <Select
               className="text-field ai-config-input"
               id="ai-config-api-format"
-              onChange={(e) =>
-                handleApiFormatChange(e.target.value as AiApiFormat)
-              }
+              onValueChange={(value) => handleApiFormatChange(value as AiApiFormat)}
+              options={AI_API_FORMATS.map((id) => ({
+                value: id,
+                label: AI_API_FORMAT_LABELS[id],
+              }))}
               value={apiFormat}
-            >
-              {AI_API_FORMATS.map((id) => (
-                <option key={id} value={id}>
-                  {AI_API_FORMAT_LABELS[id]}
-                </option>
-              ))}
-            </select>
+            />
             <p className="ai-config-hint">{t("aiConfig.apiFormatHint")}</p>
           </div>
           <div className="editor-field ai-config-field">
@@ -663,6 +815,15 @@ export function AiConfigDialog({
             {keylessFormat ? (
               <p className="ai-config-hint">{t("aiConfig.localApiKeyHint")}</p>
             ) : null}
+            {profileDraftId && hasKey ? (
+              <button
+                className="secondary-button"
+                onClick={onClearCredential}
+                type="button"
+              >
+                {t("aiConfig.clearApiKey")}
+              </button>
+            ) : null}
           </div>
           <div className="editor-field ai-config-field">
             <label className="micro-label" htmlFor="ai-config-model">
@@ -782,26 +943,23 @@ export function AiConfigDialog({
               </p>
             ) : null}
           </div>
+          <div className="micro-label ai-config-section-title">{t("aiConfig.analysisBehavior")}</div>
           <div className="editor-field ai-config-field">
             <label className="micro-label" htmlFor="ai-config-language">
               {t("aiConfig.language")}
             </label>
-            <select
+            <Select
               className="text-field ai-config-input"
               id="ai-config-language"
-              onChange={(e) =>
-                onLanguagesChange([e.target.value as AiLanguageId])
-              }
+              onValueChange={(value) => onLanguagesChange([value as AiLanguageId])}
+              options={AI_LANGUAGE_OPTIONS.map((option) => ({
+                value: option.id,
+                label: option.labelZh === option.labelEn
+                  ? option.labelEn
+                  : `${option.labelZh} / ${option.labelEn}`,
+              }))}
               value={language}
-            >
-              {AI_LANGUAGE_OPTIONS.map((option) => (
-                <option key={option.id} value={option.id}>
-                  {option.labelZh === option.labelEn
-                    ? option.labelEn
-                    : `${option.labelZh} / ${option.labelEn}`}
-                </option>
-              ))}
-            </select>
+            />
             <p className="ai-config-hint">{t("aiConfig.languageHint")}</p>
           </div>
           <div className="ai-config-switches">
@@ -954,22 +1112,18 @@ export function AiConfigDialog({
                 <label className="micro-label" htmlFor="ai-config-output-style">
                   {t("aiConfig.outputStyle")}
                 </label>
-                <select
+                <Select
                   className="text-field ai-config-input"
                   id="ai-config-output-style"
-                  onChange={(e) =>
-                    patchSettings({
-                      outputStyle: e.target.value as AiOutputStyle,
-                    })
-                  }
+                  onValueChange={(value) => patchSettings({
+                    outputStyle: value as AiOutputStyle,
+                  })}
+                  options={AI_OUTPUT_STYLES.map((style) => ({
+                    value: style,
+                    label: t(OUTPUT_STYLE_LABEL_KEY[style]),
+                  }))}
                   value={analysisSettings.outputStyle}
-                >
-                  {AI_OUTPUT_STYLES.map((style) => (
-                    <option key={style} value={style}>
-                      {t(OUTPUT_STYLE_LABEL_KEY[style])}
-                    </option>
-                  ))}
-                </select>
+                />
               </div>
               <div
                 className={`editor-field ai-config-field${ratingEnabled ? "" : " is-disabled"}`}
@@ -1025,7 +1179,7 @@ export function AiConfigDialog({
                 }}
                 type="checkbox"
               />
-              <span>{t("aiConfig.disclaimer")}</span>
+              <span>{t(keylessFormat ? "aiConfig.localDisclaimer" : "aiConfig.disclaimer")}</span>
             </label>
             <label
               className="ai-config-check-row ai-config-check-row-indent"
@@ -1065,11 +1219,11 @@ export function AiConfigDialog({
           </div>
           <button
             className="primary-button"
-            disabled={!canUseCredentials || !model.trim() || busy}
+            disabled={!canSaveProfile}
             onClick={() => void onSave()}
             type="button"
           >
-            {saveVerifying ? t("aiConfig.savingVerifying") : t("aiConfig.save")}
+            {saveVerifying ? t("aiConfig.savingVerifying") : t("aiConfig.saveProfile")}
           </button>
         </div>
         {saveVerifying ? (

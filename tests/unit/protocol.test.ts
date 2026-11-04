@@ -6,6 +6,7 @@ import {
   parseWorkerRequest,
 } from '../../src/shared/protocol/requests';
 import { classifyUnknownFailure, createPublicError, publicReasonFromError, toPublicError, PUBLIC_ERROR_MESSAGES } from '../../src/shared/protocol/errors';
+
 import {
   importConflictPlanSchema,
   parseAssetChangeEvent,
@@ -18,6 +19,128 @@ import {
   parseAiContentClearedEvent,
   parseAiInputReadyEvent,
 } from '../../src/shared/protocol/responses';
+
+it('classifies a stopped Library Worker without exposing internal details', () => {
+  const failure = Object.assign(new Error('private internal detail'), { code: 'WORKER_UNAVAILABLE' });
+  expect(toPublicError(failure)).toEqual({
+    code: 'WORKER_UNAVAILABLE',
+    message: PUBLIC_ERROR_MESSAGES.WORKER_UNAVAILABLE,
+  });
+});
+
+describe('named local AI connection protocol', () => {
+  const profileId = 'ai_0123456789abcdef01234567';
+
+  it('accepts local profiles and keeps an explicit profile on credential probes', () => {
+    const profile = {
+      type: 'ai.profiles.save.request',
+      name: 'Local vision',
+      apiFormat: 'local_openai',
+      model: 'qwen-vl',
+      baseUrl: 'http://127.0.0.1:8080/v1',
+    };
+    expect(parseRendererRequest(profile)).toEqual(profile);
+    for (const type of ['ai.list-models.request', 'ai.test-connection.request']) {
+      const probe = {
+        type,
+        apiFormat: 'local_openai',
+        profileId,
+        ...(type === 'ai.test-connection.request' ? { model: 'qwen-vl' } : {}),
+      };
+      expect(parseRendererRequest(probe)).toEqual(probe);
+      expect(() => parseRendererRequest({ ...probe, profileId: 'other-profile' })).toThrow();
+    }
+  });
+
+  it('exposes an active keyless local profile with the readiness contract', () => {
+    const response = {
+      ok: true,
+      type: 'ai.config.got',
+      activeProfileId: profileId,
+      profiles: [{
+        id: profileId,
+        name: 'Local vision',
+        apiFormat: 'local_openai',
+        model: 'qwen-vl',
+        baseUrl: 'http://127.0.0.1:8080/v1',
+        hasCredential: false,
+      }],
+      apiFormat: 'local_openai',
+      model: 'qwen-vl',
+      baseUrl: 'http://127.0.0.1:8080/v1',
+      hasKey: false,
+      requiresApiKey: false,
+      enabledFields: { description: true, tags: true, rating: false },
+      analysisSettings: {
+        forceExistingTags: false,
+        maxTags: 8,
+        maxDescriptionCharsZh: 100,
+        maxDescriptionWordsEn: 60,
+        outputStyle: 'normal',
+        ratingRubric: '1 to 5',
+        customDescriptionPrompt: '',
+        customTagPrompt: '',
+      },
+      languages: ['en'],
+      concurrencyLimit: 1,
+      maxAnalysisImageEdgePx: 1536,
+      reliabilitySettings: {
+        requestTimeoutMs: 120_000,
+        maxAttempts: 3,
+        retryBaseDelayMs: 1_000,
+        retryMaxDelayMs: 30_000,
+        retryJitterRatio: 0.2,
+      },
+      autoAnalyzeEnabled: false,
+      disclaimerAccepted: true,
+    };
+    expect(parseRendererResult(response)).toEqual(response);
+    expect(() => parseRendererResult({
+      ...response,
+      profiles: [{ ...response.profiles[0], apiKey: 'must-not-cross' }],
+    })).toThrow();
+  });
+
+  it('preserves endpoint vision capabilities in model lists and discovery', () => {
+    const capabilities = {
+      models: ['qwen-vl', 'text-model'],
+      visionModels: ['qwen-vl'],
+      capabilitiesReported: true,
+    };
+    const modelList = { ok: true, type: 'ai.list-models.result', ...capabilities };
+    expect(parseRendererResult(modelList)).toEqual(modelList);
+
+    const discovery = {
+      ok: true,
+      type: 'ai.local-endpoints.result',
+      endpoints: [{
+        presetId: 'llamacpp',
+        label: 'llama.cpp',
+        baseUrl: 'http://127.0.0.1:8080/v1',
+        host: '127.0.0.1',
+        port: 8080,
+        source: 'loopback',
+        ...capabilities,
+      }],
+      wslAvailable: false,
+      wslDistros: [],
+    };
+    expect(parseRendererRequest({ type: 'ai.local-endpoints.request' })).toEqual({
+      type: 'ai.local-endpoints.request',
+    });
+    expect(parseRendererResult(discovery)).toEqual(discovery);
+  });
+});
+
+it('validates Worker recovery lifecycle events without a library path', () => {
+  expect(parseRendererLifecycleEvent({ type: 'worker.recovering' })).toEqual({ type: 'worker.recovering' });
+  expect(parseRendererLifecycleEvent({ type: 'worker.recovered', libraryIds: ['library-1'], failedLibraryIds: [] })).toEqual({
+    type: 'worker.recovered',
+    libraryIds: ['library-1'],
+    failedLibraryIds: [],
+  });
+  expect(parseRendererLifecycleEvent({ type: 'worker.failed' })).toEqual({ type: 'worker.failed' });
+});
 
 describe('renderer request protocol', () => {
   it('accepts the library-open cancellation request and acknowledgement', () => {
@@ -2706,6 +2829,20 @@ describe('background asset change events', () => {
       missingCount: 0,
       source: 'sync',
     });
+    expect(parseAssetChangeEvent({
+      type: 'asset.changed',
+      libraryId: 'library-01',
+      changedCount: 1,
+      missingCount: 0,
+      nativeDragPathsChanged: true,
+    })).toMatchObject({ nativeDragPathsChanged: true });
+    expect(() => parseAssetChangeEvent({
+      type: 'asset.changed',
+      libraryId: 'library-01',
+      changedCount: 1,
+      missingCount: 0,
+      nativeDragPathsChanged: false,
+    })).toThrow();
     expect(() => parseAssetChangeEvent({
       type: 'asset.changed',
       libraryId: 'library-01',

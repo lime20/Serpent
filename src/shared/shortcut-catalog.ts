@@ -212,7 +212,7 @@ export const SHORTCUT_ACTIONS: readonly ShortcutActionDefinition[] = Object.free
       windows: [assetCopyPathWin],
     },
     customizable: true,
-    surfaces: rendererAndContext,
+    surfaces: ["renderer", "context-menu", "hidden-accelerator", "before-input"],
   },
   {
     id: "asset.rename",
@@ -240,6 +240,18 @@ export const SHORTCUT_ACTIONS: readonly ShortcutActionDefinition[] = Object.free
     defaults: sharedDiskDeleteDefaults,
     customizable: true,
     surfaces: rendererContextAndHidden,
+  },
+  {
+    id: "folder.copy-path",
+    labelKey: "shortcuts.action.folder.copyPath",
+    category: "folder",
+    scopes: ["sidebar.folder"],
+    defaults: {
+      mac: [assetCopyPathMac],
+      windows: [assetCopyPathWin],
+    },
+    customizable: true,
+    surfaces: ["renderer", "context-menu", "hidden-accelerator", "before-input"],
   },
   {
     id: "folder.open-in-file-manager",
@@ -551,19 +563,19 @@ export const SHORTCUT_ACTIONS: readonly ShortcutActionDefinition[] = Object.free
     id: "viewer.video.seek-back",
     labelKey: "shortcuts.action.viewer.seekBack",
     category: "viewer",
-    scopes: ["viewer.video"],
+    scopes: ["viewer.video", "viewer.audio"],
     defaults: { mac: [chord("ArrowLeft", { code: "ArrowLeft", ctrlKey: true })], windows: [chord("ArrowLeft", { code: "ArrowLeft", ctrlKey: true })] },
     customizable: true,
-    surfaces: ["renderer"],
+    surfaces: rendererViewerMain,
   },
   {
     id: "viewer.video.seek-forward",
     labelKey: "shortcuts.action.viewer.seekForward",
     category: "viewer",
-    scopes: ["viewer.video"],
+    scopes: ["viewer.video", "viewer.audio"],
     defaults: { mac: [chord("ArrowRight", { code: "ArrowRight", ctrlKey: true })], windows: [chord("ArrowRight", { code: "ArrowRight", ctrlKey: true })] },
     customizable: true,
-    surfaces: ["renderer"],
+    surfaces: rendererViewerMain,
   },
   {
     id: "viewer.volume-up",
@@ -615,6 +627,30 @@ export const SHORTCUT_ACTIONS: readonly ShortcutActionDefinition[] = Object.free
     },
     customizable: true,
     surfaces: rendererMainAndHidden,
+  },
+  {
+    id: "workspace.new-tab",
+    labelKey: "shortcuts.action.app.newTab",
+    category: "app",
+    scopes: ["app"],
+    defaults: {
+      mac: [command("t", "mac")],
+      windows: [command("t", "windows")],
+    },
+    customizable: true,
+    surfaces: ["renderer"],
+  },
+  {
+    id: "workspace.close-tab",
+    labelKey: "shortcuts.action.app.closeTab",
+    category: "app",
+    scopes: ["app"],
+    defaults: {
+      mac: [command("w", "mac")],
+      windows: [command("w", "windows")],
+    },
+    customizable: true,
+    surfaces: ["renderer"],
   },
 ]);
 

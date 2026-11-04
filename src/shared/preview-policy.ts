@@ -12,13 +12,15 @@ export const SOURCE_DIRECT_MAX_LONG_EDGE_PX = 2048;
 export const SOURCE_DIRECT_MAX_PIXELS = 2_000_000;
 export const SOURCE_DIRECT_MAX_BYTES = 2 * 1024 * 1024;
 
-const SOURCE_DIRECT_EXTENSIONS = new Set([
+export const SOURCE_DIRECT_IMAGE_EXTENSIONS = [
   ...JPEG_IMAGE_EXTENSIONS,
   ".png",
   ".webp",
   ".avif",
   ".gif",
-]);
+] as const;
+
+const SOURCE_DIRECT_EXTENSIONS = new Set<string>(SOURCE_DIRECT_IMAGE_EXTENSIONS);
 
 function extensionFor(fileName: string): string {
   const lower = fileName.toLowerCase();
@@ -34,6 +36,17 @@ export type SourceDirectPreviewInput = Readonly<{
   height: number | null | undefined;
 }>;
 
+/** Cheap eligibility check before a bounded header probe. */
+export function isSourceDirectPreviewCandidate(
+  input: Pick<SourceDirectPreviewInput, "fileName" | "mediaType" | "byteSize">,
+): boolean {
+  return input.mediaType === "image"
+    && SOURCE_DIRECT_EXTENSIONS.has(extensionFor(input.fileName))
+    && Number.isSafeInteger(input.byteSize)
+    && input.byteSize > 0
+    && input.byteSize <= SOURCE_DIRECT_MAX_BYTES;
+}
+
 /**
  * Return true only when the original can be mounted as a bounded card image.
  * Larger sources use the native thumbnail route; they remain valid assets.
@@ -41,10 +54,7 @@ export type SourceDirectPreviewInput = Readonly<{
 export function isSourceDirectPreview(
   input: SourceDirectPreviewInput,
 ): boolean {
-  if (input.mediaType !== "image") return false;
-  if (!SOURCE_DIRECT_EXTENSIONS.has(extensionFor(input.fileName))) return false;
-  if (!Number.isSafeInteger(input.byteSize) || input.byteSize <= 0) return false;
-  if (input.byteSize > SOURCE_DIRECT_MAX_BYTES) return false;
+  if (!isSourceDirectPreviewCandidate(input)) return false;
   if (
     typeof input.width !== "number"
     || typeof input.height !== "number"

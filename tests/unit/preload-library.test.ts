@@ -21,6 +21,60 @@ vi.mock('../../src/preload/transport', () => ({
 import { failure, request } from '../../src/preload/transport';
 import { library } from '../../src/preload/bridge/library';
 
+test('library.listAiModels forwards the selected profile and preserves vision capabilities', async () => {
+  vi.mocked(request).mockClear();
+  const profileId = 'ai_0123456789abcdef01234567';
+  vi.mocked(request).mockResolvedValue({
+    ok: true,
+    type: 'ai.list-models.result',
+    models: ['qwen-vl'],
+    visionModels: ['qwen-vl'],
+    capabilitiesReported: true,
+  });
+
+  await expect(library.listAiModels({ apiFormat: 'local_openai', profileId })).resolves.toEqual({
+    ok: true,
+    value: {
+      models: ['qwen-vl'],
+      visionModels: ['qwen-vl'],
+      capabilitiesReported: true,
+      errorKind: undefined,
+      reason: undefined,
+    },
+  });
+  expect(request).toHaveBeenCalledExactlyOnceWith({
+    type: 'ai.list-models.request',
+    apiFormat: 'local_openai',
+    profileId,
+  });
+});
+
+test('library.listAiLocalEndpoints keeps discovered endpoint capabilities', async () => {
+  vi.mocked(request).mockClear();
+  const discovery = {
+    endpoints: [{
+      presetId: 'ollama' as const,
+      label: 'Ollama',
+      baseUrl: 'http://127.0.0.1:11434/v1',
+      host: '127.0.0.1',
+      port: 11434,
+      source: 'loopback' as const,
+      models: ['qwen-vl'],
+      visionModels: ['qwen-vl'],
+      capabilitiesReported: true,
+    }],
+    wslAvailable: false,
+    wslDistros: [],
+  };
+  vi.mocked(request).mockResolvedValue({ ok: true, type: 'ai.local-endpoints.result', ...discovery });
+
+  await expect(library.listAiLocalEndpoints()).resolves.toEqual({
+    ok: true,
+    value: { ...discovery, wslError: undefined },
+  });
+  expect(request).toHaveBeenCalledExactlyOnceWith({ type: 'ai.local-endpoints.request' });
+});
+
 test('library.retryMediaJobs keeps an explicit empty selection out of IPC', async () => {
   vi.mocked(request).mockClear();
   vi.mocked(request).mockResolvedValue({ ok: true, type: 'media.jobs.retried', retriedCount: 0 } as never);

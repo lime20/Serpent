@@ -13,6 +13,7 @@ import {
 import { createPortal, flushSync } from "react-dom";
 
 import { Icon, type IconName } from "./Icons";
+import { isCurrentAiConnectionProbe } from "./ai-connection-probe-guard";
 import { iconActionAttrs } from "./icon-action-attrs";
 import { EditTextContextMenuHost } from "./edit-text-context-menu";
 import { HoverTipHost } from "./hover-tip";
@@ -67,6 +68,9 @@ import { ConvertLinkedDialog } from "./ConvertLinkedDialog";
 import { LinkedRulesDialog } from "./LinkedRulesDialog";
 import { TagManagementWorkspace } from "./TagManagementWorkspace";
 import { useFolderDeleteActions } from "./use-folder-delete-actions";
+import { canDeleteAssetFromDiskWithShortcut } from "./browse-key-command";
+import { filteredFolderBrowseEntries } from "./filtered-folder-visibility";
+import { useFilteredFolderCounts } from "./use-filtered-folder-counts";
 import { useFolderOrganizeActions } from "./use-folder-organize-actions";
 import { useFolderCommandShortcuts } from "./use-folder-command-shortcuts";
 import { SearchHistoryPopover } from "./SearchHistoryPopover";
@@ -117,6 +121,7 @@ import {
   type LibraryViewSessionToken,
 } from "./library-view-session";
 import { createTrackedLibraryApi } from "./tracked-library-api";
+import { useNativeDragReadyIds } from "./use-native-drag-readiness";
 import { MainMenu } from "./MainMenu";
 import {
   buildMainMenuSections,
@@ -382,6 +387,7 @@ import {
 } from "./canvas-asset-layout";
 import { useSelectionKeyboard } from "./use-selection-keyboard";
 import { useBrowseCommandKeyboard } from "./use-browse-command-keyboard";
+import { useWorkspaceTabShortcuts } from "./use-workspace-tab-shortcuts";
 import { resolveBrowsePasteDestination } from "./browse-paste-target";
 import { useWorkspaceMouseNavigation } from "./use-workspace-mouse-navigation";
 import {
@@ -445,6 +451,7 @@ import { useInlineFolderEdit } from "./use-inline-folder-edit";
 import { useInlineSmartCollectionEdit } from "./use-inline-smart-collection-edit";
 import { usePanelResize } from "./use-panel-resize";
 import { useToastNotifications } from "./useToastNotifications";
+import { Notice } from "./ui/patterns";
 import {
   AI_CONNECTION_HEARTBEAT_MS,
   aiAnalyzeConnectionReady,
@@ -464,6 +471,7 @@ import {
   showAssetDragPreview,
 } from "./asset-drag-preview";
 import { DimensionFilterBar } from "./DimensionFilterBar";
+import { buildTagFilterClauses, resolveTagFilterSets } from "./dimension-filter-selection";
 import {
   buildActiveFilterChips,
   type ClearableFilterId,
@@ -514,6 +522,11 @@ import type {
   TagSummary,
   TrashedFolderSummary,
 } from "../shared/asset-types";
+import { smartCollectionQueryDefinitionSchema } from "../shared/asset-types";
+import {
+  assetsRemainingAfterMembership,
+  type BrowseMembershipChange,
+} from "./browse-filter-membership";
 import type { FolderNavigationCover, LibraryNavigationSummary } from "../shared/library-navigation";
 import { LIBRARY_ROOT_FOLDER_ID, isLibraryRootFolderId } from "../shared/library-root-folder";
 import { DEFAULT_COLOR_SIMILARITY } from "../shared/color-filter-presets";
@@ -721,6 +734,7 @@ type RendererWindow = Window & {
     plugins?: SerpentPluginManagerApi;
     mcp?: SerpentMcpSettingsApi;
     e2e?: {
+      useNativeAssetDrag?: boolean;
       getRequestCount: (type: string) => number;
     };
   };
@@ -770,6 +784,7 @@ type QueryFilterSnapshot = {
   excludeFormatFilter: boolean;
   tagFilter: string;
   excludeTagFilter: boolean;
+  excludedTagFilter: string;
   includeAiTagFilter: boolean;
   tagFilterMatch: "any" | "all";
   ratingFilter: string;
@@ -884,6 +899,8 @@ function AppInner() {
   const t = useT();
   const { locale } = useLocale();
   const rawLibraryApi = (window as RendererWindow).serpent?.library;
+  const nativeAssetDragEnabled = !(window as RendererWindow).serpent?.e2e
+    || Boolean((window as RendererWindow).serpent?.e2e?.useNativeAssetDrag);
   const shellApi = (window as RendererWindow).serpent?.shell;
 
   useEffect(() => {
@@ -894,6 +911,7 @@ function AppInner() {
 
   // Library / folder / assets (existing)
   const [library, setLibrary] = useState<RendererLibrarySummary | null>(null);
+  const nativeDragReadyIds = useNativeDragReadyIds(rawLibraryApi, library?.libraryId);
   const libraryRef = useRef<RendererLibrarySummary | null>(null);
   libraryRef.current = library;
   const [recentLibraries, setRecentLibraries] = useState<
@@ -915,6 +933,9 @@ function AppInner() {
   const [findSimilarSource, setFindSimilarSource] = useState<FindSimilarSource | null>(null);
   const findSimilarTokenRef = useRef(0);
   const assetsRef = useRef<AssetSummary[]>([]);
+  const syncBrowseFilterMembershipRef = useRef<
+    (change: BrowseMembershipChange) => void
+  >(() => undefined);
   useEffect(() => {
     assetsRef.current = assets;
   }, [assets]);
@@ -962,6 +983,10 @@ function AppInner() {
   const [rootAssetCount, setRootAssetCount] = useState(0);
   const [selectedAssetId, setSelectedAssetId] = useState<string | undefined>();
   const [selectedAssetIds, setSelectedAssetIds] = useState<string[]>([]);
+  const selectedNativeDragReady = useMemo(
+    () => selectedAssetIds.every((id) => nativeDragReadyIds.has(id)),
+    [nativeDragReadyIds, selectedAssetIds],
+  );
   // Session persistence must wait until the startup restore has applied the
   // saved scope and selection; otherwise the initial empty React state can
   // overwrite the last browsed asset in localStorage.
@@ -1056,6 +1081,8 @@ function AppInner() {
     dismissToast,
     handleToastTransitionEnd,
   } = useToastNotifications();
+  const workerRecoveryStateRef = useRef<'ready' | 'recovering' | 'failed'>('ready');
+  const [workerRecoveryState, setWorkerRecoveryState] = useState<'ready' | 'recovering' | 'failed'>('ready');
   const topVisibleToastId = renderedToastStack.find(
     (entry) => !entry.closing,
   )?.id;
@@ -1401,6 +1428,7 @@ function AppInner() {
   const [excludeColorFilter, setExcludeColorFilter] = useState(false);
   const [tagFilter, setTagFilter] = useState("");
   const [excludeTagFilter, setExcludeTagFilter] = useState(false);
+  const [excludedTagFilter, setExcludedTagFilter] = useState("");
   const [includeAiTagFilter, setIncludeAiTagFilter] = useState(true);
   // Serpent-eaxs: tag-management AND search ("包含 N 个标签") splits the tag
   // names into separate clauses (clauses are ANDed; values within one clause
@@ -1460,6 +1488,7 @@ function AppInner() {
   const [shuffleSeed, setShuffleSeed] = useState<number | null>(null);
   const [searchOffset, setSearchOffset] = useState(0);
   const [searchTotal, setSearchTotal] = useState<number | null>(null);
+  const [filteredFolderCountRefreshToken, setFilteredFolderCountRefreshToken] = useState(0);
   const [searchSnippets, setSearchSnippets] = useState<Map<string, string>>(
     new Map(),
   );
@@ -1702,6 +1731,7 @@ function AppInner() {
     fetchScopeAssetIds: fetchBrowseScopeAssetIds,
     removeLocally: removeLocallyFromBrowse,
     applyGeometryPatches: applyBrowseGeometryPatches,
+    applyPreviewPatches: applyBrowsePreviewPatches,
     reset: resetBrowsePagination,
   } = browsePagination;
   function resetBrowsePaginationPreservingVisibleLayout() {
@@ -1713,6 +1743,8 @@ function AppInner() {
   }
   const applyBrowseGeometryPatchesRef = useRef(applyBrowseGeometryPatches);
   applyBrowseGeometryPatchesRef.current = applyBrowseGeometryPatches;
+  const applyBrowsePreviewPatchesRef = useRef(applyBrowsePreviewPatches);
+  applyBrowsePreviewPatchesRef.current = applyBrowsePreviewPatches;
 
   const {
     multiEdit,
@@ -1736,6 +1768,7 @@ function AppInner() {
     setTrashedAssets,
     setNotice,
     setError,
+    syncBrowseFilterMembershipRef,
   });
   // Serpent-c9r3: bridge the multi-edit rebuilder into the ai.content.cleared
   // event effect (whose deps intentionally exclude it) via a ref, matching the
@@ -2176,7 +2209,25 @@ function AppInner() {
   const [aiModel, setAiModel] = useState(DEFAULT_AI_MODELS[DEFAULT_AI_API_FORMAT]);
   const [aiBaseUrl, setAiBaseUrl] = useState("");
   const [aiApiKey, setAiApiKey] = useState("");
+  const [aiDraftHasKey, setAiDraftHasKey] = useState(false);
   const [aiHasKey, setAiHasKey] = useState(false);
+  const [aiProfiles, setAiProfiles] = useState<Array<{
+    id: string;
+    name: string;
+    apiFormat: AiApiFormat;
+    model: string;
+    baseUrl: string;
+    hasCredential: boolean;
+  }>>([]);
+  const [aiActiveProfileId, setAiActiveProfileId] = useState<string | null>(null);
+  const aiActiveProfileIdRef = useRef<string | null>(null);
+  const aiConnectionProbeGenerationRef = useRef(0);
+  const updateAiActiveProfileId = useCallback((profileId: string | null) => {
+    aiActiveProfileIdRef.current = profileId;
+    setAiActiveProfileId(profileId);
+  }, []);
+  const [aiProfileDraftId, setAiProfileDraftId] = useState<string | null>(null);
+  const [aiProfileName, setAiProfileName] = useState("");
   const [aiDescriptionEnabled, setAiDescriptionEnabled] = useState(true);
   const [aiTagsEnabled, setAiTagsEnabled] = useState(true);
   const [aiRatingEnabled, setAiRatingEnabled] = useState(true);
@@ -2194,9 +2245,9 @@ function AppInner() {
   const [aiDisclaimerAccepted, setAiDisclaimerAccepted] = useState(false);
   const [aiConnectionState, setAiConnectionState] =
     useState<AiConnectionState>("idle");
-  const [aiConnectionReason, setAiConnectionReason] = useState<
-    string | undefined
-  >(undefined);
+  const [aiDraftConnectionState, setAiDraftConnectionState] =
+    useState<AiConnectionState>("idle");
+  const [aiDraftConnectionReason, setAiDraftConnectionReason] = useState<string | undefined>(undefined);
   const [aiSaveVerifying, setAiSaveVerifying] = useState(false);
   /**
    * Whether the *stored* format still needs an API key. False for a keyless
@@ -2303,6 +2354,7 @@ function AppInner() {
     setTrashedAssets,
     setNotice,
     setError,
+    syncBrowseFilterMembershipRef,
   });
 
   const analyzingAssetIdRef = useRef<string | null>(null);
@@ -3313,6 +3365,7 @@ function AppInner() {
         excludeFormatFilter,
         tagFilter,
         excludeTagFilter,
+        excludedTagFilter,
         tagFilterMatch,
         ratingFilter,
         excludeRatingFilter,
@@ -3342,6 +3395,7 @@ function AppInner() {
       excludeFormatFilter,
       excludeRatingFilter,
       excludeTagFilter,
+      excludedTagFilter,
       favoriteFilter,
       formatFilter,
       heightRange,
@@ -3413,6 +3467,7 @@ function AppInner() {
       excludeFormatFilter,
       tagFilter,
       excludeTagFilter,
+      excludedTagFilter,
       includeAiTagFilter,
       ratingFilter,
       excludeRatingFilter,
@@ -3448,6 +3503,7 @@ function AppInner() {
     excludeFormatFilter,
     tagFilter,
     excludeTagFilter,
+    excludedTagFilter,
     includeAiTagFilter,
     ratingFilter,
     excludeRatingFilter,
@@ -3466,12 +3522,20 @@ function AppInner() {
 
   // CANVAS-022: folders-only (recursive off, zero direct assets) must not
   // mount an empty asset grid — its min-height:100% left a large void.
+  const filteredFolderCounts = useFilteredFolderCounts({
+    api,
+    libraryId: library?.libraryId,
+    filters: currentQueryDefinition({ searchValue: null }).filters,
+    showIgnored: showIgnoredItems,
+    enabled: !showTrash,
+    refreshToken: filteredFolderCountRefreshToken,
+  });
   const canvasFolderBrowseEntries = useMemo(() => {
-    if (!showTrash) return folderBrowseEntries;
+    if (!showTrash) return filteredFolderBrowseEntries(folderBrowseEntries, filteredFolderCounts);
     return trashedFoldersToBrowseEntries(
       filterTrashedFoldersAtTombstone(trashedFolders, trashBrowseTombstoneId),
     );
-  }, [folderBrowseEntries, showTrash, trashBrowseTombstoneId, trashedFolders]);
+  }, [folderBrowseEntries, filteredFolderCounts, showTrash, trashBrowseTombstoneId, trashedFolders]);
   const trashBreadcrumbHops = useMemo(
     () =>
       showTrash
@@ -3942,7 +4006,7 @@ function AppInner() {
     return {
       assetIds: report.trash.processAssetIds.filter((assetId) => {
         const asset = visibleById.get(assetId);
-        return !asset || asset.locationKind === "managed";
+        return canDeleteAssetFromDiskWithShortcut(asset);
       }),
       folderIds: [...report.trash.processFolderIds],
     };
@@ -4611,7 +4675,7 @@ function AppInner() {
         /** Navigation keeps sidebar data; mutations/library open opt in to refresh. */
         refreshSidebar?: boolean;
         /** Library replacement hydrates navigation before the new view is shown. */
-        navigationPriority?: "normal" | "library-switch";
+        navigationPriority?: "normal" | "library-switch" | "mutation";
         /** Keep the workspace covered until the complete navigation snapshot is ready. */
         blockingLibraryLoad?: boolean;
         /** A tab/history transition may be superseded independently of the library. */
@@ -4720,7 +4784,8 @@ function AppInner() {
               if (opts?.blockingLibraryLoad) return loadNavigationSummary();
               return deferNavigationHydration(loadNavigationSummary, {
                 signal: navigationHydrationAbort.signal,
-                immediate: opts?.navigationPriority === "library-switch",
+                immediate: opts?.navigationPriority === "library-switch"
+                  || opts?.navigationPriority === "mutation",
               });
             },
             () => undefined,
@@ -5012,6 +5077,28 @@ function AppInner() {
   useEffect(() => {
     if (!api) return;
     return api.onLifecycle((event) => {
+      if (event.type === 'worker.recovering') {
+        workerRecoveryStateRef.current = 'recovering';
+        setWorkerRecoveryState('recovering');
+        setWorkspaceNavigationPending(false);
+        return;
+      }
+      if (event.type === 'worker.failed') {
+        workerRecoveryStateRef.current = 'failed';
+        setWorkerRecoveryState('failed');
+        return;
+      }
+      if (event.type === 'worker.recovered') {
+        workerRecoveryStateRef.current = 'ready';
+        setWorkerRecoveryState('ready');
+        if (event.failedLibraryIds.length > 0) setError(t('toast.workerRestoreFailed'));
+        if (libraryRef.current && event.libraryIds.includes(libraryRef.current.libraryId)) {
+          void reloadCurrentContentRef.current().catch((caught) => {
+            setError(toMessage(caught, t('toast.readAssetsFailed'), locale));
+          });
+        }
+        return;
+      }
       if (event.type === "library.opening" && shouldDetachLibraryOnOpening(event)) {
         const applyLibraryOpening = async () => {
           // Clear the active library when the replacement starts. The old
@@ -5171,6 +5258,10 @@ function AppInner() {
       if (batch.size > 0) {
         setAssets((current) => applyAssetThumbnailPatches(current, batch));
         const geometryPatches = new Map<string, { width: number; height: number }>();
+        const previewPatches = new Map<string, {
+          previewKind: 'source' | null;
+          previewRevisionId: string | null;
+        }>();
         for (const [assetId, patch] of batch) {
           if (
             typeof patch.width === "number" &&
@@ -5183,9 +5274,43 @@ function AppInner() {
               height: patch.height,
             });
           }
+          if (
+            patch.previewKind !== undefined
+            && patch.previewRevisionId !== undefined
+          ) {
+            previewPatches.set(assetId, {
+              previewKind: patch.previewKind,
+              previewRevisionId: patch.previewRevisionId,
+            });
+          }
         }
         if (geometryPatches.size > 0) {
           applyBrowseGeometryPatchesRef.current(geometryPatches);
+          const measured: Array<{
+            assetId: string;
+            width: number;
+            height: number;
+            mediaType: AssetSummary["mediaType"];
+          }> = [];
+          for (const [assetId, size] of geometryPatches) {
+            const current = assetsRef.current.find((asset) => asset.assetId === assetId);
+            if (!current) continue;
+            measured.push({
+              assetId,
+              width: size.width,
+              height: size.height,
+              mediaType: current.mediaType,
+            });
+          }
+          if (measured.length > 0) {
+            syncBrowseFilterMembershipRef.current({
+              kind: "dimensions",
+              assets: measured,
+            });
+          }
+        }
+        if (previewPatches.size > 0) {
+          applyBrowsePreviewPatchesRef.current(previewPatches);
         }
       }
       if (pendingLayoutArtifactIds.size > 0) {
@@ -5245,10 +5370,24 @@ function AppInner() {
       const subscriptions = thumbnailSubscriptions();
       if (event.type === "asset.dimensions.ready") {
         if (!shouldProjectThumbnailCompletion(event.assetId, subscriptions)) return;
+        const currentAsset = assetsRef.current.find(
+          (asset) => asset.assetId === event.assetId,
+        );
+        if (
+          event.revisionId !== undefined
+          && currentAsset
+          && currentAsset.currentRevisionId !== event.revisionId
+        ) return;
         jobStatusCoordinatorRef.current?.noteActivity("media");
         queuePatch(event.assetId, {
           width: event.width,
           height: event.height,
+          ...(event.previewKind === undefined
+            ? {}
+            : { previewKind: event.previewKind }),
+          ...(event.previewRevisionId === undefined
+            ? {}
+            : { previewRevisionId: event.previewRevisionId }),
           ...(event.durationMs === undefined
             ? {}
             : { durationMs: event.durationMs }),
@@ -5422,6 +5561,7 @@ function AppInner() {
     });
     const unsubscribeCleared = api.onAiCleared((event) => {
       if (event.libraryId !== library.libraryId) return;
+      setFilteredFolderCountRefreshToken((token) => token + 1);
       jobStatusCoordinatorRef.current?.noteActivity("ai");
       setAiContent(null);
       setNotice(t("toast.aiContentCleared", { count: event.affectedAssetCount }));
@@ -5476,6 +5616,7 @@ function AppInner() {
         colorSimilarity,
         tagFilter,
         excludeTagFilter,
+        excludedTagFilter,
         includeAiTagFilter,
         tagFilterMatch,
         ratingFilter,
@@ -5687,6 +5828,7 @@ function AppInner() {
     setExcludeColorFilter(state.filters.excludeColorFilter);
     setTagFilter(state.filters.tagFilter);
     setExcludeTagFilter(state.filters.excludeTagFilter);
+    setExcludedTagFilter(state.filters.excludedTagFilter ?? "");
     setIncludeAiTagFilter(state.filters.includeAiTagFilter);
     setTagFilterMatch(state.filters.tagFilterMatch);
     setRatingFilter(state.filters.ratingFilter);
@@ -6406,6 +6548,7 @@ function AppInner() {
     setExcludeColorFilter(false);
     setTagFilter("");
     setExcludeTagFilter(false);
+    setExcludedTagFilter("");
     setIncludeAiTagFilter(true);
     setRatingFilter("");
     setExcludeRatingFilter(false);
@@ -6430,6 +6573,7 @@ function AppInner() {
     setExcludeColorFilter(false);
     setTagFilter("");
     setExcludeTagFilter(false);
+    setExcludedTagFilter("");
     setIncludeAiTagFilter(true);
     setRatingFilter("");
     setExcludeRatingFilter(false);
@@ -6462,6 +6606,7 @@ function AppInner() {
       case "tag":
         setTagFilter("");
         setExcludeTagFilter(false);
+        setExcludedTagFilter("");
         setActiveTagId(null);
         return;
       case "rating":
@@ -6859,6 +7004,8 @@ function AppInner() {
       const definition = currentQueryDefinition({
         tagFilter: joined,
         tagFilterMatch: match,
+        excludeTagFilter: false,
+        excludedTagFilter: "",
       });
       const includeIgnored =
         request.browseState?.showIgnoredItems ?? showIgnoredItems;
@@ -6885,6 +7032,8 @@ function AppInner() {
       setAssetScope("all");
       clearAssetSelection();
       setTagFilter(joined);
+      setExcludeTagFilter(false);
+      setExcludedTagFilter("");
       setTagFilterMatch(match);
       setSearchOffset(0);
       api.setActiveContext(targetLibraryId);
@@ -6937,7 +7086,11 @@ function AppInner() {
     try {
       const definition = request.browseState
         ? queryDefinitionForWorkspaceBrowseState(request.browseState)
-        : currentQueryDefinition({ tagFilter: tag.name });
+        : currentQueryDefinition({
+          tagFilter: tag.name,
+          excludeTagFilter: false,
+          excludedTagFilter: "",
+        });
       const includeIgnored =
         request.browseState?.showIgnoredItems ?? showIgnoredItems;
       const result = await api.openBrowseSession({
@@ -6968,6 +7121,8 @@ function AppInner() {
       clearAssetSelection();
       if (!request.browseState) {
         setTagFilter(tag.name);
+        setExcludeTagFilter(false);
+        setExcludedTagFilter("");
         setTagFilterMatch("any");
       }
       setSearchOffset(0);
@@ -7009,6 +7164,15 @@ function AppInner() {
       });
       if (!result.ok) throw new LibraryOperationError(result.error);
       await refreshTagAndMetadataState(assetId);
+      const tagName = tags.find((tag) => tag.tagId === tagId)?.name;
+      if (tagName) {
+        syncBrowseFilterMembershipRef.current({
+          kind: "tags",
+          assetIds: [assetId],
+          addedTagNames: [tagName],
+          removedTagNames: [],
+        });
+      }
       setNotice(t("toast.tagAdded"), result.value.historyEntryId);
     } catch (caught) {
       setError(toMessage(caught, t("toast.addTagFailed"), locale));
@@ -7026,6 +7190,15 @@ function AppInner() {
       });
       if (!result.ok) throw new LibraryOperationError(result.error);
       await refreshTagAndMetadataState(targetAssetId);
+      const tagName = tags.find((tag) => tag.tagId === tagId)?.name;
+      if (tagName) {
+        syncBrowseFilterMembershipRef.current({
+          kind: "tags",
+          assetIds: [targetAssetId],
+          addedTagNames: [],
+          removedTagNames: [tagName],
+        });
+      }
       setNotice(t("toast.tagRemoved"), result.value.historyEntryId);
     } catch (caught) {
       setError(toMessage(caught, t("toast.removeTagFailed"), locale));
@@ -7048,6 +7221,12 @@ function AppInner() {
       });
       if (!assignResult.ok) throw new LibraryOperationError(assignResult.error);
       await refreshTagAndMetadataState(targetAssetId);
+      syncBrowseFilterMembershipRef.current({
+        kind: "tags",
+        assetIds: [targetAssetId],
+        addedTagNames: [tagName.trim()],
+        removedTagNames: [],
+      });
       setNotice(
         t("toast.tagCreatedAssigned", { name: tagName.trim() }),
         assignResult.value.historyEntryId,
@@ -7714,6 +7893,8 @@ function AppInner() {
     overrides: {
       tagFilter?: string;
       tagFilterMatch?: "any" | "all";
+      excludeTagFilter?: boolean;
+      excludedTagFilter?: string;
       searchValue?: string | null;
       colorFilter?: string | null;
       excludeColorFilter?: boolean;
@@ -7728,6 +7909,7 @@ function AppInner() {
       excludeFormatFilter,
       tagFilter,
       excludeTagFilter,
+      excludedTagFilter,
       includeAiTagFilter,
       tagFilterMatch,
       ratingFilter,
@@ -7750,10 +7932,6 @@ function AppInner() {
       .map((value) => value.trim().replace(/^\./, ""))
       .filter(Boolean);
     const formatValues = compactFormatFilterTokens(formatTokens);
-    const selectedTags = (overrides.tagFilter ?? filtersState.tagFilter)
-      .split(",")
-      .map((value) => value.trim())
-      .filter(Boolean);
     const ratings = filtersState.ratingFilter
       .split(",")
       .map((value) => value.trim())
@@ -7778,30 +7956,15 @@ function AppInner() {
         values: formatValues,
         exclude: filtersState.excludeFormatFilter,
       });
-    if (selectedTags.length > 0) {
-      const matchAll =
-        (overrides.tagFilterMatch ?? filtersState.tagFilterMatch) === "all" &&
-        selectedTags.length > 1;
-      // AND semantics ("包含 N 个标签"): one clause per tag — separate
-      // clauses are ANDed, values within a clause are ORed.
-      if (matchAll) {
-        for (const tag of selectedTags) {
-          filters.push({
-            field: "tag",
-            values: [tag],
-            exclude: filtersState.excludeTagFilter,
-            includeAi: filtersState.includeAiTagFilter,
-          });
-        }
-      } else {
-        filters.push({
-          field: "tag",
-          values: selectedTags,
-          exclude: filtersState.excludeTagFilter,
-          includeAi: filtersState.includeAiTagFilter,
-        });
-      }
-    }
+    filters.push(...buildTagFilterClauses(
+      resolveTagFilterSets({
+        tagFilter: overrides.tagFilter ?? filtersState.tagFilter,
+        excludeTagFilter: overrides.excludeTagFilter ?? filtersState.excludeTagFilter,
+        excludedTagFilter: overrides.excludedTagFilter ?? filtersState.excludedTagFilter,
+      }),
+      overrides.tagFilterMatch ?? filtersState.tagFilterMatch,
+      filtersState.includeAiTagFilter,
+    ));
     if (ratings.length > 0)
       filters.push({
         field: "rating",
@@ -7908,6 +8071,7 @@ function AppInner() {
         excludeFormatFilter: state.filters.excludeFormatFilter,
         tagFilter: state.filters.tagFilter,
         excludeTagFilter: state.filters.excludeTagFilter,
+        excludedTagFilter: state.filters.excludedTagFilter ?? "",
         includeAiTagFilter: state.filters.includeAiTagFilter,
         tagFilterMatch: state.filters.tagFilterMatch,
         ratingFilter: state.filters.ratingFilter,
@@ -7992,8 +8156,11 @@ function AppInner() {
   async function reloadCurrentContent(options?: {
     /** Wait for the navigation snapshot before resolving the operation. */
     blockingNavigation?: boolean;
+    /** Folder mutations must publish sidebar changes without the browse idle delay. */
+    navigationPriority?: "mutation";
   }) {
     if (!library) return;
+    if (!showTrash) setFilteredFolderCountRefreshToken((token) => token + 1);
     if (activeSmartCollectionId) {
       await chooseSmartCollection(activeSmartCollectionId);
       return;
@@ -8015,6 +8182,7 @@ function AppInner() {
       discovery,
       searchScope: currentSearchScope(discovery.search !== undefined),
       blockingLibraryLoad: options?.blockingNavigation,
+      navigationPriority: options?.navigationPriority,
     });
   }
 
@@ -8299,6 +8467,93 @@ function AppInner() {
     reloadCurrentContentRef.current = reloadCurrentContent;
   });
 
+  function visibleBrowseFilters(): FilterClause[] | null {
+    if (activeSmartCollectionId) {
+      const found = smartCollections.find(
+        (collection) => collection.collectionId === activeSmartCollectionId,
+      );
+      if (!found) return null;
+      try {
+        const parsed = smartCollectionQueryDefinitionSchema.parse(
+          JSON.parse(found.queryDefinition),
+        );
+        return parsed.filters ?? [];
+      } catch {
+        return null;
+      }
+    }
+    const activeTagName = activeTagId
+      ? tags.find((tag) => tag.tagId === activeTagId)?.name
+      : undefined;
+    const definition = activeTagName
+      ? currentQueryDefinition({ tagFilter: activeTagName })
+      : currentQueryDefinition();
+    return definition.filters ?? [];
+  }
+
+  function scheduleFilteredBrowseReconcile(delayMs: number): void {
+    const operationLibraryId = libraryRef.current?.libraryId;
+    if (deferredReconcileTimerRef.current !== undefined) {
+      window.clearTimeout(deferredReconcileTimerRef.current);
+    }
+    deferredReconcileTimerRef.current = window.setTimeout(() => {
+      deferredReconcileTimerRef.current = undefined;
+      if (
+        operationLibraryId !== undefined
+        && libraryRef.current?.libraryId !== operationLibraryId
+      ) return;
+      const canvas = workspaceCanvasRef.current;
+      const scrollTopBefore = canvas?.scrollTop ?? 0;
+      void reloadCurrentContentRef.current()
+        .catch(() => undefined)
+        .finally(() => {
+          if (
+            operationLibraryId !== undefined
+            && libraryRef.current?.libraryId !== operationLibraryId
+          ) return;
+          const nextCanvas = workspaceCanvasRef.current;
+          if (nextCanvas && nextCanvas.scrollTop !== scrollTopBefore) {
+            nextCanvas.scrollTo({ top: scrollTopBefore });
+          }
+        });
+    }, delayMs);
+  }
+
+  function dropAssetsFromFilteredBrowse(assetIds: readonly string[]): void {
+    const removed = new Set(assetIds);
+    const visible = showTrash ? trashedAssets : assets;
+    const removedCount = visible.filter((asset) => removed.has(asset.assetId)).length;
+    if (removedCount === 0) return;
+    if (showTrash) {
+      setTrashedAssets((current) => removeAssetIdsLocally(current, removed));
+    } else {
+      setAssets((current) => removeAssetIdsLocally(current, removed));
+    }
+    setSearchTotal((current) => decrementScopeCount(current, removedCount));
+    removeLocallyFromBrowse([...assetIds], removedCount);
+    scheduleFilteredBrowseReconcile(1500);
+  }
+
+  function syncBrowseFilterMembership(change: BrowseMembershipChange): void {
+    if (change.kind === "dimensions" && showTrash) return;
+    if (!showTrash && (visibleBrowseFilters()?.length ?? 0) > 0) {
+      setFilteredFolderCountRefreshToken((token) => token + 1);
+    }
+    const visible = showTrash ? trashedAssets : assets;
+    const next = assetsRemainingAfterMembership(visible, visibleBrowseFilters(), change);
+    if (next.assets.length < visible.length) {
+      const kept = new Set(next.assets.map((asset) => asset.assetId));
+      dropAssetsFromFilteredBrowse(
+        visible
+          .filter((asset) => !kept.has(asset.assetId))
+          .map((asset) => asset.assetId),
+      );
+      return;
+    }
+    if (next.reload) scheduleFilteredBrowseReconcile(0);
+  }
+  syncBrowseFilterMembershipRef.current = syncBrowseFilterMembership;
+
   async function refreshAfterAutomationScript() {
     try {
       // A script may issue hundreds of write commands. Refresh once after the
@@ -8339,6 +8594,16 @@ function AppInner() {
     clearAssetSelection,
     activeTagId,
     activeCollectionId,
+    onTagsChanged: (action, tagId, assetIds) => {
+      const tagName = tags.find((tag) => tag.tagId === tagId)?.name;
+      if (!tagName) return;
+      syncBrowseFilterMembershipRef.current({
+        kind: "tags",
+        assetIds,
+        addedTagNames: action === "assign" ? [tagName] : [],
+        removedTagNames: action === "remove" ? [tagName] : [],
+      });
+    },
   });
 
   const removeDeletedManagedFoldersFromSidebar = useCallback(
@@ -8839,6 +9104,9 @@ function AppInner() {
     copyFolder: (folderId) => {
       void handleCopyFolder(folderId);
     },
+    copyFolderPath: (folderId) => {
+      void handleCopyFolderPath(folderId);
+    },
     pasteIntoFolder: (folderId) => {
       dispatchClipboardPaste(folderId);
     },
@@ -9112,7 +9380,7 @@ function AppInner() {
       setNotice(null);
     } catch (caught) {
       if (request.isCurrent()) {
-        setError(toMessage(caught, t("toast.searchFailed"), locale));
+        if (workerRecoveryStateRef.current === 'ready') setError(toMessage(caught, t("toast.searchFailed"), locale));
         if (!silent) setWorkspaceNavigationPending(false);
       }
     } finally {
@@ -9196,7 +9464,7 @@ function AppInner() {
         onPreparing: () => setNotice(t("settings.semanticSearch.similarPreparing")),
       });
     } catch (caught) {
-      if (polling()) setError(toMessage(caught, t("toast.searchFailed"), locale));
+      if (polling() && workerRecoveryStateRef.current === 'ready') setError(toMessage(caught, t("toast.searchFailed"), locale));
       return;
     }
     if (!page || !polling()) return;
@@ -9246,7 +9514,7 @@ function AppInner() {
       }
     } catch (caught) {
       if (request.isCurrent()) {
-        setError(toMessage(caught, t("toast.searchFailed"), locale));
+        if (workerRecoveryStateRef.current === 'ready') setError(toMessage(caught, t("toast.searchFailed"), locale));
         if (!navigation) setWorkspaceNavigationPending(false);
       }
     } finally {
@@ -9259,6 +9527,7 @@ function AppInner() {
     opts?: { silent?: boolean },
   ) {
     event?.preventDefault();
+    if (workerRecoveryStateRef.current !== 'ready') return;
     if (event) {
       searchHistoryDismissedUntilInputRef.current = true;
       setSearchHistoryOpen(false);
@@ -9282,7 +9551,7 @@ function AppInner() {
           deferReveal: true,
         });
       } catch (caught) {
-        setError(toMessage(caught, t("toast.searchFailed"), locale));
+        if (workerRecoveryStateRef.current === 'ready') setError(toMessage(caught, t("toast.searchFailed"), locale));
       } finally {
         setUiState("ready");
       }
@@ -9308,7 +9577,7 @@ function AppInner() {
       }
     } catch (caught) {
       if (request.isCurrent()) {
-        setError(toMessage(caught, t("toast.searchFailed"), locale));
+        if (workerRecoveryStateRef.current === 'ready') setError(toMessage(caught, t("toast.searchFailed"), locale));
         setWorkspaceNavigationPending(false);
       }
     } finally {
@@ -9390,6 +9659,7 @@ function AppInner() {
     excludeFormatFilter,
     tagFilter,
     excludeTagFilter,
+    excludedTagFilter,
     includeAiTagFilter,
     ratingFilter,
     excludeRatingFilter,
@@ -12130,6 +12400,20 @@ function AppInner() {
     else void closeAssetPreview();
   }
 
+  useWorkspaceTabShortcuts({
+    enabled: Boolean(library),
+    platform: SHORTCUT_PLATFORM,
+    busy,
+    tabCount: workspaceTabsState.tabs.length,
+    previewOpen: Boolean(previewAsset),
+    onNewTab: () => {
+      void addWorkspaceTab();
+    },
+    onCloseTab: () => {
+      void closeWorkspaceTab(workspaceTabsState.activeTabId);
+    },
+  });
+
   useBrowseCommandKeyboard({
     enabled: Boolean(library) && !showTagManagement && !showPluginSidebarView,
     platform: SHORTCUT_PLATFORM,
@@ -12507,45 +12791,58 @@ function AppInner() {
 
   async function loadAiConfig() {
     if (!api) return;
-    const result = await api.getAiConfig();
-    if (!result.ok) return;
-    setAiApiFormat(
-      (result.value.apiFormat as AiApiFormat) ?? DEFAULT_AI_API_FORMAT,
-    );
-    setAiModel(result.value.model ?? DEFAULT_AI_MODELS[DEFAULT_AI_API_FORMAT]);
-    setAiBaseUrl(result.value.baseUrl ?? "");
-    setAiHasKey(result.value.hasKey);
-    // Keyless local runtimes never store a key, so the stored format — not
-    // `hasKey` — decides whether the heartbeat and analyze affordance run.
-    setAiRequiresApiKey(result.value.requiresApiKey ?? true);
-    setAiDescriptionEnabled(result.value.enabledFields.description);
-    setAiTagsEnabled(result.value.enabledFields.tags);
-    setAiRatingEnabled(result.value.enabledFields.rating);
-    setAiForceExistingTags(result.value.analysisSettings.forceExistingTags);
-    setAiAnalysisSettings(
-      toWireAiAnalysisSettings(
-        normalizeAiAnalysisSettings(result.value.analysisSettings),
-      ),
-    );
-    const langs = result.value.languages as
-      | Array<"zh-CN" | "en" | "ja" | "ko">
-      | undefined;
-    setAiLanguages(langs?.length ? [langs[0]!] : ["zh-CN"]);
-    setAiConcurrencyLimit(result.value.concurrencyLimit);
-    setAiMaxAnalysisImageEdgePx(result.value.maxAnalysisImageEdgePx);
-    setAiAutoAnalyzeEnabled(result.value.autoAnalyzeEnabled);
-    setAiDisclaimerAccepted(result.value.disclaimerAccepted);
-    aiVerifiedFingerprintRef.current = null;
+    try {
+      const result = await api.getAiConfig();
+      if (!result.ok) {
+        setError(toMessage(result.error, t("toast.aiConfigLoadFailed"), locale));
+        return;
+      }
+      setAiProfiles(result.value.profiles);
+      updateAiActiveProfileId(result.value.activeProfileId);
+      setAiProfileDraftId(result.value.activeProfileId);
+      setAiProfileName(
+        result.value.profiles.find((profile) => profile.id === result.value.activeProfileId)?.name ?? "",
+      );
+      setAiApiFormat(
+        (result.value.apiFormat as AiApiFormat) ?? DEFAULT_AI_API_FORMAT,
+      );
+      setAiModel(result.value.model ?? DEFAULT_AI_MODELS[DEFAULT_AI_API_FORMAT]);
+      setAiBaseUrl(result.value.baseUrl ?? "");
+      setAiHasKey(result.value.hasKey);
+      setAiRequiresApiKey(result.value.requiresApiKey);
+      setAiDraftHasKey(result.value.hasKey);
+      setAiDraftConnectionState(
+        result.value.hasKey || !result.value.requiresApiKey ? "idle" : "disconnected",
+      );
+      setAiDraftConnectionReason(undefined);
+      setAiDescriptionEnabled(result.value.enabledFields.description);
+      setAiTagsEnabled(result.value.enabledFields.tags);
+      setAiRatingEnabled(result.value.enabledFields.rating);
+      setAiForceExistingTags(result.value.analysisSettings.forceExistingTags);
+      setAiAnalysisSettings(
+        toWireAiAnalysisSettings(
+          normalizeAiAnalysisSettings(result.value.analysisSettings),
+        ),
+      );
+      const langs = result.value.languages as
+        | Array<"zh-CN" | "en" | "ja" | "ko">
+        | undefined;
+      setAiLanguages(langs?.length ? [langs[0]!] : ["zh-CN"]);
+      setAiConcurrencyLimit(result.value.concurrencyLimit);
+      setAiMaxAnalysisImageEdgePx(result.value.maxAnalysisImageEdgePx);
+      setAiAutoAnalyzeEnabled(result.value.autoAnalyzeEnabled);
+      setAiDisclaimerAccepted(result.value.disclaimerAccepted);
+      aiVerifiedFingerprintRef.current = null;
+    } catch (caught) {
+      setError(toMessage(caught, t("toast.aiConfigLoadFailed"), locale));
+    }
   }
 
-  function aiCredentialFingerprint(): string {
-    return [
-      aiApiFormat,
-      aiModel.trim(),
-      aiBaseUrl.trim(),
-      aiApiKey.trim() || (aiHasKey ? "__stored__" : ""),
-    ].join("\u0001");
-  }
+  const matchingDraftAiProfileId = useCallback((): string | undefined => {
+    const profile = aiProfiles.find((item) => item.id === aiProfileDraftId);
+    return profile && (profile.hasCredential || !aiApiFormatRequiresApiKey(profile.apiFormat))
+      ? profile.id : undefined;
+  }, [aiProfileDraftId, aiProfiles]);
 
   /**
    * Stored-config readiness. A keyless local runtime is ready with an empty
@@ -12558,30 +12855,42 @@ function AppInner() {
     success: boolean;
     reason?: string;
   }> => {
+    const selectedProfile = aiProfiles.find((profile) => profile.id === aiProfileDraftId);
+    const testsActiveStoredProfile = !aiApiKey.trim()
+      && aiProfileDraftId !== null
+      && aiProfileDraftId === aiActiveProfileId
+      && selectedProfile !== undefined
+      && (selectedProfile.hasCredential || !aiApiFormatRequiresApiKey(selectedProfile.apiFormat))
+      && selectedProfile.apiFormat === aiApiFormat
+      && selectedProfile.model === aiModel.trim()
+      && selectedProfile.baseUrl === aiBaseUrl.trim();
     if (!api) return { success: false, reason: t("aiConfig.testFailed") };
-    if (
-      !aiApiKey.trim() &&
-      !aiHasKey &&
-      aiApiFormatRequiresApiKey(aiApiFormat)
-    ) {
-      setAiConnectionState("disconnected");
-      setAiConnectionReason(t("aiConfig.testFailed"));
+    if (!aiApiKey.trim() && !aiDraftHasKey && aiApiFormatRequiresApiKey(aiApiFormat)) {
+      setAiDraftConnectionState("disconnected");
+      setAiDraftConnectionReason(t("aiConfig.testFailed"));
       aiVerifiedFingerprintRef.current = null;
       return { success: false, reason: t("aiConfig.testFailed") };
     }
-    setAiConnectionState("connecting");
-    setAiConnectionReason(undefined);
+    setAiDraftConnectionState("connecting");
+    setAiDraftConnectionReason(undefined);
+    if (testsActiveStoredProfile) {
+      setAiConnectionState("connecting");
+    }
+    const storedProfileId = aiApiKey.trim()
+      ? undefined
+      : matchingDraftAiProfileId();
     const fingerprint = [
       aiApiFormat,
       aiModel.trim(),
       aiBaseUrl.trim(),
-      aiApiKey.trim() || (aiHasKey ? "__stored__" : ""),
+      aiApiKey.trim() || (aiDraftHasKey ? "__stored__" : ""),
     ].join("\u0001");
     const result = await api.testAiConnection({
       apiFormat: aiApiFormat,
       model: aiModel.trim(),
       ...(aiApiKey.trim() ? { apiKey: aiApiKey.trim() } : {}),
       baseUrl: aiBaseUrl.trim() || undefined,
+      ...(storedProfileId ? { profileId: storedProfileId } : {}),
     });
     if (!result.ok) {
       const reason = toMessage(
@@ -12589,36 +12898,54 @@ function AppInner() {
         t("aiConfig.testFailed"),
         locale,
       );
-      setAiConnectionState("error");
-      setAiConnectionReason(reason);
+      setAiDraftConnectionState("error");
+      setAiDraftConnectionReason(reason);
+      if (testsActiveStoredProfile) {
+        setAiConnectionState("error");
+      }
       aiVerifiedFingerprintRef.current = null;
       return { success: false, reason };
     }
     if (result.value.success) {
-      setAiConnectionState("connected");
-      setAiConnectionReason(undefined);
+      setAiDraftConnectionState("connected");
+      setAiDraftConnectionReason(undefined);
+      if (testsActiveStoredProfile) {
+        setAiConnectionState("connected");
+      }
       aiVerifiedFingerprintRef.current = fingerprint;
-      // Only a stored key makes a cloud profile ready. A typed key is not on
-      // disk until save, and a keyless local profile never stores one — a
-      // successful probe must not be mistaken for a stored credential.
-      if (!aiHasKey) {
+      // Typed key is not on disk until save — only mark ready when stored.
+      if (aiDraftHasKey) {
+        setAiDraftHasKey(true);
+        if (aiProfileDraftId === aiActiveProfileId) setAiHasKey(true);
+      } else if (aiApiFormatRequiresApiKey(aiApiFormat)) {
+        // Probe OK with unsaved key: refresh from disk (still false until save).
         void api.getAiConfig().then((cfg) => {
-          if (cfg.ok) setAiHasKey(cfg.value.hasKey);
+          if (cfg.ok) {
+            setAiHasKey(cfg.value.hasKey);
+            setAiRequiresApiKey(cfg.value.requiresApiKey);
+          }
         });
       }
       return { success: true };
     }
     const reason = result.value.reason ?? t("aiConfig.testFailed");
-    setAiConnectionState("error");
-    setAiConnectionReason(reason);
+    setAiDraftConnectionState("error");
+    setAiDraftConnectionReason(reason);
+    if (testsActiveStoredProfile) {
+      setAiConnectionState("error");
+    }
     aiVerifiedFingerprintRef.current = null;
     return { success: false, reason };
   }, [
     aiApiFormat,
     aiApiKey,
-    aiBaseUrl,
-    aiHasKey,
+    aiActiveProfileId,
     aiModel,
+    aiBaseUrl,
+    aiDraftHasKey,
+    aiProfiles,
+    aiProfileDraftId,
+    matchingDraftAiProfileId,
     api,
     locale,
     t,
@@ -12645,23 +12972,7 @@ function AppInner() {
     } = options;
     if (!api) return false;
     const draft = aiConfigPersistDraftRef.current;
-    // A keyless local endpoint saves without a credential; every other format
-    // still needs a typed or previously stored key.
-    if (
-      !draft.apiKey.trim() &&
-      !draft.hasKey &&
-      aiApiFormatRequiresApiKey(draft.apiFormat)
-    ) {
-      if (showNotice) {
-        setError(t("toast.aiConfigSaveFailed"));
-      }
-      return false;
-    }
     const result = await api.setAiConfig({
-      apiFormat: draft.apiFormat,
-      model: draft.model,
-      baseUrl: draft.baseUrl.trim(),
-      ...(draft.apiKey.trim() ? { apiKey: draft.apiKey.trim() } : {}),
       enabledFields: {
         description: draft.descriptionEnabled,
         tags: draft.tagsEnabled,
@@ -12684,17 +12995,12 @@ function AppInner() {
       }
       return false;
     }
-    setAiHasKey(Boolean(draft.apiKey.trim()) || draft.hasKey);
-    setAiRequiresApiKey(aiApiFormatRequiresApiKey(draft.apiFormat));
     if (clearApiKeyDraft) setAiApiKey("");
     if (showNotice) setNotice(t("toast.aiConfigSaved"));
     if (verifyConnection) {
       setAiSaveVerifying(true);
       try {
-        const connection = await testAiConnectionFromDialog();
-        if (connection.success) {
-          setAiConnectionReason(undefined);
-        }
+        await testAiConnectionFromDialog();
       } finally {
         setAiSaveVerifying(false);
       }
@@ -12724,24 +13030,127 @@ function AppInner() {
   }
 
   async function saveAiConfig() {
-    if (!api || (!aiApiKey.trim() && !aiHasKey && aiApiFormatRequiresApiKey(aiApiFormat))) {
+    if (!api || !aiModel.trim()) return;
+    const apiKey = aiApiKey.trim();
+    const profileName = aiProfileName.trim() || t("aiConfig.newProfileName");
+    const savedProfile = await api.saveAiProfile({
+      ...(aiProfileDraftId ? { id: aiProfileDraftId } : {}),
+      name: profileName,
+      apiFormat: aiApiFormat,
+      model: aiModel.trim(),
+      baseUrl: aiBaseUrl.trim(),
+      ...(apiKey ? { apiKey } : {}),
+    });
+    if (!savedProfile.ok) {
+      setError(toMessage(savedProfile.error, t("toast.aiConfigSaveFailed"), locale));
       return;
     }
-    const alreadyVerified =
-      aiVerifiedFingerprintRef.current === aiCredentialFingerprint() &&
-      aiConnectionState === "connected";
-    const ok = await persistAiConfig(
-      {},
-      {
-        showNotice: true,
-        clearApiKeyDraft: true,
-        verifyConnection: !alreadyVerified,
-      },
-    );
-    if (!ok) return;
-    if (alreadyVerified) {
-      setAiConnectionReason(undefined);
-      setAiSaveVerifying(false);
+    setAiProfileDraftId(savedProfile.value.id);
+    setAiProfileName(profileName);
+    setAiApiKey("");
+    setAiDraftHasKey(aiDraftHasKey || Boolean(apiKey));
+    if (savedProfile.value.id === aiActiveProfileId) {
+      setAiHasKey(aiDraftHasKey || Boolean(apiKey));
+    }
+    setAiDraftConnectionState("idle");
+    setAiDraftConnectionReason(undefined);
+    aiVerifiedFingerprintRef.current = null;
+    setNotice(t("toast.aiConfigSaved"));
+    if (savedProfile.value.id === aiActiveProfileId) {
+      setAiConnectionState("idle");
+      aiAutoConnectAttemptedRef.current = false;
+    }
+
+    const refreshed = await api.getAiConfig();
+    if (refreshed.ok) {
+      setAiProfiles(refreshed.value.profiles);
+      updateAiActiveProfileId(refreshed.value.activeProfileId);
+      setAiHasKey(refreshed.value.hasKey);
+      setAiRequiresApiKey(refreshed.value.requiresApiKey);
+      const saved = refreshed.value.profiles.find((profile) => profile.id === savedProfile.value.id);
+      if (saved) setAiDraftHasKey(saved.hasCredential);
+    }
+  }
+
+  function beginNewAiProfile() {
+    setAiProfileDraftId(null);
+    setAiProfileName(t("aiConfig.newProfileName"));
+    setAiApiKey("");
+    setAiDraftHasKey(false);
+    setAiDraftConnectionState("disconnected");
+    setAiDraftConnectionReason(undefined);
+    aiVerifiedFingerprintRef.current = null;
+  }
+
+  function selectAiProfile(id: string) {
+    if (!id) {
+      beginNewAiProfile();
+      return;
+    }
+    const profile = aiProfiles.find((item) => item.id === id);
+    if (!profile) return;
+    setAiProfileDraftId(profile.id);
+    setAiProfileName(profile.name);
+    setAiApiFormat(profile.apiFormat);
+    setAiModel(profile.model);
+    setAiBaseUrl(profile.baseUrl);
+    setAiApiKey("");
+    setAiDraftHasKey(profile.hasCredential);
+    setAiDraftConnectionState("idle");
+    setAiDraftConnectionReason(undefined);
+    aiVerifiedFingerprintRef.current = null;
+  }
+
+  async function activateAiProfile(id: string) {
+    if (!api) return;
+    const result = await api.activateAiProfile({ id });
+    if (!result.ok) {
+      setError(toMessage(result.error, t("toast.aiConfigSaveFailed"), locale));
+      return;
+    }
+    setAiApiKey("");
+    setAiConnectionState("idle");
+    aiAutoConnectAttemptedRef.current = false;
+    await loadAiConfig();
+  }
+
+  async function removeAiProfile(id: string) {
+    if (!api) return;
+    if (!(await requestConfirmation(t("aiConfig.deleteProfileConfirm"), true))) return;
+    const result = await api.deleteAiProfile({ id });
+    if (!result.ok) {
+      setError(toMessage(result.error, t("toast.aiConfigSaveFailed"), locale));
+      return;
+    }
+    setAiApiKey("");
+    await loadAiConfig();
+  }
+
+  async function clearAiProfileCredential() {
+    if (!api || !aiProfileDraftId) return;
+    if (!(await requestConfirmation(t("aiConfig.clearApiKeyConfirm"), true))) return;
+    const result = await api.saveAiProfile({
+      id: aiProfileDraftId,
+      name: aiProfileName.trim(),
+      apiFormat: aiApiFormat,
+      model: aiModel.trim(),
+      baseUrl: aiBaseUrl.trim(),
+      clearCredential: true,
+    });
+    if (!result.ok) {
+      setError(toMessage(result.error, t("toast.aiConfigSaveFailed"), locale));
+      return;
+    }
+    setAiApiKey("");
+    setAiDraftHasKey(false);
+    setAiDraftConnectionState("disconnected");
+    setAiDraftConnectionReason(undefined);
+    const refreshed = await api.getAiConfig();
+    if (refreshed.ok) {
+      setAiProfiles(refreshed.value.profiles);
+      updateAiActiveProfileId(refreshed.value.activeProfileId);
+      setAiHasKey(refreshed.value.hasKey);
+      setAiRequiresApiKey(refreshed.value.requiresApiKey);
     }
   }
 
@@ -12752,13 +13161,16 @@ function AppInner() {
       aiAutoConnectAttemptedRef.current = false;
       return;
     }
-    if (!aiCredentialsReady || aiAutoConnectAttemptedRef.current) return;
+    if (!aiCredentialsReady || aiAutoConnectAttemptedRef.current
+      || aiProfileDraftId !== aiActiveProfileId) return;
     aiAutoConnectAttemptedRef.current = true;
     void testAiConnectionFromDialog();
   }, [
     appSettingsOpen,
     appSettingsCategory,
     aiCredentialsReady,
+    aiActiveProfileId,
+    aiProfileDraftId,
     testAiConnectionFromDialog,
   ]);
 
@@ -12778,10 +13190,17 @@ function AppInner() {
   }, [librarySettingsOpen, api, library]);
 
   const probeStoredAiConnection = useCallback(async () => {
+    const generation = ++aiConnectionProbeGenerationRef.current;
+    const capturedProfileId = aiActiveProfileId;
+    const isCurrentProbe = () => isCurrentAiConnectionProbe({
+      capturedGeneration: generation,
+      latestGeneration: aiConnectionProbeGenerationRef.current,
+      capturedProfileId,
+      activeProfileId: aiActiveProfileIdRef.current,
+    });
     if (!api) return;
     if (!shouldRunAiConnectionHeartbeat(aiCredentialsReady)) {
       setAiConnectionState("disconnected");
-      setAiConnectionReason(undefined);
       aiVerifiedFingerprintRef.current = null;
       return;
     }
@@ -12789,37 +13208,28 @@ function AppInner() {
       prev === "connected" || prev === "connecting" ? prev : "connecting",
     );
     const cfg = await api.getAiConfig();
-    // The stored format decides readiness, not the key file: a keyless local
-    // runtime is configured with no key at all.
-    const storedReady =
-      cfg.ok && (cfg.value.hasKey || cfg.value.requiresApiKey === false);
-    if (
-      !cfg.ok ||
-      !storedReady ||
-      !cfg.value.apiFormat ||
-      !cfg.value.model
-    ) {
+    if (!isCurrentProbe()) return;
+    if (!cfg.ok || (!cfg.value.hasKey && cfg.value.requiresApiKey)
+      || !cfg.value.apiFormat || !cfg.value.model) {
       setAiConnectionState("disconnected");
-      setAiConnectionReason(t("aiConfig.testFailed"));
       aiVerifiedFingerprintRef.current = null;
       return;
     }
+    if (cfg.value.activeProfileId !== capturedProfileId) return;
     const result = await api.testAiConnection({
       apiFormat: cfg.value.apiFormat,
       model: cfg.value.model,
       baseUrl: cfg.value.baseUrl.trim() || undefined,
+      ...(capturedProfileId ? { profileId: capturedProfileId } : {}),
     });
+    if (!isCurrentProbe()) return;
     if (!result.ok) {
       setAiConnectionState("error");
-      setAiConnectionReason(
-        toMessage(result.error, t("aiConfig.testFailed"), locale),
-      );
       aiVerifiedFingerprintRef.current = null;
       return;
     }
     if (result.value.success) {
       setAiConnectionState("connected");
-      setAiConnectionReason(undefined);
       aiVerifiedFingerprintRef.current = [
         cfg.value.apiFormat,
         cfg.value.model.trim(),
@@ -12829,9 +13239,8 @@ function AppInner() {
       return;
     }
     setAiConnectionState("error");
-    setAiConnectionReason(result.value.reason ?? t("aiConfig.testFailed"));
     aiVerifiedFingerprintRef.current = null;
-  }, [api, aiCredentialsReady, locale, t]);
+  }, [api, aiActiveProfileId, aiCredentialsReady]);
 
   useEffect(() => {
     if (!shouldRunAiConnectionHeartbeat(aiCredentialsReady)) {
@@ -12860,10 +13269,17 @@ function AppInner() {
     reason?: string;
   }> {
     if (!api) return { models: [], reason: t("aiConfig.fetchModelsFailed") };
+    if (!aiApiKey.trim() && !aiDraftHasKey && aiApiFormatRequiresApiKey(aiApiFormat)) {
+      return { models: [], reason: t("aiConfig.fetchModelsFailed") };
+    }
+    const storedProfileId = aiApiKey.trim()
+      ? undefined
+      : matchingDraftAiProfileId();
     const result = await api.listAiModels({
       apiFormat: aiApiFormat,
       ...(aiApiKey.trim() ? { apiKey: aiApiKey.trim() } : {}),
       baseUrl: aiBaseUrl.trim() || undefined,
+      ...(storedProfileId ? { profileId: storedProfileId } : {}),
     });
     if (!result.ok) {
       return {
@@ -13699,10 +14115,12 @@ function AppInner() {
   const searchActive = searchValue.trim() !== "";
   const folderRowEntries =
     !showTrash && searchActive && searchFolderResults.length > 0
-      ? searchFolderRealKey === searchFolderMatchKey &&
-        searchFolderRealEntries.length > 0
-        ? searchFolderRealEntries
-        : searchFolderResults
+      ? filteredFolderBrowseEntries(
+          searchFolderRealKey === searchFolderMatchKey && searchFolderRealEntries.length > 0
+            ? searchFolderRealEntries
+            : searchFolderResults,
+          filteredFolderCounts,
+        )
       : canvasFolderBrowseEntries;
   const folderCardRowVisible =
     library !== null && folderRowEntries.length > 0;
@@ -13731,6 +14149,11 @@ function AppInner() {
           key={entry.folderId}
           libraryId={library.libraryId}
           trashed={showTrash}
+          filteredCount={
+            showTrash || !filteredFolderCounts
+              ? undefined
+              : filteredFolderCounts.byFolderId.get(entry.folderId) ?? 0
+          }
           {...(showTrash
             ? {}
             : createFolderCardDropHandlers(entry.folderId))}
@@ -14102,6 +14525,7 @@ function AppInner() {
                   setSearchHistoryOpen(true);
                 }}
                 onKeyDown={(event) => {
+                  if (isImeKeyboardEvent(event)) return;
                   const matches = filterSearchHistory(searchHistory, searchValue);
                   const visibleCount = Math.min(
                     matches.length,
@@ -14269,6 +14693,7 @@ function AppInner() {
         }}
         allAssetCount={allAssetCount}
         rootAssetCount={rootAssetCount}
+        filteredFolderCounts={showTrash ? null : filteredFolderCounts}
         trashedAssetCount={trashedAssetCount}
         folders={folders}
         collections={collections}
@@ -14694,6 +15119,7 @@ function AppInner() {
             excludeFormatFilter={excludeFormatFilter}
             excludeRatingFilter={excludeRatingFilter}
             excludeTagFilter={excludeTagFilter}
+            excludedTagFilter={excludedTagFilter}
             includeAiRating={includeAiRatingFilter}
             includeAiTag={includeAiTagFilter}
             favoriteFilter={favoriteFilter}
@@ -14743,6 +15169,7 @@ function AppInner() {
               setTagFilterMatch("any");
               setTagFilter(value);
             }}
+            setExcludedTagFilter={setExcludedTagFilter}
             setWidthRange={setWidthRange}
             shuffleActive={shuffleSeed !== null}
             onShuffle={() => {
@@ -14758,6 +15185,7 @@ function AppInner() {
               excludeFormatFilter,
               tagFilter,
               excludeTagFilter,
+              excludedTagFilter,
               includeAiTagFilter,
               ratingFilter,
               excludeRatingFilter,
@@ -14849,16 +15277,23 @@ function AppInner() {
           />
         )}
         <div
-          aria-busy={workspaceNavigationPending}
+          aria-busy={workspaceNavigationPending || workerRecoveryState === 'recovering'}
           className={`workspace-canvas-host${previewAsset || previewRestoring ? " is-viewing" : ""}${previewRestoring ? " is-restoring" : ""}${workspaceNavigationPending ? " is-navigating" : ""}`}
         >
-          {renderedToastStack.length > 0
+          {renderedToastStack.length > 0 || workerRecoveryState !== 'ready'
             ? createPortal(
                 <div
                   aria-atomic="false"
                   aria-live="polite"
                   className="workspace-notice-stack workspace-notice"
                 >
+                  {workerRecoveryState !== 'ready' ? (
+                    <Notice
+                      className="workspace-notice-item"
+                      message={t(workerRecoveryState === 'recovering' ? 'toast.workerRecovering' : 'toast.workerFailed')}
+                      tone={workerRecoveryState === 'recovering' ? 'warning' : 'error'}
+                    />
+                  ) : null}
                   {renderedToastStack.map((message) => {
                     const isUndoTarget =
                       !message.closing &&
@@ -14904,6 +15339,7 @@ function AppInner() {
           ) : null}
         <div
           className={`workspace-canvas${previewAsset ? " is-viewing" : previewRestoring ? " is-restoring" : ""}${externalDropActive ? " is-external-drop" : ""}`}
+          inert={workerRecoveryState !== 'ready'}
           onDragEnter={handleExternalDragEnter}
           onDragLeave={handleExternalDragLeave}
           onDragOver={handleExternalDragOver}
@@ -15077,7 +15513,15 @@ function AppInner() {
                       data-asset-id={asset.assetId}
                       data-asset-name={asset.displayName}
                       data-media-type={asset.mediaType}
-                      draggable={!showTrash && !renamingThisAsset}
+                      draggable={
+                        !showTrash && !renamingThisAsset && (
+                          Boolean(activeCollectionId && !collectionRecursive)
+                          || !nativeAssetDragEnabled
+                          || (selectedIdSet.has(asset.assetId)
+                            ? selectedNativeDragReady
+                            : nativeDragReadyIds.has(asset.assetId))
+                        )
+                      }
                       key={renderOptions?.stableSlot
                         ? undefined
                         : assetCardKey(library?.libraryId, asset.assetId)}
@@ -15161,10 +15605,12 @@ function AppInner() {
                         // explicit diagnostics bridge so E2E HTML5 drops do
                         // not enter Electron's native OS drag loop, while
                         // production still uses startDrag().
-                        const isE2e = Boolean(
-                          (window as RendererWindow).serpent?.e2e,
-                        );
-                        if (!isE2e && api && library) {
+                        if (nativeAssetDragEnabled && api && library) {
+                          if (!ids.every((id) => nativeDragReadyIds.has(id))) {
+                            event.preventDefault();
+                            api.primeAssetDrag({ libraryId: library.libraryId, assetIds: ids });
+                            return;
+                          }
                           // Electron's supported path is an asynchronous
                           // one-way IPC from dragstart. A synchronous round
                           // trip deadlocks when this native file drag returns
@@ -15547,6 +15993,7 @@ function AppInner() {
                                     }}
                                     onKeyDown={(event) => {
                                       event.stopPropagation();
+                                      if (isImeKeyboardEvent(event)) return;
                                       if (event.key === "Enter") {
                                         event.preventDefault();
                                         void submitAssetRename();
@@ -15772,6 +16219,18 @@ function AppInner() {
             }
             libraryId={library.libraryId}
             navArrowsOnApproach={viewerChromePrefs.navArrowsOnApproach}
+            onToggleNavArrowsOnApproach={() => {
+              setViewerChromePrefs((current) => ({
+                ...current,
+                navArrowsOnApproach: !current.navArrowsOnApproach,
+              }));
+            }}
+            onToggleVideoTransportOnApproach={() => {
+              setViewerChromePrefs((current) => ({
+                ...current,
+                videoTransportOnApproach: !current.videoTransportOnApproach,
+              }));
+            }}
             onDiskDeleteAsset={() => {
               requestSelectionDiskDelete([previewAsset.assetId], []);
             }}
@@ -16059,13 +16518,17 @@ function AppInner() {
             open={appSettingsOpen && appSettingsCategory === "ai"}
             variant="embedded"
             apiKey={aiApiKey}
+            profiles={aiProfiles}
+            activeProfileId={aiActiveProfileId}
+            profileDraftId={aiProfileDraftId}
+            profileName={aiProfileName}
             apiFormat={aiApiFormat}
             model={aiModel}
             baseUrl={aiBaseUrl}
             languages={aiLanguages}
             concurrencyLimit={aiConcurrencyLimit}
             maxAnalysisImageEdgePx={aiMaxAnalysisImageEdgePx}
-            hasKey={aiHasKey}
+            hasKey={aiDraftHasKey}
             descriptionEnabled={aiDescriptionEnabled}
             tagsEnabled={aiTagsEnabled}
             ratingEnabled={aiRatingEnabled}
@@ -16073,9 +16536,15 @@ function AppInner() {
             analysisSettings={aiAnalysisSettings}
             disclaimerAccepted={aiDisclaimerAccepted}
             autoAnalyzeEnabled={aiAutoAnalyzeEnabled}
-            connectionState={aiConnectionState}
-            connectionReason={aiConnectionReason}
+            connectionState={aiDraftConnectionState}
+            connectionReason={aiDraftConnectionReason}
             onApiKeyChange={setAiApiKey}
+            onProfileNameChange={setAiProfileName}
+            onNewProfile={beginNewAiProfile}
+            onSelectProfile={selectAiProfile}
+            onActivateProfile={(id) => void activateAiProfile(id)}
+            onDeleteProfile={(id) => void removeAiProfile(id)}
+            onClearCredential={() => void clearAiProfileCredential()}
             onApiFormatChange={setAiApiFormat}
             onModelChange={setAiModel}
             onBaseUrlChange={setAiBaseUrl}

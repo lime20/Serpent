@@ -10,6 +10,7 @@ import { notifyEmbeddingCatalogChanged, subscribeEmbeddingCatalog } from "./embe
 import { useT } from "./i18n";
 import { loadSemanticSearchPreferences } from "./semantic-search-preferences";
 import { embeddingIndexCopyKey } from "./semantic-index-copy";
+import { Select } from "./ui/primitives";
 
 const MODEL_LABEL_KEYS = {
   "embeddinggemma-2-compact": "settings.semanticSearch.modelCompact",
@@ -171,29 +172,31 @@ export function LibraryEmbeddingSettings({
             <strong>{t("settings.librarySemantic.model")}</strong>
             <span>{t("settings.librarySemantic.inheritHint", { model: defaultLabel })}</span>
           </div>
-          <select
+          <Select
             aria-label={t("settings.librarySemantic.model")}
-            className="text-field library-semantic-select"
-            onChange={(event) => {
-              setSelectionValue(event.target.value);
+            className="text-field"
+            onValueChange={(value) => {
+              setSelectionValue(value);
               setNotice(null);
             }}
+            options={[
+              {
+                value: INHERIT_VALUE,
+                label: t("settings.librarySemantic.inherit", { model: defaultLabel }),
+              },
+              { value: OFF_VALUE, label: t("settings.librarySemantic.off") },
+              ...SETTINGS_LOCAL_SEMANTIC_MODELS.map((modelId) => ({
+                value: modelId,
+                label: `${t(MODEL_LABEL_KEYS[modelId])}${installed.has(modelId) ? "" : ` (${t("settings.librarySemantic.notInstalled")})`}`,
+              })),
+              ...services.map((service) => ({
+                value: service.id,
+                label: service.name,
+              })),
+            ]}
             value={selectionValue}
-          >
-            <option value={INHERIT_VALUE}>
-              {t("settings.librarySemantic.inherit", { model: defaultLabel })}
-            </option>
-            <option value={OFF_VALUE}>{t("settings.librarySemantic.off")}</option>
-            {SETTINGS_LOCAL_SEMANTIC_MODELS.map((modelId) => (
-              <option key={modelId} value={modelId}>
-                {t(MODEL_LABEL_KEYS[modelId])}
-                {installed.has(modelId) ? "" : ` (${t("settings.librarySemantic.notInstalled")})`}
-              </option>
-            ))}
-            {services.map((service) => (
-              <option key={service.id} value={service.id}>{service.name}</option>
-            ))}
-          </select>
+            wrapperClassName="library-semantic-select"
+          />
           {!globalPrefs.enabled ? (
             <p className="app-settings-help-note">{t("settings.librarySemantic.globalOff")}</p>
           ) : null}

@@ -64,6 +64,12 @@ export const PLATFORM_SHORTCUT_TABLE: readonly PlatformShortcutRow[] = [
     windows: { label: "Ctrl+Shift+C", key: "c", ctrlKey: true, shiftKey: true },
   },
   {
+    id: "folder.copy-path",
+    purpose: "Copy the focused or open folder's absolute path as text",
+    mac: { label: "⌥⌘C", key: "c", metaKey: true, altKey: true },
+    windows: { label: "Ctrl+Shift+C", key: "c", ctrlKey: true, shiftKey: true },
+  },
+  {
     id: "asset.reveal-in-folder",
     purpose: "Reveal selected asset in Finder / File Explorer",
     mac: { label: "⌘⇧S", key: "s", metaKey: true, shiftKey: true },
@@ -140,6 +146,18 @@ export const PLATFORM_SHORTCUT_TABLE: readonly PlatformShortcutRow[] = [
     purpose: "Toggle application window fullscreen (not viewer element fullscreen)",
     mac: { label: "⌃⌘F", key: "f", metaKey: true, ctrlKey: true },
     windows: { label: "F11", key: "F11" },
+  },
+  {
+    id: "workspace.new-tab",
+    purpose: "Open a new workspace tab",
+    mac: { label: "⌘T", key: "t", metaKey: true },
+    windows: { label: "Ctrl+T", key: "t", ctrlKey: true },
+  },
+  {
+    id: "workspace.close-tab",
+    purpose: "Close the current workspace tab without closing the window",
+    mac: { label: "⌘W", key: "w", metaKey: true },
+    windows: { label: "Ctrl+W", key: "w", ctrlKey: true },
   },
 ] as const;
 

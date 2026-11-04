@@ -22,7 +22,7 @@ import {
   type SemanticSearchPageSize,
 } from "./semantic-search-preferences";
 import { SettingsCard } from "./ui/patterns";
-import { Switch } from "./ui/primitives";
+import { Switch, Select } from "./ui/primitives";
 
 type InstallSnapshot = {
   runtimeInstalled: boolean;
@@ -206,20 +206,23 @@ export function SemanticSearchSettings({
             <strong>{t("settings.semanticSearch.defaultModel")}</strong>
             <span>{t("settings.semanticSearch.defaultModelHint")}</span>
           </div>
-          <select
+          <Select
             aria-label={t("settings.semanticSearch.defaultModel")}
-            className="text-field semantic-default-model-select"
+            className="text-field"
             disabled={!prefs.enabled || defaultChoices.length === 0}
-            onChange={(event) => updatePrefs({ modelId: event.target.value })}
+            onValueChange={(value) => updatePrefs({ modelId: value })}
+            options={[
+              ...(defaultChoices.length === 0
+                ? [{ value: prefs.modelId, label: t("settings.semanticSearch.defaultModelEmpty") }]
+                : []),
+              ...defaultChoices.map((choice) => ({
+                value: choice.id,
+                label: choice.label,
+              })),
+            ]}
             value={prefs.modelId}
-          >
-            {defaultChoices.length === 0 ? (
-              <option value={prefs.modelId}>{t("settings.semanticSearch.defaultModelEmpty")}</option>
-            ) : null}
-            {defaultChoices.map((choice) => (
-              <option key={choice.id} value={choice.id}>{choice.label}</option>
-            ))}
-          </select>
+            wrapperClassName="semantic-default-model-select"
+          />
         </div>
       </SettingsCard>
 

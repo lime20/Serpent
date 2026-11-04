@@ -15,6 +15,8 @@ export default tseslint.config(
       'dist/**',
       'out/**',
       'coverage/**',
+      // Electron/Playwright-generated traces, reports, and runtime fixtures.
+      'test-results/**',
       'node_modules/**',
       // Emscripten-generated glue (acquired by scripts/build-ufbx-wasm.mjs).
       'resources/ufbx/**',

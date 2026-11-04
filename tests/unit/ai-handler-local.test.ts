@@ -164,8 +164,19 @@ test('openai_chat keeps sending its key to the same endpoint shape', async () =>
  */
 test('a saved keyless local profile completes Main → Worker → HTTP', async () => {
   const stub = await startServer();
+  const profileId = 'ai_000000000000000000000001';
+  const getDecryptedProfileApiKey = vi.fn(() => '');
   const localConfig = {
     hasKey: false,
+    activeProfileId: profileId,
+    profiles: [{
+      id: profileId,
+      name: 'Local runtime',
+      apiFormat: 'local_openai' as const,
+      model: 'qwen2.5vl:7b',
+      baseUrl: stub.baseUrl,
+      hasCredential: false,
+    }],
     apiFormat: 'local_openai' as const,
     model: 'qwen2.5vl:7b',
     baseUrl: stub.baseUrl,
@@ -186,8 +197,11 @@ test('a saved keyless local profile completes Main → Worker → HTTP', async (
     // No key file exists for a keyless profile; Main returns an empty key
     // rather than throwing AI_NOT_CONFIGURED.
     getDecryptedApiKey: () => '',
+    getDecryptedProfileApiKey,
     saveAiConfig: vi.fn(),
-    saveEncryptedApiKey: vi.fn(),
+    saveConnectionProfile: vi.fn(() => profileId),
+    activateConnectionProfile: vi.fn(),
+    deleteConnectionProfile: vi.fn(),
     workerAvailable: () => true,
     requestWorker: (command) =>
       executeAiWorkerCommand(
@@ -208,6 +222,7 @@ test('a saved keyless local profile completes Main → Worker → HTTP', async (
   await expect(tryHandleAiOwnedRequest(
     {
       type: 'ai.test-connection.request',
+      profileId,
       apiFormat: 'local_openai',
       model: 'qwen2.5vl:7b',
       baseUrl: stub.baseUrl,
@@ -220,4 +235,5 @@ test('a saved keyless local profile completes Main → Worker → HTTP', async (
   });
 
   expect(stub.authorizationHeaders).toEqual([undefined]);
+  expect(getDecryptedProfileApiKey).toHaveBeenCalledWith(profileId);
 });
