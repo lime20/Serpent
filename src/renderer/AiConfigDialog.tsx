@@ -15,6 +15,7 @@ import {
   AI_API_FORMATS,
   AI_API_FORMAT_LABELS,
   AI_LANGUAGE_OPTIONS,
+  anthropicCustomBaseUrlMissesProtocolPath,
   DEFAULT_AI_BASE_URLS,
   DEFAULT_AI_MODELS,
   aiApiFormatRequiresApiKey,
@@ -704,6 +705,9 @@ export function AiConfigDialog({
                   ? t("aiConfig.localBaseUrlHint")
                   : t("aiConfig.baseUrlHint")}
             </p>
+            {apiFormat === "anthropic" && anthropicCustomBaseUrlMissesProtocolPath(baseUrl) ? (
+              <p className="ai-config-hint">{t("aiConfig.baseUrlAnthropicPathHint")}</p>
+            ) : null}
           </div>
           {apiFormat === "local_openai" ? (
             <div className="ai-config-local">

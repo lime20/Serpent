@@ -343,8 +343,9 @@ test("tests, saves and activates a hand-typed local endpoint without a key", asy
     if (!profileId) throw new Error("Expected the keyless local profile to be saved.");
     await expect(profileSelector).not.toContainText(/需要 API Key|API key needed/);
     await expect(dialog.getByText(/保存 API Key 后才能启用/)).toHaveCount(0);
-    await dialog.getByRole("button", { name: /设为当前|Set as current/ }).click();
+    // Saving a new profile makes it current immediately, including keyless ones.
     await expect(profileSelector).toContainText(/当前使用|In use/);
+    await expect(dialog.getByRole("button", { name: /设为当前|Set as current/ })).toHaveCount(0);
     await dialog.press("Escape");
     await expect(dialog).toBeHidden({ timeout: 15_000 });
 

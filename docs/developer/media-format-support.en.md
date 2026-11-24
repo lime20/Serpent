@@ -90,6 +90,17 @@ Acceptance should cover valid, missing, corrupt, oversized, and Sharp-undecodabl
 - **Background Tasks → Retry failed** fetches every current-library media-task page, collects and deduplicates failed IDs, then submits the retry. It does not depend on the loaded UI page or send empty `jobIds`; the protocol still requires at least one ID. AI retry retains its loaded-list scope: the button is disabled when that list has no failures, and App/preload also prevent empty selections from reaching IPC.
 - The development server retains CSP, using a random nonce for Vite/React scripts and permitting the required blob Worker; production policy remains intact. Mount timeouts capture page/resource diagnostics, and window closure stops retries. The original 20-second blank mount has not been reproduced; isolated cold-cache startup and HMR passed, which does not establish that the original cause is fixed.
 
+### RAW thumbnails, viewer images, and tone
+
+- Thumbnails first try a bounded embedded JPEG, falling back to OIIO / LibRaw when it cannot be read. This fast path is not a full-size RAW decode and does not cover every RAW container.
+- `viewer_image` performs a separate full-resolution decode. RAW now produces quality-95 JPEG (`image/jpeg`) instead of PNG, without changing the RAW source. Consumers must honor the artifact MIME and file type rather than assuming `viewer_image` means `image/png`.
+- RAW keeps the decoder's default sRGB display path rather than applying the OCIO display transform used for other professional images. ARW viewer images use PPG demosaicing with automatic brightness disabled; a readable embedded camera JPEG guides a shared tone curve. Other RAW formats do not use this ARW tone matching.
+- Viewer-image caches update by generator version. Tests must check actual decoding, full-resolution dimensions, MIME, and file headers. A displayed thumbnail does not prove the RAW viewer image has finished, and ARW timing or tone results must not be generalized to all RAW formats.
+
+### Model transparency and display settings
+
+Both the model viewer and offscreen card previews must retain texture alpha rather than baking transparent regions onto a dark background. Base-color alpha handling after FBX conversion lives in `src/renderer/3d-viewer/base-color-alpha.ts` and needs checking alongside the other material display modes. **Double-sided** applies to material, flat, and wireframe modes. Double-sided and statistics-panel choices live in viewer preferences and do not alter the source model.
+
 ## 4. Test matrix
 
 Prepare fixtures in temporary directories; never commit personal absolute paths or real user data. Cover:

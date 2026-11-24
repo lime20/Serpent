@@ -142,6 +142,41 @@ it('validates Worker recovery lifecycle events without a library path', () => {
   expect(parseRendererLifecycleEvent({ type: 'worker.failed' })).toEqual({ type: 'worker.failed' });
 });
 
+it('preserves duplicate save dispositions through the Worker response schema', () => {
+  const response = parseWorkerResponse({
+    requestId: 'extension-save-duplicate',
+    result: {
+      ok: true,
+      type: 'extension.asset-saved',
+      duplicate: true,
+      asset: {
+        assetId: 'asset-1',
+        locationKind: 'managed',
+        managedFolderId: null,
+        linkedFolderId: null,
+        relativeFilePath: 'photo.png',
+        displayName: 'photo.png',
+        currentRevisionId: 'revision-1',
+        byteSize: 8,
+        modifiedAt: '2026-11-12T00:00:00.000Z',
+        availability: 'available',
+        rating: 0,
+        favorite: false,
+        deletedAt: null,
+        trashedFromPath: null,
+        remainingDays: null,
+        thumbnailStatus: null,
+        thumbnailArtifactId: null,
+        mediaType: 'image',
+        width: null,
+        height: null,
+      },
+    },
+  });
+
+  expect(response.result).toMatchObject({ type: 'extension.asset-saved', duplicate: true });
+});
+
 describe('renderer request protocol', () => {
   it('accepts the library-open cancellation request and acknowledgement', () => {
     expect(parseRendererRequest({ type: 'library.open-cancel.request' })).toEqual({
@@ -1684,6 +1719,35 @@ describe('preview response protocol', () => {
     })).toMatchObject({ type: 'media.jobs.listed', queued: 1 });
   });
 
+  it('defaults queuePaused on legacy media summary and listing responses', () => {
+    const counts = {
+      ok: true,
+      libraryId: 'library-01',
+      queued: 0,
+      running: 0,
+      succeeded: 0,
+      failed: 0,
+      paused: 0,
+      cancelled: 0,
+    };
+    expect(parseRendererResult({
+      ...counts,
+      type: 'media.job-summary.read',
+    })).toMatchObject({ type: 'media.job-summary.read', queuePaused: false });
+    expect(parseRendererResult({
+      ...counts,
+      type: 'media.jobs.listed',
+      nextCursor: null,
+      hasMore: false,
+      jobs: [],
+    })).toMatchObject({ type: 'media.jobs.listed', queuePaused: false });
+    expect(parseRendererResult({
+      ...counts,
+      type: 'media.job-summary.read',
+      queuePaused: true,
+    })).toMatchObject({ queuePaused: true });
+  });
+
   it('validates automatic palette provenance without exposing artifact paths', () => {
     const result = parseRendererResult({
       ok: true,
@@ -2075,6 +2139,57 @@ describe('worker request protocol', () => {
         libraryId: 'library-1',
         mediaUrl: 'http://user:secret@example.com/image.png',
       },
+    })).toThrow();
+  });
+
+  it('requires explicit media kind for staged browser uploads', () => {
+    const command = {
+      type: 'extension.save-from-file',
+      kind: 'video',
+      libraryId: 'library-1',
+      stagedFilePath: 'C:\\temp\\video.mp4',
+      contentType: 'video/mp4',
+      filename: 'video.mp4',
+    } as const;
+    expect(parseWorkerRequest({ requestId: 'request-file-video', command }).command).toEqual(command);
+    expect(() => parseWorkerRequest({
+      requestId: 'request-file-video-no-kind',
+      command: { ...command, kind: undefined },
+    })).toThrow();
+  });
+
+  it('allows a staged blob media URL only for the matching source-page origin', () => {
+    const command = {
+      type: 'extension.save-from-file',
+      kind: 'video',
+      libraryId: 'library-1',
+      sourcePageUrl: 'https://frame.example.com/watch/42',
+      mediaUrl: 'blob:https://frame.example.com/f03a6ed0-7fa5-4e76-9eb9-176a39f65e47',
+      stagedFilePath: 'C:\\temp\\video.mp4',
+      contentType: 'video/mp4',
+      filename: 'video.mp4',
+    } as const;
+    expect(parseWorkerRequest({ requestId: 'request-file-blob-valid', command }).command).toEqual(command);
+
+    for (const mediaUrl of [
+      'blob:https://other.example/id',
+      'blob:null/id',
+      'blob:chrome-extension://extension-id/id',
+      'data:video/mp4;base64,AAAA',
+      'file:///tmp/video.mp4',
+      'https://user:secret@frame.example.com/video.mp4',
+      `https://frame.example.com/${'x'.repeat(8_200)}`,
+      `blob:https://frame.example.com/${'x'.repeat(8_200)}`,
+    ]) {
+      expect(() => parseWorkerRequest({
+        requestId: 'request-file-blob-invalid',
+        command: { ...command, mediaUrl },
+      }), mediaUrl).toThrow();
+    }
+
+    expect(() => parseWorkerRequest({
+      requestId: 'request-file-blob-no-page',
+      command: { ...command, sourcePageUrl: undefined },
     })).toThrow();
   });
 
@@ -3045,6 +3160,16 @@ describe('model convert-fbx protocol (slice B, Serpent-5ygi)', () => {
     });
   });
 
+  it('preserves typed FBX host pressure across the worker response boundary', () => {
+    expect(parseWorkerResponse({
+      requestId: 'convert-resource',
+      result: {
+        ok: true, type: 'model.convert-fbx.done', assetId: 'asset-01',
+        status: 'failed', errorCode: 'FBX_RESOURCE_EXHAUSTED',
+      },
+    })).toMatchObject({ result: { errorCode: 'FBX_RESOURCE_EXHAUSTED' } });
+  });
+
   it('validates ready and failed conversion results', () => {
     expect(parseWorkerResponse({
       requestId: 'convert-01',
@@ -3297,4 +3422,13 @@ describe('library deletion deferred-cleanup protocol (Serpent-65d837)', () => {
       kind: 'video', mimeType: 'video/mp4', bytesBase64: Buffer.from('mp4').toString('base64'),
     } }).result).toMatchObject({ type: 'semantic.index.prepared', kind: 'video', mimeType: 'video/mp4' });
   });
+});
+
+
+it('accepts folder-only and mixed clipboard selections, but rejects an empty selection', () => {
+  expect(parseRendererRequest({ type: 'asset.copy-files.request', libraryId: 'lib', assetIds: [], folderIds: ['folder'], operation: 'cut' })).toMatchObject({ folderIds: ['folder'] });
+  expect(parseRendererRequest({ type: 'asset.copy-files.request', libraryId: 'lib', assetIds: ['asset'], folderIds: ['folder'], operation: 'cut' })).toMatchObject({ assetIds: ['asset'], folderIds: ['folder'] });
+  expect(() => parseRendererRequest({ type: 'asset.copy-files.request', libraryId: 'lib', assetIds: [] })).toThrow();
+  expect(() => parseRendererRequest({ type: 'asset.copy-files.request', libraryId: 'lib', assetIds: [], folderIds: ['folder', 'folder'] })).toThrow();
+  expect(parseRendererResult({ ok: true, type: 'asset.clipboard-state', cutAssetIds: [], cutFolderIds: ['folder'] })).toMatchObject({ cutFolderIds: ['folder'] });
 });

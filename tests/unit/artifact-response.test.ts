@@ -55,6 +55,7 @@ describe('artifact protocol byte ranges', () => {
     expect(response.status).toBe(200);
     expect(response.headers.get('access-control-allow-origin')).toBe('*');
     expect(response.headers.get('content-type')).toBe('image/webp');
+    expect(Buffer.from(await response.arrayBuffer()).toString()).toBe('webp');
   });
 
   it('returns 416 for an unsatisfiable range', async () => {

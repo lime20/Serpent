@@ -1,108 +1,98 @@
-// @vitest-environment happy-dom
-import { readFileSync } from "node:fs";
-import path from "node:path";
+import { describe, expect, it, vi } from "vitest";
 
-import ts from "typescript";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { loadRendererDevUrl } from "../../src/main/dev-renderer-load";
 
-// Run the startup functions without evaluating the Electron main entry's
-// process-wide handlers, native modules, or application startup side effects.
-const mainSource = readFileSync(path.resolve(import.meta.dirname, "../../src/main/index.ts"), "utf8");
-const startupSource = mainSource.slice(
-  mainSource.indexOf("const DEV_SERVER_WAIT_MS"),
-  mainSource.indexOf("function attachRendererDiagnostics"),
-);
-const javascript = ts.transpileModule(startupSource, {
-  compilerOptions: { target: ts.ScriptTarget.ES2023, module: ts.ModuleKind.None },
-}).outputText;
+const url = "http://localhost:5173";
 
 function fixture() {
   let destroyed = false;
-  let attempts = 0;
+  let now = 0;
   const logger = { info: vi.fn(), error: vi.fn() };
   const document = {
     readyState: "complete",
-    querySelector: () => attempts > 1 ? {} : null,
-    getElementById: () => ({ childElementCount: 0 }),
+    querySelector: (selector: string) => selector === "#root" ? { childElementCount: 0 } : null,
   };
   const performance = {
-    getEntriesByType: () => [{
-      name: "http://localhost:5173/src/renderer/main.tsx",
-      duration: 123,
-      initiatorType: "script",
-    }],
+    getEntriesByType: () => [{ name: `${url}/src/renderer/main.tsx` }],
   };
   const window = {
     isDestroyed: () => destroyed,
-    loadURL: vi.fn(async () => {
-      if (destroyed) throw new Error("Window has been destroyed");
-      attempts += 1;
-    }),
+    loadURL: vi.fn(async () => undefined),
     webContents: {
       isDestroyed: () => destroyed,
       executeJavaScript: vi.fn(async (script: string) => {
         if (destroyed) throw new Error("WebContents has been destroyed");
+        if (script.startsWith("import(")) return undefined;
         return new Function("document", "performance", `return ${script}`)(document, performance);
       }),
     },
   };
-  const fetch = vi.fn(async () => ({ ok: true }));
-  const load = new Function("logger", "fetch", `${javascript}; return loadRendererDevUrl;`)(logger, fetch) as
-    (target: typeof window, url: string) => Promise<void>;
-  return { logger, window, load, close: () => { destroyed = true; } };
+  const fetchUrl = vi.fn(async () => ({ ok: true }));
+  const sleep = vi.fn(async (ms: number) => { now += ms; });
+  const options = { now: () => now, sleep, fetchUrl, pollMs: 10_000 };
+  return { logger, window, options, close: () => { destroyed = true; } };
 }
 
 describe("Development renderer startup", () => {
-  beforeEach(() => vi.useFakeTimers());
-  afterEach(() => vi.useRealTimers());
-
-  it("records document and resource evidence when a mounted shell is missing", async () => {
+  it("waits 120 seconds without reloading a blank page and records its resource state", async () => {
     const context = fixture();
-    const loading = context.load(context.window, "http://localhost:5173");
-    await vi.runAllTimersAsync();
-    await loading;
 
-    expect(context.logger.info).toHaveBeenCalledWith(
-      "main.window.mount-retry",
-      expect.any(String),
-      expect.objectContaining({
-        attempt: 1,
-        snapshot: expect.objectContaining({ mounted: false, readyState: "complete", rootChildCount: 0 }),
-      }),
+    await expect(loadRendererDevUrl(context.window, url, context.logger, context.options))
+      .rejects.toThrow("Renderer did not mount within 120000ms: document=complete, root=0, resources=1, mainModule=true, viteError=false");
+
+    expect(context.window.loadURL).toHaveBeenCalledExactlyOnceWith(url);
+    expect(context.logger.error).toHaveBeenCalledWith(
+      "main.window.mount-failed",
+      expect.any(Error),
+      expect.objectContaining({ state: expect.stringContaining("resources=1, mainModule=true") }),
     );
-    expect(context.window.loadURL).toHaveBeenCalledTimes(2);
   });
 
   it("ends startup when its window closes without reloading or reporting failure", async () => {
     const context = fixture();
-    let failure: unknown;
-    const loading = context.load(context.window, "http://localhost:5173").catch(error => { failure = error; });
-    await vi.advanceTimersByTimeAsync(1);
-    context.close();
-    await vi.runAllTimersAsync();
-    await loading;
+    context.options.sleep.mockImplementationOnce(async () => { context.close(); });
+
+    await expect(loadRendererDevUrl(context.window, url, context.logger, context.options)).resolves.toBeUndefined();
 
     expect(context.window.loadURL).toHaveBeenCalledTimes(1);
     expect(context.window.webContents.executeJavaScript).toHaveBeenCalledTimes(1);
     expect(context.logger.error).not.toHaveBeenCalled();
-    expect(failure).toBeUndefined();
   });
 
-  it("retains renderer probe failures in the timeout evidence", async () => {
+  it("stops waiting for the dev server when its window closes", async () => {
     const context = fixture();
-    context.window.webContents.executeJavaScript.mockRejectedValue(new Error("Renderer execution context unavailable"));
-    let failure: unknown;
-    const loading = context.load(context.window, "http://localhost:5173").catch(error => { failure = error; });
-    await vi.runAllTimersAsync();
-    await loading;
+    context.options.fetchUrl.mockResolvedValue({ ok: false });
+    context.options.sleep.mockImplementationOnce(async () => { context.close(); });
 
-    expect(failure).toBeInstanceOf(Error);
-    expect(context.logger.info).toHaveBeenCalledWith(
-      "main.window.mount-retry",
-      expect.any(String),
-      expect.objectContaining({
-        snapshot: expect.objectContaining({ mounted: false, probeError: "Renderer execution context unavailable" }),
-      }),
-    );
+    await expect(loadRendererDevUrl(context.window, url, context.logger, context.options)).resolves.toBeUndefined();
+
+    expect(context.options.fetchUrl).toHaveBeenCalledTimes(1);
+    expect(context.window.loadURL).not.toHaveBeenCalled();
+    expect(context.logger.error).not.toHaveBeenCalled();
+  });
+
+  it("does not retry or report a failed navigation after the window closes", async () => {
+    const context = fixture();
+    context.window.loadURL.mockImplementationOnce(async () => {
+      context.close();
+      throw new Error("Window has been destroyed");
+    });
+
+    await expect(loadRendererDevUrl(context.window, url, context.logger, context.options)).resolves.toBeUndefined();
+
+    expect(context.window.loadURL).toHaveBeenCalledTimes(1);
+    expect(context.logger.error).not.toHaveBeenCalled();
+  });
+
+  it("does not start work when its web contents have already been destroyed", async () => {
+    const context = fixture();
+    context.window.webContents.isDestroyed = () => true;
+
+    await expect(loadRendererDevUrl(context.window, url, context.logger, context.options)).resolves.toBeUndefined();
+
+    expect(context.options.fetchUrl).not.toHaveBeenCalled();
+    expect(context.window.loadURL).not.toHaveBeenCalled();
+    expect(context.window.webContents.executeJavaScript).not.toHaveBeenCalled();
+    expect(context.logger.error).not.toHaveBeenCalled();
   });
 });

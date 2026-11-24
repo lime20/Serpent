@@ -17,6 +17,8 @@ On Windows open `Main menu → Settings → AI`; on macOS open `Settings → AI`
 - `Model`: enter the provider’s vision model name. With a valid key, the picker can load models; if that fails, enter the name manually.
 - Click `Test connection` to check the values currently entered, then `Save configuration`. Testing does not save or activate a configuration. After saving a new configuration, click `Set as current`; the `In use` label identifies the connection used for AI analysis.
 
+For a custom `Anthropic Messages` URL, include the full API prefix required by the provider. If it requires `/anthropic`, for example, use `https://api.example.com/anthropic` rather than only the host name; a host-only address sends requests to `/v1/messages`. Compatible services may use different paths, so follow that provider's instructions.
+
 Never put an API key in a script, plugin, screenshot, issue report, or MCP configuration.
 
 ### Manage connection configurations

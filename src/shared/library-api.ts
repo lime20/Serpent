@@ -222,6 +222,7 @@ export interface MediaJobStatus {
   failed: number;
   paused: number;
   cancelled: number;
+  queuePaused?: boolean;
   jobs: MediaJob[];
   nextCursor?: { createdAt: string; jobId: string } | null;
   hasMore?: boolean;
@@ -250,7 +251,7 @@ export interface PluginJobStatus {
 }
 
 export interface SerpentLibraryApi {
-  create(input: { displayName: string }): Promise<LibraryApiResult<RendererLibrarySummary>>;
+  create(input: { displayName: string; selectionToken?: string }): Promise<LibraryApiResult<RendererLibrarySummary>>;
   open(input?: {
     libraryPath?: string;
     replaceExisting?: boolean;
@@ -261,6 +262,8 @@ export interface SerpentLibraryApi {
    * their loading UI only after the dialog closes.
    */
   chooseLibraryPath(): Promise<LibraryApiResult<string | null>>;
+  /** Choose a create location without opening a library; null means cancelled. */
+  chooseCreateLocation(): Promise<LibraryApiResult<string | null>>;
   /** Request cancellation of the active library open/create transition. */
   cancelOpen(): Promise<LibraryApiResult<void>>;
   /** Reveal a Main-owned recovery report without exposing its filesystem path. */
@@ -931,10 +934,15 @@ export interface SerpentLibraryApi {
   openWith(input: { libraryId: string; assetId: string }): Promise<LibraryApiResult<void>>;
   revealInFolder(input: { libraryId: string; assetId: string }): Promise<LibraryApiResult<void>>;
   copyFilePath(input: { libraryId: string; assetId: string }): Promise<LibraryApiResult<void>>;
+  /** Cut selection in this library; absolute clipboard paths stay in Main. */
+  getClipboardCutAssets(input: { libraryId: string }): Promise<LibraryApiResult<string[]>>;
+  getClipboardCutSelection(input: { libraryId: string }): Promise<LibraryApiResult<{ assetIds: string[]; folderIds: string[] }>>;
   /** OS file clipboard copy for one or more assets (Finder/Explorer interoperable). */
   copyAssetFiles(input: {
     libraryId: string;
     assetIds: string[];
+    folderIds?: string[];
+    operation?: 'copy' | 'cut';
   }): Promise<LibraryApiResult<void>>;
   /** Start an OS-native file drag from the current dragstart event. */
   startAssetDrag(input: {
@@ -979,6 +987,7 @@ export interface SerpentLibraryApi {
     failed: number;
     paused: number;
     cancelled: number;
+    queuePaused?: boolean;
   }>>;
   pauseMediaJobs(input: { libraryId: string; jobIds?: string[] }): Promise<LibraryApiResult<{ pausedCount: number }>>;
   resumeMediaJobs(input: { libraryId: string; jobIds?: string[] }): Promise<LibraryApiResult<{ resumedCount: number }>>;

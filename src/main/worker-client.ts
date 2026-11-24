@@ -109,6 +109,7 @@ const UNBOUNDED_WORKER_COMMANDS = new Set([
   // A local file upload has no remote network deadline. The URL variant
   // remains bounded by the download policy below.
   'extension.save-from-file',
+  'extension.save-segmented-video',
 ]);
 
 // These requests cross a provider/network boundary and already have their
@@ -117,7 +118,6 @@ const UNBOUNDED_WORKER_COMMANDS = new Set([
 const BOUNDED_PROVIDER_COMMANDS = new Set([
   'ai.test-connection',
   'ai.list-models',
-  'sync.probe',
 ]);
 
 function isLocalResourceCommand(commandType: string): boolean {
@@ -173,6 +173,10 @@ export function requestTimeoutForCommand(
   if (BOUNDED_PROVIDER_COMMANDS.has(commandType)) {
     return PROVIDER_REQUEST_TIMEOUT_MS;
   }
+  // A probe can wait behind an exclusive, hours-long sync.run mutation. Its
+  // HTTP calls have their own deadlines in WebDAVDriver; a Main-side timer
+  // would expire while the request is still in the Worker admission queue.
+  if (commandType === 'sync.probe') return null;
   if (UNBOUNDED_WORKER_COMMANDS.has(commandType) || isLocalResourceCommand(commandType)) {
     return null;
   }

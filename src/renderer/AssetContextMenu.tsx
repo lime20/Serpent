@@ -208,6 +208,7 @@ const HOST_MENU_ANCHORS: Record<PluginHostMenuGroup, readonly string[]> = {
     "asset.remove-from-current-collection",
     "asset.relink",
     "asset.move-to-folder",
+    "asset.cut",
     "asset.copy",
     "asset.paste",
     "asset.copy-file-path",
@@ -378,7 +379,9 @@ interface AssetContextMenuProps {
   onOpenFolderInFileManager: (folderId: string) => void;
   onCopyFolderPath: (folderId: string) => void;
   onCopyFolder: (folderId: string) => void;
+  onCutFolders?: (folderIds: string[]) => void;
   onPasteIntoFolder: (folderId: string | null) => void;
+  onImportIntoFolder: (kind: "files" | "folder", folderId: string) => void;
   onCloneFolder: (folderId: string) => void;
   onMoveFolder: (folderIds: string[]) => void;
   onOpenLinkedRules: (folder: LinkedFolderSummary) => void;
@@ -439,6 +442,7 @@ interface AssetContextMenuProps {
   onCopyFilePath: (assetId: string) => void;
   /** OS file clipboard copy (Finder/Explorer interoperable). */
   onCopyAssetFiles: (assetIds: string[]) => void;
+  onCutAssetFiles?: (assetIds: string[], folderIds?: string[]) => void;
   /**
    * Managed folder that receives OS clipboard paste from asset menus.
    * Typically the current browse folder; null hides paste.
@@ -493,7 +497,9 @@ export function AssetContextMenu(props: AssetContextMenuProps) {
     onOpenFolderInFileManager,
     onCopyFolderPath,
     onCopyFolder,
+    onCutFolders,
     onPasteIntoFolder,
+    onImportIntoFolder,
     onCloneFolder,
     onMoveFolder,
     onOpenLinkedRules,
@@ -532,6 +538,7 @@ export function AssetContextMenu(props: AssetContextMenuProps) {
     onFindSimilar,
     onCopyFilePath,
     onCopyAssetFiles,
+    onCutAssetFiles,
     pasteTargetFolderId,
     onRenameAssetFile,
     onRemoveFromCurrentCollection,
@@ -715,12 +722,11 @@ export function AssetContextMenu(props: AssetContextMenuProps) {
   };
 
   if (!activeContextMenu) return null;
-  // Serpent-接管: the workspace canvas menu is a plugin extension point
-  // (PLUGIN-015). With no plugin contributions it would render an empty
-  // floating menu on blank-canvas right-click — suppress it entirely; the
-  // active descriptor stays set so a late async contribution still appears.
+  // Suppress a blank workspace menu when neither a built-in action nor a
+  // plugin contribution is available. Late contributions can still appear.
   if (
     activeContextMenu.descriptor.type === "workspace" &&
+    activeContextMenu.descriptor.folder === undefined &&
     pluginWorkspaceMenuItems.length === 0
   ) {
     return null;
@@ -792,17 +798,50 @@ export function AssetContextMenu(props: AssetContextMenuProps) {
           const desc = activeContextMenu.descriptor;
           if (desc.type !== "workspace") return null;
           const assetIds = desc.assetIds;
+          const folder = desc.folder;
           return (
-            <PluginMenuCommandsSection
-              items={pluginWorkspaceMenuItems}
-              label={t("contextMenu.pluginCommands")}
-              onRun={(item) => runPluginCommand(
-                item,
-                assetIds === undefined || assetIds.length === 0
-                  ? {}
-                  : { assetIds: [...assetIds] },
+            <>
+              {folder && (
+                <ContextMenuSection label={folder.name} labelCase="preserve">
+                  <ContextMenuItem
+                    icon={<Icon name="folder" size={14} />}
+                    label={t("command.folder.newFolder")}
+                    shortcut={formatRuntimeShortcut("folder.create-subfolder", isMac ? "mac" : "windows") ?? undefined}
+                    disabled={props.busy}
+                    onAction={() => onCreateSubfolder(folder.id)}
+                  />
+                  <ContextMenuItem
+                    icon={<Icon name="clipboard" size={14} />}
+                    label={t("command.folder.paste")}
+                    shortcut={formatRuntimeShortcut("asset.paste", isMac ? "mac" : "windows") ?? undefined}
+                    disabled={props.busy}
+                    onAction={() => onPasteIntoFolder(folder.id)}
+                  />
+                  <ContextMenuItem
+                    icon={<Icon name="file" size={14} />}
+                    label={`${t("toolbar.importFiles")}…`}
+                    disabled={props.busy}
+                    onAction={() => onImportIntoFolder("files", folder.id)}
+                  />
+                  <ContextMenuItem
+                    icon={<Icon name="folder" size={14} />}
+                    label={`${t("toolbar.importFolder")}…`}
+                    disabled={props.busy}
+                    onAction={() => onImportIntoFolder("folder", folder.id)}
+                  />
+                </ContextMenuSection>
               )}
-            />
+              <PluginMenuCommandsSection
+                items={pluginWorkspaceMenuItems}
+                label={t("contextMenu.pluginCommands")}
+                onRun={(item) => runPluginCommand(
+                  item,
+                  assetIds === undefined || assetIds.length === 0
+                    ? {}
+                    : { assetIds: [...assetIds] },
+                )}
+              />
+            </>
           );
         })()}
         {activeContextMenu.descriptor.type === "workspace-tab" && (() => {
@@ -927,6 +966,7 @@ export function AssetContextMenu(props: AssetContextMenuProps) {
               openLinkedRules: onOpenLinkedRules,
               copyFolderPath: onCopyFolderPath,
               copyFolder: onCopyFolder,
+              cutFolders: onCutFolders,
               pasteIntoFolder: onPasteIntoFolder,
               cloneFolder: onCloneFolder,
               expandFolderTree: onExpandFolderTree,
@@ -1037,6 +1077,7 @@ export function AssetContextMenu(props: AssetContextMenuProps) {
               openLinkedRules: onOpenLinkedRules,
               copyFolderPath: onCopyFolderPath,
               copyFolder: onCopyFolder,
+              cutFolders: onCutFolders,
               pasteIntoFolder: onPasteIntoFolder,
               cloneFolder: onCloneFolder,
               expandFolderTree: onExpandFolderTree,
@@ -1185,6 +1226,7 @@ export function AssetContextMenu(props: AssetContextMenuProps) {
               openLinkedRules: onOpenLinkedRules,
               copyFolderPath: onCopyFolderPath,
               copyFolder: onCopyFolder,
+              cutFolders: onCutFolders,
               pasteIntoFolder: onPasteIntoFolder,
               cloneFolder: onCloneFolder,
               expandFolderTree: onExpandFolderTree,
@@ -1230,6 +1272,7 @@ export function AssetContextMenu(props: AssetContextMenuProps) {
           const renameItem = resolvedById.get("folder.rename");
           const linkedRulesItem = resolvedById.get("folder.linked-rules");
           const copyPathItem = resolvedById.get("folder.copy-path");
+          const cutFolderItem = resolvedById.get("folder.cut");
           const copyItem = resolvedById.get("folder.copy");
           const pasteItem = resolvedById.get("folder.paste");
           const cloneItem = resolvedById.get("folder.clone");
@@ -1384,6 +1427,11 @@ export function AssetContextMenu(props: AssetContextMenuProps) {
                     label={linkedRulesItem.label}
                     onAction={() => runSidebarCommand("folder.linked-rules")}
                   />
+                )}
+                {cutFolderItem && (
+                  <ContextMenuItem icon={<Icon name="scissors" size={14} />} label={cutFolderItem.label}
+                    disabled={cutFolderItem.disabled} disabledReason={cutFolderItem.disabledReason ?? undefined}
+                    shortcut={cutFolderItem.shortcutLabel ?? undefined} onAction={() => runSidebarCommand("folder.cut")} />
                 )}
                 {copyItem && (
                   <ContextMenuItem
@@ -1628,6 +1676,7 @@ export function AssetContextMenu(props: AssetContextMenuProps) {
               linkedAssetIds,
               folderCount: moveFolderIds.length,
               processFolderIds: moveFolderIds,
+              cutFolderIds: moveFolderIds.filter(id => managedFolders.some(folder => folder.folderId === id)),
               trashedAll: allTrashed,
               managedAssetIds,
               availableManagedAssetIds,
@@ -1642,6 +1691,7 @@ export function AssetContextMenu(props: AssetContextMenuProps) {
                 openRemoveTagPicker: (assetIds) =>
                   setTagPicker({ mode: "remove", assetIds, single: false }),
                 copyFiles: onCopyAssetFiles,
+                cutFiles: onCutAssetFiles,
                 pasteIntoFolder: onPasteIntoFolder,
                 moveToFolder: onMoveToFolder,
                 moveToTrash: (assetIds, folderIds) =>
@@ -1724,6 +1774,7 @@ export function AssetContextMenu(props: AssetContextMenuProps) {
             const appearanceItem = resolvedById.get("assets.appearance");
             const ignoreItem = resolvedById.get("assets.ignore");
             const copyItem = resolvedById.get("assets.copy");
+            const cutItem = resolvedById.get("assets.cut");
             const pasteItem = resolvedById.get("assets.paste");
             const moveToTrashItem = resolvedById.get("assets.move-to-trash");
             const deleteFromDiskItem = resolvedById.get(
@@ -2008,6 +2059,16 @@ export function AssetContextMenu(props: AssetContextMenuProps) {
                 disabledReason={ignoreItem?.disabledReason ?? undefined}
                 onAction={() => runMultiCommand("assets.ignore")}
               />
+                  {cutItem && (
+                    <ContextMenuItem
+                      icon={<Icon name="scissors" size={14} />}
+                      label={cutItem.label}
+                      shortcut={cutItem.shortcutLabel ?? undefined}
+                      disabled={cutItem.disabled}
+                      disabledReason={cutItem.disabledReason ?? undefined}
+                      onAction={() => runMultiCommand("assets.cut")}
+                    />
+                  )}
                   {copyItem && targetAssetIds.length > 0 && (
                     <ContextMenuItem
                       icon={<Icon name="clipboard" size={14} />}
@@ -2119,6 +2180,7 @@ export function AssetContextMenu(props: AssetContextMenuProps) {
                 showInLibraryFolder: onShowInLibraryFolder,
                 findSimilar: onFindSimilar,
                 copyFiles: onCopyAssetFiles,
+                cutFiles: onCutAssetFiles,
                 pasteIntoFolder: onPasteIntoFolder,
                 copyFilePath: onCopyFilePath,
                 rename: onRenameAssetFile,
@@ -2163,6 +2225,7 @@ export function AssetContextMenu(props: AssetContextMenuProps) {
             const relinkItem = resolvedById.get("asset.relink");
             const moveToFolderItem = resolvedById.get("asset.move-to-folder");
             const copyItem = resolvedById.get("asset.copy");
+            const cutItem = resolvedById.get("asset.cut");
             const pasteItem = resolvedById.get("asset.paste");
             const copyFilePathItem = resolvedById.get("asset.copy-file-path");
             const renameItem = resolvedById.get("asset.rename");
@@ -2373,6 +2436,16 @@ export function AssetContextMenu(props: AssetContextMenuProps) {
                       icon={<Icon name="folder" size={14} />}
                       label={moveToFolderItem.label}
                       onAction={() => runAssetCommand("asset.move-to-folder")}
+                    />
+                  )}
+                  {cutItem && (
+                    <ContextMenuItem
+                      icon={<Icon name="scissors" size={14} />}
+                      label={cutItem.label}
+                      shortcut={cutItem.shortcutLabel ?? undefined}
+                      disabled={cutItem.disabled}
+                      disabledReason={cutItem.disabledReason ?? undefined}
+                      onAction={() => runAssetCommand("asset.cut")}
                     />
                   )}
                   {copyItem && (

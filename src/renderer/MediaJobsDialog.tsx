@@ -122,7 +122,7 @@ export function MediaJobsDialog({
             <div className="dialog-actions dialog-actions-start is-spaced">
               <button
                 className="secondary-button"
-                disabled={mediaJobs.queued + mediaJobs.running === 0}
+                disabled={mediaJobs.queuePaused ?? false}
                 onClick={() => void onControlMediaJobs("pause")}
                 type="button"
               >
@@ -130,7 +130,7 @@ export function MediaJobsDialog({
               </button>
               <button
                 className="secondary-button"
-                disabled={mediaJobs.paused === 0}
+                disabled={!mediaJobs.queuePaused && mediaJobs.paused === 0}
                 onClick={() => void onControlMediaJobs("resume")}
                 type="button"
               >

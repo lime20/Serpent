@@ -80,12 +80,13 @@ async function testProfile(
   input: { model: string; apiKey: string; path?: string },
   requests: MockAiRequest[],
 ): Promise<void> {
+  const requestCountBeforeProbe = requests.length;
   await settings
     .getByRole("button", { name: /测试连接|Test connection/ })
     .click();
   await expect
     .poll(
-      () => requests.some((request) =>
+      () => requests.slice(requestCountBeforeProbe).some((request) =>
         request.isProbe
         && request.model === input.model
         && (!input.path || request.path === input.path)
@@ -263,15 +264,23 @@ test("switches AI profiles for analysis and restores the active profile after re
       model: firstProfile.model,
       baseUrl: firstProfile.baseUrl,
     });
-    await expectOpenProfileOption(settings, originalActiveProfileId, /当前使用|In use/);
+    const firstProfileId = await profileSelector.getAttribute("data-value");
+    if (!firstProfileId) throw new Error("Expected the first profile to be saved.");
+    expect(firstProfileId).not.toBe(originalActiveProfileId);
+    await expectOpenProfileOption(settings, firstProfileId, /当前使用|In use/);
+    await expect(profileSelector).toContainText(/需要 API Key|API key needed/);
     expect(requests).toHaveLength(0);
-    await expect(settings.getByRole("button", { name: /设为当前|Set as current/ })).toBeDisabled();
+    await expect(settings.getByRole("button", { name: /设为当前|Set as current/ })).toHaveCount(0);
 
     await settings.locator("#ai-config-api-key").fill(firstProfile.apiKey);
     await saveProfile(settings, firstProfile);
-    expect(requests.some((request) => request.isProbe)).toBe(false);
-    await expectOpenProfileOption(settings, originalActiveProfileId, /当前使用|In use/);
-    await expect(settings.getByRole("button", { name: /设为当前|Set as current/ })).toBeEnabled();
+    await expectOpenProfileOption(settings, firstProfileId, /当前使用|In use/);
+    await expect(settings.getByRole("button", { name: /设为当前|Set as current/ })).toHaveCount(0);
+    await expect.poll(() => requests.some((request) =>
+      request.isProbe
+      && request.model === firstProfile.model
+      && request.path === "/v1/chat/completions"
+      && request.authorization === `Bearer ${firstProfile.apiKey}`), { timeout: 30_000 }).toBe(true);
     const draftBaseUrl = `http://127.0.0.1:${port}/draft/v1`;
     await settings.locator("#ai-config-base-url").fill(draftBaseUrl);
     await settings.getByRole("button", { name: /选择模型|Choose model/ }).click();
@@ -294,18 +303,15 @@ test("switches AI profiles for analysis and restores the active profile after re
       model: firstProfile.model,
       baseUrl: draftBaseUrl,
     });
-    await activateSelectedProfile(settings, firstProfile.name);
+    await expect(profileSelector).toContainText(/当前使用|In use/);
 
     await settings.getByRole("button", { name: /^新建$|^Add$/ }).click();
     await saveProfile(settings, secondProfile);
-    // Selecting a saved profile edits its draft; the active marker must stay
-    // on the first profile until the user explicitly activates the second.
-    await profileSelector.click();
-    const firstProfileOption = settings.page().getByRole("listbox").getByRole("option").filter({ hasText: firstProfile.name });
-    await expect(firstProfileOption).toContainText(/当前使用|In use/);
-    await profileSelector.click();
+    // New profiles become current on save. Selecting an existing profile
+    // below only opens its draft until it is explicitly activated.
+    await expect(profileSelector).toContainText(/当前使用|In use/);
+    await expect(settings.getByRole("button", { name: /设为当前|Set as current/ })).toHaveCount(0);
     await testProfile(settings, secondProfile, requests);
-    await activateSelectedProfile(settings, secondProfile.name);
 
     await selectProfile(settings, firstProfile.name);
     await profileSelector.click();
@@ -331,6 +337,7 @@ test("switches AI profiles for analysis and restores the active profile after re
         () => requests.some((request) =>
           !request.isProbe
           && request.model === secondProfile.model
+          && request.path === "/v1/chat/completions"
           && request.authorization === `Bearer ${secondProfile.apiKey}`),
         { timeout: 60_000 },
       )
@@ -362,6 +369,7 @@ test("switches AI profiles for analysis and restores the active profile after re
         () => requests.slice(requestCountBeforeRestartProbe).some((request) =>
           request.isProbe
           && request.model === secondProfile.model
+          && request.path === "/v1/chat/completions"
           && request.authorization === `Bearer ${secondProfile.apiKey}`),
         { timeout: 30_000 },
       )

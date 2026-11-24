@@ -82,6 +82,7 @@ import {
 import {
   tryHandleSyncOwnedRequest,
   applySyncWorkerBindings,
+  bindingNeedsRunAfterManual,
   runSyncProbeWithRetry,
   type SyncServerRecord,
   type SyncBindingRecord,
@@ -178,6 +179,7 @@ import {
 } from "../shared/native-dialog-i18n";
 import {
   createAppUpdateService,
+  reapWindowsInstallerStaging,
   type AppUpdateFetch,
   type AppUpdateService,
 } from './app-update-service';
@@ -224,9 +226,12 @@ import type {
 import { resolveNativeDialogCopy } from '../shared/native-dialog-i18n';
 
 import { popupEditContextMenu } from "./edit-context-menu";
+import { assetClipboard, completeInternalClipboardMove, completeFileClipboardMove, pendingClipboardMoves, rememberClipboardMove, type FileClipboardSnapshot } from './asset-clipboard';
+import { readWin32ClipboardSequenceNumber } from './win32-file-clipboard';
 import {
   createFileClipboardDeps,
   readFilePathsFromClipboard,
+  readFileClipboard,
   writeFilePathsToClipboard,
 } from "./file-clipboard";
 import {
@@ -428,6 +433,7 @@ import {
   parseRendererLifecycleEvent,
   type RendererLifecycleEvent,
   type RendererResult,
+  type WorkerResult,
   type AssetChangeEvent,
   parseAssetChangeEvent,
   type LibraryChangedEvent,
@@ -447,6 +453,7 @@ import { LibraryWorkerClient, WorkerRequestTimeoutError } from "./worker-client"
 import { performanceConsumerIdForWindow } from "../shared/performance-contract";
 import { SyncAutoScheduler, type SyncBindingLike } from "./sync-auto-scheduler";
 import { AppLogger } from "./app-logger";
+import { loadRendererDevUrl } from "./dev-renderer-load";
 import { chooseUniqueSessionLogPath, pruneSessionLogs } from "./session-log";
 import {
   logRendererChildProcessGone,
@@ -526,6 +533,7 @@ import {
 } from "./model-thumbnail-source-cache";
 import {
   createExtensionServer,
+  reapExtensionUploadStaging,
   type ExtensionServer,
   type SaveIntent,
   type SaveIntentDisposition,
@@ -535,6 +543,12 @@ import {
   extensionCollectionSummaries,
   type ListCollectionsDisposition,
 } from "./extension-server";
+import { mapWorkerSaveFailure } from "./extension-save-disposition";
+import {
+  SegmentedSourceValidationError,
+  SegmentedMediaTransferManager,
+  type SegmentedMediaCommitInput,
+} from "./segmented-media-transfer";
 import {
   readExtensionBrowseFolderIds,
   recordExtensionBrowseFolder,
@@ -551,6 +565,7 @@ import {
   rewritePluginUiHtmlAssetUrls,
   pluginUiMimeType,
 } from "./plugin-ui-assets";
+import { resolveE2eRenderingPolicy } from "./e2e-rendering-policy";
 
 // Headless E2E hosts may expose no hardware WebGL implementation. Opt those
 // tests into Chromium's explicitly acknowledged software path; production
@@ -558,6 +573,13 @@ import {
 // SERPENT_SOFTWARE_GL=1 is the same explicit opt-in for users on GPU-less
 // hosts (Linux VMs / remote desktops without a usable GL driver), so the 3D
 // viewer and model thumbnails can render via SwiftShader. Off by default.
+const e2eRenderingPolicy = resolveE2eRenderingPolicy(process.env, app.isPackaged);
+if (e2eRenderingPolicy.nativeGpu && e2eRenderingPolicy.softwareGlEnabled) {
+  throw new Error(
+    "SERPENT_E2E_RENDERING_MODE=native-gpu cannot be combined with SwiftShader or SERPENT_SOFTWARE_GL.",
+  );
+}
+
 if (
   (process.env.SERPENT_E2E === "1" &&
     process.env.SERPENT_E2E_ENABLE_SWIFTSHADER === "1") ||
@@ -605,12 +627,9 @@ if (allowMultiInstance && process.env.SERPENT_E2E !== "1") {
 // over serpent:// Range responses (Serpent-jh2).
 protocol.registerSchemesAsPrivileged(serpentProtocolSchemes());
 
-// E2E（本地/CI）：虚拟化 runner 的 GPU 不可靠，白屏会让所有交互测试
-// 超时（CI mac 上 69 个 E2E 全挂）。禁用硬件加速换取稳定渲染。
-if (
-  process.env.SERPENT_E2E === "1" &&
-  process.env.SERPENT_E2E_ENABLE_SWIFTSHADER !== "1"
-) {
+// Ordinary E2E（本地/CI）：虚拟化 runner 的 GPU 不可靠，禁用硬件加速
+// 换取稳定渲染；native-gpu measurement mode keeps the platform default.
+if (e2eRenderingPolicy.disableHardwareAcceleration) {
   app.disableHardwareAcceleration();
 }
 
@@ -673,6 +692,12 @@ function embeddingHttp(): EmbeddingHttpIndex {
 }
 /** 自动同步调度器（Serpent-bfsb 后续），随 Worker 生命周期启停。 */
 let syncAutoScheduler: SyncAutoScheduler | undefined;
+const manualSyncRuns = new Map<string, {
+  count: number;
+  serverId: string;
+  directoryName?: string;
+  savedBindingDuringRun: boolean;
+}>();
 type ArtifactPathBatchWaiter = {
   artifactId: string;
   generation: number;
@@ -1073,6 +1098,7 @@ function refreshApplicationMenuRecentLibraries(): void {
 }
 
 let extensionServer: ExtensionServer | undefined;
+let segmentedMediaTransferManager: SegmentedMediaTransferManager | undefined;
 let extensionBrowseFoldersStorePath: string | undefined;
 const aiQueueScheduler = new AiQueueScheduler(processAiQueueBatch, {
   batchSize: AI_ANALYSIS_QUEUE_BATCH_SIZE,
@@ -1812,6 +1838,8 @@ let loopbackRelease: Promise<void> | undefined;
 
 function releaseLoopbackListeners(): Promise<void> {
   if (loopbackRelease !== undefined) return loopbackRelease;
+  const segmentedTransferClose = segmentedMediaTransferManager?.dispose() ?? Promise.resolve();
+  segmentedMediaTransferManager = undefined;
   try {
     extensionServer?.server.close();
   } catch (error) {
@@ -1819,7 +1847,7 @@ function releaseLoopbackListeners(): Promise<void> {
   }
   extensionServer = undefined;
   const mcpClose = embeddedMcpServer?.close() ?? Promise.resolve();
-  loopbackRelease = mcpClose.catch((error: unknown) => {
+  loopbackRelease = Promise.all([segmentedTransferClose, mcpClose]).then(() => undefined).catch((error: unknown) => {
     logger?.error("automation.mcp.close", error);
   });
   return loopbackRelease;
@@ -2095,17 +2123,8 @@ function storeStartupPreferences(input: unknown): StartupPreferencesSnapshot {
 
 function handleSecondInstance(): void {
   if (!shouldHandleSecondaryLaunch({ updateHandoff, applicationQuitting })) return;
-  if (
-    MAIN_WINDOW_VITE_DEV_SERVER_URL &&
-    mainWindow &&
-    !mainWindow.isDestroyed()
-  ) {
-    void loadRendererDevUrl(
-      mainWindow,
-      MAIN_WINDOW_VITE_DEV_SERVER_URL,
-    ).finally(() => focusMainWindow());
-    return;
-  }
+  // A second launch while Vite is preparing its first module graph must not
+  // reload the still-loading window and reset its mount deadline.
   focusMainWindow();
 }
 
@@ -2167,133 +2186,17 @@ function resolveE2eIsolatedPlacement(
   return undefined;
 }
 
-const DEV_SERVER_WAIT_MS = 60_000;
-const DEV_SERVER_POLL_MS = 250;
-const DEV_RENDERER_MOUNT_TIMEOUT_MS = 20_000;
-const DEV_RENDERER_LOAD_ATTEMPTS = 4;
-
-interface DevRendererMountSnapshot {
-  mounted: boolean;
-  closed?: boolean;
-  readyState?: string;
-  rootChildCount?: number;
-  resourceCount?: number;
-  recentResources?: Array<{ path: string; duration: number; initiatorType: string }>;
-  probeError?: string;
-}
-
-async function waitForDevServer(
-  url: string,
-  isClosed: () => boolean,
-): Promise<boolean> {
-  const deadline = Date.now() + DEV_SERVER_WAIT_MS;
-  while (Date.now() < deadline) {
-    if (isClosed()) return false;
-    try {
-      const response = await fetch(url, { signal: AbortSignal.timeout(2_000) });
-      if (response.ok) return !isClosed();
-    } catch {
-      // Vite may still be binding; keep polling until the deadline.
-    }
-    await new Promise((resolve) => setTimeout(resolve, DEV_SERVER_POLL_MS));
-  }
-  if (isClosed()) return false;
-  throw new Error(
-    `Renderer dev server did not become reachable within ${DEV_SERVER_WAIT_MS}ms: ${url}`,
-  );
-}
-
-async function inspectRendererMount(
-  webContents: Electron.WebContents,
-): Promise<DevRendererMountSnapshot> {
-  if (webContents.isDestroyed()) return { mounted: false, closed: true };
-  try {
-    return await webContents.executeJavaScript(
-      `(() => ({
-        mounted: Boolean(document.querySelector('#root .app-shell')),
-        readyState: document.readyState,
-        rootChildCount: document.getElementById('root')?.childElementCount ?? 0,
-        resourceCount: performance.getEntriesByType('resource').length,
-        recentResources: performance.getEntriesByType('resource').slice(-5).map(resource => ({
-          path: new URL(resource.name).pathname,
-          duration: Math.round(resource.duration),
-          initiatorType: resource.initiatorType,
-        })),
-      }))()`,
-    );
-  } catch (error) {
-    return {
-      mounted: false,
-      ...(webContents.isDestroyed() ? { closed: true } : {}),
-      probeError: error instanceof Error ? error.message : String(error),
-    };
-  }
-}
-
-async function waitForRendererMounted(
-  webContents: Electron.WebContents,
-  timeoutMs = DEV_RENDERER_MOUNT_TIMEOUT_MS,
-): Promise<DevRendererMountSnapshot> {
-  const deadline = Date.now() + timeoutMs;
-  let snapshot: DevRendererMountSnapshot = { mounted: false };
-  while (Date.now() < deadline) {
-    snapshot = await inspectRendererMount(webContents);
-    if (snapshot.mounted || snapshot.closed) return snapshot;
-    await new Promise((resolve) => setTimeout(resolve, DEV_SERVER_POLL_MS));
-  }
-  return snapshot;
-}
-
-async function loadRendererDevUrl(
-  window: BrowserWindow,
-  url: string,
-): Promise<void> {
-  const startedAt = Date.now();
-  const isClosed = () => window.isDestroyed() || window.webContents.isDestroyed();
-  let snapshot: DevRendererMountSnapshot | undefined;
-  for (let attempt = 1; attempt <= DEV_RENDERER_LOAD_ATTEMPTS; attempt++) {
-    if (isClosed()) return;
-    const attemptStartedAt = Date.now();
-    try {
-      if (!await waitForDevServer(url, isClosed)) return;
-      await window.loadURL(url);
-    } catch (error) {
-      if (isClosed()) return;
-      logger?.error("main.window.load-attempt", error, { attempt, url, elapsedMs: Date.now() - startedAt });
-      await new Promise((resolve) => setTimeout(resolve, 400 * attempt));
-      continue;
-    }
-    snapshot = await waitForRendererMounted(window.webContents);
-    if (snapshot.closed || isClosed()) return;
-    if (snapshot.mounted) {
-      logger?.info("main.window.mount-verified", "Renderer shell visible.", {
-        attempt,
-        url,
-        elapsedMs: Date.now() - startedAt,
-      });
-      return;
-    }
-    logger?.info(
-      "main.window.mount-retry",
-      "Renderer still blank after load; retrying.",
-      { attempt, url, elapsedMs: Date.now() - startedAt, attemptElapsedMs: Date.now() - attemptStartedAt, snapshot },
-    );
-    await new Promise((resolve) => setTimeout(resolve, 400 * attempt));
-  }
-  if (isClosed()) return;
-  logger?.error(
-    "main.window.mount-failed",
-    new Error("Renderer remained blank after dev load retries."),
-    { url, attempts: DEV_RENDERER_LOAD_ATTEMPTS, elapsedMs: Date.now() - startedAt, snapshot },
-  );
-  throw new Error(`Renderer remained blank after dev load retries: ${url}`);
-}
-
 function attachRendererDiagnostics(window: BrowserWindow): void {
   window.webContents.on(
     "console-message",
-    (_event, level, message, line, sourceId) => {
-      logRendererConsoleMessage(logger, level, message, line, sourceId);
+    (details) => {
+      logRendererConsoleMessage(
+        logger,
+        details.level,
+        details.message,
+        details.lineNumber,
+        details.sourceId,
+      );
     },
   );
   window.webContents.on("render-process-gone", (_event, details) => {
@@ -2351,10 +2254,13 @@ async function createMainWindow(): Promise<void> {
       sandbox: true,
       contextIsolation: true,
       nodeIntegration: false,
-      // The opt-in performance harness needs frames while remaining hidden.
-      ...(process.env.SERPENT_E2E === "1" && process.env.SERPENT_E2E_PERF_OFFSCREEN === "1"
+      // E2E performance modes keep frames running while hidden; native-gpu
+      // measures the ordinary native window surface rather than offscreen paint.
+      ...(e2eRenderingPolicy.offscreen
         ? { offscreen: true, backgroundThrottling: false }
-        : {}),
+        : e2eRenderingPolicy.disableBackgroundThrottling
+          ? { backgroundThrottling: false }
+          : {}),
     },
   });
 
@@ -2365,7 +2271,7 @@ async function createMainWindow(): Promise<void> {
   // A blank window in a packaged build must leave the same evidence as one
   // started from Vite; idle windows produce no log entries.
   attachRendererDiagnostics(window);
-  window.on("ready-to-show", () => {
+  const showMainWindowIfAllowed = (): void => {
     // E2E can keep its renderer fully loaded and automatable without putting
     // a test window over the user's desktop session. An update handoff stays
     // hidden so a second launch cannot flash a window.
@@ -2378,10 +2284,12 @@ async function createMainWindow(): Promise<void> {
         && process.env.SERPENT_E2E_HIDE_WINDOW === "1"
         && !e2eShowInactive,
     })) {
+      if (window.isVisible()) return;
       if (e2eShowInactive) window.showInactive();
       else window.show();
     }
-  });
+  };
+  window.on("ready-to-show", showMainWindowIfAllowed);
   // Cleanup while webContents/HWND still exist (`closed` is too late).
   window.on("close", () => {
     clearViewerVideoShortcutCapture(mainContentsId);
@@ -2562,6 +2470,22 @@ async function createMainWindow(): Promise<void> {
   });
 
   if (MAIN_WINDOW_VITE_DEV_SERVER_URL) {
+    let devModuleNetworkChanged = false;
+    const devOrigin = new URL(MAIN_WINDOW_VITE_DEV_SERVER_URL).origin;
+    const devSession = window.webContents.session;
+    devSession.webRequest.onErrorOccurred(
+      { urls: [`${devOrigin}/*`] },
+      (details) => {
+        if (details.webContentsId === window.webContents.id
+          && details.resourceType === "script"
+          && details.error === "net::ERR_NETWORK_CHANGED") {
+          devModuleNetworkChanged = true;
+        }
+      },
+    );
+    window.once("closed", () => {
+      devSession.webRequest.onErrorOccurred(null);
+    });
     window.webContents.on("did-fail-load", (_event, errorCode, errorDescription, validatedURL) => {
       if (errorCode === -3) return; // aborted
       const detail = [
@@ -2576,7 +2500,24 @@ async function createMainWindow(): Promise<void> {
       dialog.showErrorBox("Serpent renderer failed to load", detail);
     });
     try {
-      await loadRendererDevUrl(window, MAIN_WINDOW_VITE_DEV_SERVER_URL);
+      await loadRendererDevUrl(window, MAIN_WINDOW_VITE_DEV_SERVER_URL, logger, {
+        consumeNetworkChange: () => {
+          const changed = devModuleNetworkChanged;
+          devModuleNetworkChanged = false;
+          return changed;
+        },
+        // A cold Vite module graph can leave a hidden BrowserWindow without a
+        // first paint. Showing it after navigation lets Chromium schedule the
+        // Renderer normally; the E2E hidden-window policy is still respected.
+        onNavigated: () => {
+          const visibleBefore = window.isVisible();
+          showMainWindowIfAllowed();
+          logger?.info("main.window.dev-navigation", "Renderer navigation completed.", {
+            visibleBefore,
+            visibleAfter: window.isVisible(),
+          });
+        },
+      });
     } catch (error) {
       logger?.error("main.window.dev-load", error);
       dialog.showErrorBox(
@@ -2811,21 +2752,22 @@ async function handleSaveIntent(
           reason: result.error.reason,
         },
       );
-      return {
-        accepted: false,
-        status: result.error.code === "LIBRARY_NOT_OPEN" ? 503 : 422,
-        reason: result.error.reason ?? result.error.code,
-      };
+      return mapWorkerSaveFailure(result);
     }
     logger?.info("extension-server.save", "Asset saved successfully.", {
       type: result.type,
     });
-    if (result.type === "extension.asset-saved") {
+    if (result.type === "extension.asset-saved" && !result.duplicate) {
       void enqueueAutoAnalyzeAfterImport(saveContext.libraryId, [
         result.asset.assetId,
       ]);
     }
-    return { accepted: true };
+    return {
+      accepted: true,
+      ...(result.type === "extension.asset-saved" && result.duplicate
+        ? { duplicate: true as const }
+        : {}),
+    };
   } catch (error) {
     logger?.error("extension-server.save", error);
     throw error;
@@ -2858,6 +2800,9 @@ async function handleSaveUpload(
     );
     return { accepted: false, status: 503, reason: "no active library" };
   }
+  if (upload.expectedLibraryId !== undefined && upload.expectedLibraryId !== saveContext.libraryId) {
+    return { accepted: false, status: 409, reason: "the original library is no longer active" };
+  }
 
   const targetFolderId = upload.targetCollectionId
     ? undefined
@@ -2867,6 +2812,7 @@ async function handleSaveUpload(
 
   const command: WorkerCommand = {
     type: "extension.save-from-file",
+    kind: upload.kind,
     libraryId: saveContext.libraryId,
     targetFolderId,
     sourcePageUrl: upload.sourcePageUrl,
@@ -2887,11 +2833,7 @@ async function handleSaveUpload(
           reason: result.error.reason,
         },
       );
-      return {
-        accepted: false,
-        status: result.error.code === "LIBRARY_NOT_OPEN" ? 503 : 422,
-        reason: result.error.reason ?? result.error.code,
-      };
+      return mapWorkerSaveFailure(result);
     }
     if (result.type !== "extension.asset-saved") {
       return { accepted: false, status: 500, reason: "unexpected worker response" };
@@ -2929,19 +2871,92 @@ async function handleSaveUpload(
         asset: result.asset,
       });
     }
-    void enqueueAutoAnalyzeAfterImport(saveContext.libraryId, [
-      result.asset.assetId,
-    ]);
-    return { accepted: true };
+    if (!result.duplicate) {
+      void enqueueAutoAnalyzeAfterImport(saveContext.libraryId, [
+        result.asset.assetId,
+      ]);
+    }
+    return {
+      accepted: true,
+      ...(result.duplicate ? { duplicate: true as const } : {}),
+    };
   } catch (error) {
     logger?.error("extension-server.save-upload", error);
     throw error;
-  } finally {
-    try {
-      rmSync(upload.stagingDirectory, { recursive: true, force: true });
-    } catch (error) {
-      logger?.error("extension-server.save-upload-cleanup", error);
+  }
+}
+
+async function commitSegmentedMediaTransfer(
+  transfer: SegmentedMediaCommitInput,
+): Promise<{ duplicate?: true }> {
+  if (!workerClient) throw new Error("Worker unavailable");
+  const result = await workerClient.request({
+    type: "extension.save-segmented-video",
+    libraryId: transfer.target.libraryId,
+    transferId: transfer.sessionId,
+    ...(transfer.target.targetFolderId === undefined
+      ? {}
+      : { targetFolderId: transfer.target.targetFolderId }),
+    sourcePageUrl: transfer.sourcePageUrl,
+    mediaUrl: transfer.mediaUrl,
+    stagingDirectory: transfer.stagingDirectory,
+    contentType: "video/mp4",
+    filename: transfer.filename,
+    protocol: transfer.protocol,
+    totalBytes: transfer.totalBytes,
+    tracks: transfer.tracks,
+  });
+  if (!result.ok) {
+    if (result.errorCode === "SEGMENTED_SOURCE_VALIDATION") {
+      throw new SegmentedSourceValidationError(result.error.reason ?? "The selected video failed media validation.");
     }
+    throw new Error(result.error.reason ?? result.error.code);
+  }
+  if (result.type !== "extension.asset-saved") throw new Error("Unexpected segmented media worker response");
+
+  if (transfer.target.targetCollectionId) {
+    const added = await workerClient.request({
+      type: "collection.assets.add",
+      libraryId: transfer.target.libraryId,
+      collectionId: transfer.target.targetCollectionId,
+      assetIds: [result.asset.assetId],
+    });
+    if (!added.ok || added.type !== "collection.assets.added") {
+      throw new Error(added.ok ? "Unable to add the asset to its collection" : added.error.reason ?? added.error.code);
+    }
+  }
+  logger?.info("extension-server.segmented-media", "Segmented video saved successfully.", {
+    transferId: transfer.sessionId,
+    byteLength: transfer.totalBytes,
+    assetId: result.asset.assetId,
+  });
+  if (transfer.focusAppAfterSave) {
+    focusSerpentWindow(transfer.target.targetWindowId ?? undefined);
+  }
+  if (transfer.revealInLibrary) {
+    publishExtensionSaveCompleted(transfer.target.targetWindowId ?? null, {
+      type: "extension.save.completed",
+      libraryId: transfer.target.libraryId,
+      asset: result.asset,
+    });
+  }
+  if (!result.duplicate) {
+    void enqueueAutoAnalyzeAfterImport(transfer.target.libraryId, [result.asset.assetId]);
+  }
+  return result.duplicate ? { duplicate: true } : {};
+}
+
+async function cancelSegmentedMediaWorkerTransfer(
+  transferId: string,
+): Promise<void> {
+  if (!workerClient) return;
+  const result = await workerClient.request({
+    type: "extension.cancel-segmented-video",
+    transferId,
+  });
+  if (!result.ok) throw new Error(result.error.reason ?? result.error.code);
+  if (result.type !== "extension.segmented-video.cancelled") {
+    throw new Error("Unexpected segmented media cancellation response");
   }
 }
 
@@ -3390,7 +3405,8 @@ async function commandFor(
     case "library.open-recent.request":
     case "library.forget-recent.request":
     case "library.open-cancel.request":
-    case "library.choose-path.request": {
+    case "library.choose-path.request":
+    case "library.choose-create-location.request": {
       return executeLibraryMainCommand(request, {
         selectDirectory,
         createNativeDialogHost,
@@ -3643,6 +3659,9 @@ async function commandFor(
     case "asset.retry-artifact.request": {
       return executeMediaPathMainCommand(request);
     }
+    case 'asset.clipboard-state.request':
+      // Clipboard state is resolved in Main before commandFor dispatch.
+      return undefined;
     case "sync.servers.list.request":
     case "sync.servers.upsert.request":
     case "sync.servers.delete.request":
@@ -3706,6 +3725,8 @@ async function handleLibraryRequest(
   let operation: "create" | "open" | "import" | "open-eagle" | "open-billfish" | undefined;
   let lifecyclePublished = false;
   let clipboardStageDirectory: string | undefined;
+  let pastedAssetClipboardSnapshot: FileClipboardSnapshot | undefined;
+  let pastedFileClipboardMoveSnapshot: FileClipboardSnapshot | undefined;
   let command: WorkerCommand | undefined;
   let retainExternalSource = false;
   let deleteFromDiskLibraryId: string | undefined;
@@ -3816,6 +3837,18 @@ async function handleLibraryRequest(
       encryptPassword: (password) =>
         safeStorage.encryptString(password).toString("base64"),
       syncNow: (libraryId) => {
+        const manual = manualSyncRuns.get(libraryId);
+        if (manual) {
+          const binding = readSyncBindings()[libraryId];
+          // The in-flight manual run already covers this binding. A rebind to
+          // another remote still needs one run after the manual one finishes.
+          if (bindingNeedsRunAfterManual(binding, manual)) {
+            syncAutoScheduler?.syncNow(libraryId);
+          } else {
+            manual.savedBindingDuringRun = true;
+          }
+          return;
+        }
         syncAutoScheduler?.syncNow(libraryId);
       },
     });
@@ -3946,11 +3979,18 @@ async function handleLibraryRequest(
         },
         clipboardAvailableFormats: () => clipboard.availableFormats(),
         readClipboardFilePaths: () => readFilePathsFromClipboard(createFileClipboardDeps()),
+        readFileClipboard: () => readFileClipboard(createFileClipboardDeps()),
+        readClipboardSequence: readWin32ClipboardSequenceNumber,
+        onCutPasteCompleted: (snapshot, assetIds, folderIds) => completeInternalClipboardMove(snapshot, assetIds, folderIds, {
+          read: () => readFileClipboard(createFileClipboardDeps()), clear: () => clipboard.clear(),
+        }),
       });
       if (ingestion?.kind === "result") return ingestion.result;
       if (ingestion?.kind === "command") {
         command = ingestion.command;
         clipboardStageDirectory = ingestion.clipboardStageDirectory;
+        pastedAssetClipboardSnapshot = ingestion.assetClipboardSnapshot;
+        pastedFileClipboardMoveSnapshot = ingestion.fileClipboardMoveSnapshot;
       } else {
         command = await commandFor(
           request,
@@ -4030,7 +4070,34 @@ async function handleLibraryRequest(
             { workerCommand: command.type },
           );
         }
-        const result = await workerClient.request(command, { consumerId: options.consumerId });
+        const manualRequest = request.type === "sync.run.request" ? request : undefined;
+        const manualLibraryId = manualRequest?.libraryId;
+        if (manualLibraryId !== undefined) {
+          const active = manualSyncRuns.get(manualLibraryId);
+          manualSyncRuns.set(manualLibraryId, {
+            count: (active?.count ?? 0) + 1,
+            serverId: manualRequest!.serverId,
+            directoryName: manualRequest!.directoryName,
+            savedBindingDuringRun: active?.savedBindingDuringRun ?? false,
+          });
+        }
+        let result: WorkerResult | undefined;
+        try {
+          result = await workerClient.request(command, { consumerId: options.consumerId });
+        } finally {
+          if (manualLibraryId !== undefined) {
+            const active = manualSyncRuns.get(manualLibraryId);
+            if (active && active.count > 1) {
+              manualSyncRuns.set(manualLibraryId, { ...active, count: active.count - 1 });
+            } else {
+              manualSyncRuns.delete(manualLibraryId);
+              syncAutoScheduler?.manualSyncFinished(
+                manualLibraryId,
+                Boolean(active?.savedBindingDuringRun && (!result || !result.ok)),
+              );
+            }
+          }
+        }
         if (traceLibraryRequest) {
           logger?.info(
             "diag.library-request.dispatched",
@@ -4040,6 +4107,24 @@ async function handleLibraryRequest(
         }
         return result;
       })();
+    const clipboardImportId = request.type === 'asset.import.resolve' || request.type === 'asset.import.skip-source-failure' || request.type === 'asset.import.abandon'
+      ? request.importId : undefined;
+    const fileMoveSnapshot = pastedFileClipboardMoveSnapshot ?? (clipboardImportId ? pendingClipboardMoves.get(clipboardImportId) : undefined);
+    if (fileMoveSnapshot && workerResult.ok) {
+      if (workerResult.type === 'asset.import.conflicts' || workerResult.type === 'asset.import.source-failure') {
+        rememberClipboardMove(workerResult.plan.importId, fileMoveSnapshot);
+      } else if (workerResult.type === 'asset.import.completed') {
+        completeFileClipboardMove(fileMoveSnapshot, {
+          read: () => readFileClipboard(createFileClipboardDeps()),
+          exists: existsSync,
+          write: (paths) => writeFilePathsToClipboard(paths, createFileClipboardDeps(), 'cut'),
+          clear: () => clipboard.clear(),
+        });
+        if (clipboardImportId) pendingClipboardMoves.delete(clipboardImportId);
+      }
+    }
+    if (request.type === 'asset.import.abandon') pendingClipboardMoves.delete(request.importId);
+
     if (navigationTrace) {
       navigationTrace.workerReturnedAt = performance.now();
       logNavigationStage("worker-returned", {
@@ -4170,8 +4255,11 @@ async function handleLibraryRequest(
       writeClipboardText: (text) => {
         clipboard.writeText(text);
       },
-      writeClipboardFilePaths: (absolutePaths) =>
-        writeFilePathsToClipboard(absolutePaths, createFileClipboardDeps()),
+      writeClipboardFilePaths: (absolutePaths, operation) =>
+        writeFilePathsToClipboard(absolutePaths, createFileClipboardDeps(), operation),
+      rememberAssetClipboard: (libraryId, assetIds, operation, folderIds) => {
+        assetClipboard.remember(libraryId, assetIds, readFileClipboard(createFileClipboardDeps()), operation, folderIds);
+      },
       openWith: (absolutePath) =>
         openPathWithOtherApplication(
           absolutePath,
@@ -4179,6 +4267,24 @@ async function handleLibraryRequest(
         ),
     });
     if (mediaShellResult) return mediaShellResult;
+
+    if (request.type === 'folder.paste.request' && workerResult.ok &&
+      (workerResult.type === 'asset.moved' || workerResult.type === 'asset.copied')) {
+      if (workerResult.type === 'asset.moved' && command.type === 'asset.move' && workerResult.skippedCount === 0) {
+        const snapshot = readFileClipboard(createFileClipboardDeps());
+        const current = assetClipboard.read(snapshot);
+        if (current?.libraryId === command.libraryId && JSON.stringify(current.snapshot) === JSON.stringify(pastedAssetClipboardSnapshot)) {
+          assetClipboard.completed(command);
+          if (!snapshot.unavailable && !assetClipboard.read(snapshot)) clipboard.clear();
+        }
+      }
+      const count = workerResult.type === 'asset.moved' ? workerResult.movedCount : workerResult.copiedCount;
+      return { ok: true, type: 'asset.import.completed', completion: {
+        pasteAction: count === 0 && workerResult.type === 'asset.moved' ? 'noop' : workerResult.type === 'asset.moved' ? 'move' : 'copy',
+        importedCount: count, fileCount: count, assetCount: count,
+        replacedCount: 0, skippedCount: workerResult.skippedCount, assets: workerResult.assets,
+      } } satisfies RendererResult;
+    }
 
     const importPostProcess = await applyImportWorkerResult(request, workerResult, {
       pendingImportLibraries,
@@ -4698,7 +4804,7 @@ async function normalizeMcpCommandInput(input: {
  * A Windows installer keeps its executable locked while it is running, and
  * the main process exits immediately after handing it off. A detached hidden
  * PowerShell worker removes the installer directory after setup releases it.
- * The path is generated by the update service under the OS temp directory.
+ * The path is generated by the update service under this profile's staging root.
  */
 async function scheduleWindowsInstallerCleanup(
   installerPath: string,
@@ -4831,13 +4937,19 @@ async function startApplication(): Promise<void> {
   logger = new AppLogger(appLogPath);
   bindRendererKeyboardFocusLogger(logger);
   void sweepOrphanExternalLibraryStagingOnStartup();
+  const updateStagingRoot = path.join(app.getPath('userData'), 'update-staging');
+  if (process.platform === 'win32') {
+    await reapWindowsInstallerStaging(updateStagingRoot, (error) => {
+      logger?.error('app-update.stale-staging', error);
+    });
+  }
   appUpdateService = createAppUpdateService({
     currentVersion: app.getVersion(),
     isPackaged: app.isPackaged,
     platform: process.platform,
     arch: process.arch,
     executablePath: app.getPath('exe'),
-    tempDirectory: app.getPath('temp'),
+    tempDirectory: updateStagingRoot,
     downloadsDirectory: app.getPath('downloads'),
     environment: process.env,
     fetchImpl: createAppUpdateE2eFetch(),
@@ -4927,6 +5039,7 @@ async function startApplication(): Promise<void> {
     logRendererChildProcessGone(logger, undefined, details);
   });
   applyDevAppIcon();
+  const uploadStagingRoot = path.join(app.getPath("userData"), "extension-uploads");
   const staleClipboardCount = cleanupStaleClipboardImages(app.getPath("temp"));
   if (staleClipboardCount > 0) {
     logger.info(
@@ -4947,6 +5060,7 @@ async function startApplication(): Promise<void> {
         'library-metadata-cache',
       ),
       SERPENT_SEMANTIC_LEGACY_CACHE_ROOT: app.getPath('userData'),
+      SERPENT_EXTENSION_STAGING_ROOT: uploadStagingRoot,
       SERPENT_MAIN_PROCESS_SESSION_ID: mainProcessSessionId,
     },
   );
@@ -5266,6 +5380,7 @@ async function startApplication(): Promise<void> {
               sessionId: input.sessionId,
               title: input.title,
               ...(input.submitLabel === undefined ? {} : { submitLabel: input.submitLabel }),
+              ...(input.width === undefined ? {} : { width: input.width }),
               tree: input.tree,
             });
             ensureRendererKeyboardFocus(window, {
@@ -6260,6 +6375,7 @@ async function startApplication(): Promise<void> {
     readBindings: () => readSyncBindings() as unknown as Record<string, SyncBindingLike>,
     writeBindings: (bindings) => writeSyncBindings(bindings as unknown as Record<string, SyncBindingRecord>),
     resolveCredentials: (serverId) => resolveSyncServerCredentials(serverId),
+    isManualSyncActive: (libraryId) => manualSyncRuns.has(libraryId),
     logger,
   });
   syncAutoScheduler.start();
@@ -7290,6 +7406,7 @@ async function startApplication(): Promise<void> {
     if (!mainWindow || event.sender !== mainWindow.webContents) return;
     if (input === "paste") event.sender.paste();
     if (input === "select-all") event.sender.selectAll();
+    if (input === "cut") event.sender.cut();
   });
 
   // Bootstrap dialog locale from OS before Renderer syncs (Serpent-bwb).
@@ -7496,9 +7613,39 @@ async function startApplication(): Promise<void> {
 
   // Start the browser-extension HTTP server on 127.0.0.1.
   try {
+      segmentedMediaTransferManager = new SegmentedMediaTransferManager(
+        app.getPath("temp"),
+        {
+          resolveTarget: async (request) => {
+            const routing = getExtensionSaveRouting();
+            const context = routing.context;
+            if (!context) return undefined;
+            const targetFolderId = request.targetCollectionId
+              ? undefined
+              : request.targetFolderId !== undefined
+                ? request.targetFolderId ?? undefined
+                : context.selectedFolderId;
+            return {
+              libraryId: context.libraryId,
+              ...(targetFolderId === undefined ? {} : { targetFolderId }),
+              ...(request.targetCollectionId === undefined
+                ? {}
+                : { targetCollectionId: request.targetCollectionId }),
+              targetWindowId: routing.targetWindowId,
+            };
+          },
+          commit: commitSegmentedMediaTransfer,
+          cancelCommit: cancelSegmentedMediaWorkerTransfer,
+        },
+      );
+      await segmentedMediaTransferManager.initialize();
+    await reapExtensionUploadStaging(uploadStagingRoot, (error) => {
+      logger?.error("extension-server.stale-upload", error);
+    });
     extensionServer = await createExtensionServer({
       port: 19876,
-      uploadStagingRoot: app.getPath("temp"),
+      uploadStagingRoot,
+      segmentedMediaTransferManager,
       onListFolders: handleListFolders,
       onListCollections: handleListCollections,
       onSaveIntent: handleSaveIntent,

@@ -1,3 +1,7 @@
+import { readFocusedNavFolder } from "./folder-shortcut-dispatch";
+import { useAssetCutState } from './use-asset-cut-state';
+import { clipboardSelectionIds } from './clipboard-selection';
+import { useMediaPlayback } from './use-media-playback';
 import { LocalConfirmationHost, useLocalConfirmation, requestConfirmation } from "./local-confirmation";
 import {
   useCallback,
@@ -48,6 +52,8 @@ import {
 } from "./asset-card-hover-preview";
 import { shouldShowThumbnailFailureBadge } from "./thumbnail-failure-badge";
 import { viewportPriorityReportKey } from "../shared/viewport-priority";
+import { createCoalescedFrame, VIEWPORT_REPORT_INTERVAL_MS } from "./coalesced-frame";
+import { CANVAS_LAYOUT_COMMITTED_EVENT } from "./canvas-layout-commit-signal";
 import {
   collectIntersectingCanvasAssetIds,
   composeBrowseViewportPriorityBands,
@@ -63,11 +69,14 @@ import { useAssetCardHoverPreview } from "./use-asset-card-hover-preview";
 import { SyncCardStatusBadge } from "./SyncCardStatusBadge";
 import { useSyncCardStatuses } from "./use-sync-card-status";
 import { resolveSearchSnippetCaption } from "./search-snippet-caption";
-import { parseSearchExpression, splitSearchHighlights } from "./search-expression";
+import { parseSearchExpressionDetailed, searchExpressionReasonKey, splitSearchHighlights } from "./search-expression";
+import type { parseSearchExpression } from "./search-expression";
 import { ConvertLinkedDialog } from "./ConvertLinkedDialog";
 import { LinkedRulesDialog } from "./LinkedRulesDialog";
 import { TagManagementWorkspace } from "./TagManagementWorkspace";
 import { useFolderDeleteActions } from "./use-folder-delete-actions";
+import { FolderMutationProjectionGate } from "./folder-mutation-projection";
+import { useFolderMutationBridge } from "./use-folder-mutation-bridge";
 import { canDeleteAssetFromDiskWithShortcut } from "./browse-key-command";
 import { filteredFolderBrowseEntries } from "./filtered-folder-visibility";
 import { useFilteredFolderCounts } from "./use-filtered-folder-counts";
@@ -81,6 +90,7 @@ import {
   readSearchHistory,
   readVisibleSearchHistoryCount,
   rememberSearchQuery,
+  searchHistoryNavigationDirection,
 } from "./search-history";
 import { useWindowsBrowseShortcutBridge } from "./use-windows-browse-shortcut-bridge";
 import { useCollectionCommandShortcuts } from "./use-collection-command-shortcuts";
@@ -94,10 +104,8 @@ import type { ShortcutEventLike } from "../shared/shortcut-resolution";
 import { ExportDialog } from "./ExportDialog";
 import { ImportDialog } from "./ImportDialog";
 import { ImportLibraryChooserDialog, OpenLibraryChooserDialog } from "./ImportLibraryChooserDialog";
-import {
-  NavigationSidebar,
-  type FolderTreeExpandActions,
-} from "./NavigationSidebar";
+import type { FolderTreeExpandActions } from "./NavigationSidebar";
+import { NavigationSidebarBoundary } from "./navigation-sidebar-boundary";
 import { LibrarySwitcher, buildRecentLibraryMenuEntries, type RecentLibraryMenuEntry } from "./LibrarySwitcher";
 import {
   LibraryLoadingOverlay,
@@ -150,6 +158,7 @@ import {
 import {
   resolveBrowseCanvasBodyLayout,
   resolveFolderBrowseParentId,
+  resolveBrowseCreateFolderParentId,
   shouldShowFolderBrowseCards,
 } from "./folder-browse-canvas";
 import { useFolderInspector } from "./folder-inspector";
@@ -225,6 +234,7 @@ import type {
 } from "./workspace-render-snapshot-cache";
 import {
   createDefaultWorkspaceTabBrowseState,
+  resolveWorkspaceTagExpression,
   workspaceTabBrowseStateHasDiscoveryInput,
   type WorkspaceTabBrowseState,
   type WorkspaceTabSession,
@@ -310,6 +320,7 @@ import {
   shouldApplyLibraryLifecycleEvent,
   shouldDetachLibraryOnOpening,
 } from "./library-lifecycle-sync";
+import { createLibraryClosedHandler } from "./library-closed-view-ownership";
 import { shouldRefreshContentForLibraryChange } from "./library-change-refresh";
 import { AboutDialog } from "./AboutDialog";
 import { OpenSourceLicensesDialog } from "./OpenSourceLicensesDialog";
@@ -366,7 +377,7 @@ import {
   appendMediaJobListPage,
   applyMediaJobSummary,
   replaceMediaJobListPage,
-  type MediaJobSummaryCounts,
+  type MediaJobSummarySnapshot,
 } from "./media-job-status-state";
 import { MEDIA_JOB_LIST_PAGE_SIZE } from "../shared/media-jobs";
 import { retryMediaJobs } from "./media-job-controls";
@@ -440,12 +451,13 @@ import {
   MANAGED_FOLDERS_DRAG_TYPE,
   resolveDraggedFolderIds,
 } from "./folder-drag-drop";
-import { importSummaryMessage } from "./import-summary";
+import { importSummaryMessage, shouldNotifyImportCompletion } from "./import-summary";
 import { automationCommandToast } from "./automation-command-toast";
 import {
   resolveDialogEscapeAction,
   type DialogEscapeSnapshot,
 } from "./dialog-escape-stack";
+import { beginInlineRenameTextSelection } from "./inline-rename-text-selection";
 import { splitAssetFileName, useAssetRename } from "./useAssetRename";
 import { useInlineFolderEdit } from "./use-inline-folder-edit";
 import { useInlineSmartCollectionEdit } from "./use-inline-smart-collection-edit";
@@ -474,6 +486,7 @@ import { DimensionFilterBar } from "./DimensionFilterBar";
 import { buildTagFilterClauses, resolveTagFilterSets } from "./dimension-filter-selection";
 import {
   buildActiveFilterChips,
+  clearTagDiscoveryFilter,
   type ClearableFilterId,
 } from "./active-discovery-filters";
 import { resolveBrowseEmptyState, resolveImportMenuCopy } from "./browse-empty-state";
@@ -598,6 +611,7 @@ import {
 } from "./plugin-context-state";
 import { createPluginMenuContributionContext } from "./plugin-contribution-context";
 import { InspectorPanel } from "./InspectorPanel";
+import { dispatchFocusedTagClipboardCommand } from "./inspector-tag-shortcuts";
 import {
   assetCaptionAlignClass,
   nextCanvasCaptionAlign,
@@ -660,9 +674,14 @@ import { JustifiedAssetRows } from "./justified-asset-rows";
 import { MasonryColumns } from "./masonry-columns";
 import {
   applyAssetThumbnailPatches,
-  mergeAssetThumbnailPatch,
+  AssetDimensionPublicationTracker,
   type AssetThumbnailPatch,
 } from "./asset-thumbnail-patches";
+import {
+  AssetThumbnailPatchQueue,
+  DeferredVersionedThumbnailPatches,
+  resolveQueuedAssetThumbnailPatches,
+} from "./asset-thumbnail-patch-queue";
 import {
   expandThumbnailCardEvents,
   shouldProjectThumbnailCompletion,
@@ -675,15 +694,19 @@ import {
   type CanvasAnchor,
 } from "./canvas-scroll-anchor";
 import {
+  cancelScheduledAnchorRestore,
   captureReflowAnchorFromCards,
   retainReflowAnchor,
   scheduleAnchorRestore,
   type ScrollOffsetSnapshot,
 } from "./canvas-reflow-restore";
+import { interruptPreviewReturnForReflow } from "./preview-return-interruption";
 import {
   captureBrowseViewSnapshot,
   type BrowseViewSnapshot,
 } from "./view-restore";
+import { tagRenameError } from "./tag-rename-error";
+import { tagBrowseDefinition } from "./tag-browse-definition";
 import { scheduleBrowseViewRestore } from "./browse-view-restore-scheduler";
 import {
   canvasHasPreviewScrollHold,
@@ -783,6 +806,9 @@ type QueryFilterSnapshot = {
   formatFilter: string;
   excludeFormatFilter: boolean;
   tagFilter: string;
+  tagFilterExpression?: string;
+  tagFilterMode?: "selection" | "expression";
+  tagFilterLastValidExpression?: string;
   excludeTagFilter: boolean;
   excludedTagFilter: string;
   includeAiTagFilter: boolean;
@@ -947,6 +973,8 @@ function AppInner() {
     ids: Map<string, string>;
   }>({ libraryId: "", ids: new Map() });
   const [assetScope, setAssetScope] = useState<AssetScope>("all");
+  const assetScopeRef = useRef<AssetScope>(assetScope);
+  assetScopeRef.current = assetScope;
   // REQ-FOLDER-001/002/003/010: direct child folder cards shown above assets
   // when the current browse parent is a managed folder or the managed root.
   const [folderBrowseEntries, setFolderBrowseEntries] = useState<FolderBrowseEntry[]>([]);
@@ -1015,6 +1043,7 @@ function AppInner() {
   const libraryTransitionInlineOpeningRef = useRef<
     "open-eagle" | "open-billfish" | null
   >(null);
+  const libraryLocationOperationRef = useRef(false);
   const libraryWriteDepthRef = useRef(0);
   const libraryWriteInFlightRef = useRef(false);
   const [, forceLibraryWriteState] = useState(false);
@@ -1399,6 +1428,8 @@ function AppInner() {
     string | null
   >(null);
   const [searchValue, setSearchValue] = useState("");
+  const lastValidSearchQueryRef = useRef<{ scope: string; query: ReturnType<typeof parseSearchExpression> } | null>(null);
+  const lastValidFolderSearchQueryRef = useRef<{ scope: string; query: ReturnType<typeof parseSearchExpression> } | null>(null);
   const searchInputRef = useRef<HTMLInputElement>(null);
   const [storedSearchHistory, setStoredSearchHistory] = useState<{
     libraryId: string;
@@ -1427,6 +1458,9 @@ function AppInner() {
   const [colorFilterPrefs, setColorFilterPrefs] = useState(loadColorFilterPreferences);
   const [excludeColorFilter, setExcludeColorFilter] = useState(false);
   const [tagFilter, setTagFilter] = useState("");
+  const [tagFilterExpression, setTagFilterExpression] = useState("");
+  const [tagFilterMode, setTagFilterMode] = useState<"selection" | "expression">("expression");
+  const [tagFilterLastValidExpression, setTagFilterLastValidExpression] = useState("");
   const [excludeTagFilter, setExcludeTagFilter] = useState(false);
   const [excludedTagFilter, setExcludedTagFilter] = useState("");
   const [includeAiTagFilter, setIncludeAiTagFilter] = useState(true);
@@ -1492,61 +1526,6 @@ function AppInner() {
   const [searchSnippets, setSearchSnippets] = useState<Map<string, string>>(
     new Map(),
   );
-  // Serpent-f74e48: while a text term is present, surface matching folders
-  // (name or relative path) as a "Folders" section above the asset grid.
-  const searchFolderResults = useMemo(() => {
-    if (searchValue.trim() === "") return [];
-    return resolveSearchFolderResults({
-      query: parseSearchExpression(searchValue),
-      folders,
-      linkedFolders,
-    });
-  }, [searchValue, folders, linkedFolders]);
-  // Serpent-f74e48: fetch the real FolderBrowseEntry (cover previews + counts)
-  // for search-matched folders so the reused asset-browser folder cards show
-  // the same previews as normal browsing. Enrichment is keyed by the matched
-  // ref set so a slow older response never overwrites a newer search.
-  const searchFolderMatchKey = searchFolderResults.length
-    ? searchFolderResults
-        .map((result) => `${result.locationKind}:${result.folderId}`)
-        .join("|")
-    : null;
-  const [searchFolderRealKey, setSearchFolderRealKey] = useState<string | null>(
-    null,
-  );
-  const [searchFolderRealEntries, setSearchFolderRealEntries] = useState<
-    FolderBrowseEntry[]
-  >([]);
-  const searchFolderEntriesKeyRef = useRef<string | null>(null);
-  useEffect(() => {
-    if (!api || !library || searchFolderMatchKey === null) return;
-    searchFolderEntriesKeyRef.current = searchFolderMatchKey;
-    let cancelled = false;
-    void api
-      .listFolderEntriesByRefs({
-        libraryId: library.libraryId,
-        refs: searchFolderResults.map((result) => ({
-          locationKind: result.locationKind,
-          folderId: result.folderId,
-        })),
-      })
-      .then((result) => {
-        if (
-          !cancelled &&
-          result.ok &&
-          searchFolderEntriesKeyRef.current === searchFolderMatchKey
-        ) {
-          setSearchFolderRealKey(searchFolderMatchKey);
-          setSearchFolderRealEntries(result.value);
-        }
-      })
-      .catch(() => {
-        // Enrichment is best-effort: fall back to the lightweight entries.
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [searchFolderMatchKey, searchFolderResults, library, api]);
   // Serpent-b8a853: one-time hint for the include-subfolders icon. The hint
   // key is per (library, folder scope); the actual flash decision needs the
   // browse canvas mode (folders-only = child-folder cards but zero direct
@@ -1577,6 +1556,8 @@ function AppInner() {
     generation: 0,
   });
   const navigationHydrationAbortRef = useRef<AbortController | null>(null);
+  const folderMutationRefreshAbortRef = useRef<AbortController | null>(null);
+  const folderMutationProjectionGateRef = useRef(new FolderMutationProjectionGate());
   const pendingLibraryCloseFencesRef = useRef(new Map<string, Set<number>>());
   const localAssetRemovalGenerationRef = useRef(0);
 
@@ -1584,6 +1565,12 @@ function AppInner() {
     contentLoadGenerationRef.current += 1;
     navigationHydrationAbortRef.current?.abort();
     navigationHydrationAbortRef.current = null;
+    folderMutationRefreshAbortRef.current?.abort();
+    folderMutationRefreshAbortRef.current = null;
+  }, []);
+  useEffect(() => () => {
+    folderMutationRefreshAbortRef.current?.abort();
+    folderMutationRefreshAbortRef.current = null;
   }, []);
   const beginLibraryTransition = useCallback(() => {
     cancelPendingLibraryReads();
@@ -2048,6 +2035,69 @@ function AppInner() {
       );
     },
   });
+  // Serpent-f74e48: while a text term is present, surface matching folders
+  // (name or relative path) as a "Folders" section above the asset grid.
+  const searchFolderResults = useMemo(() => {
+    if (searchValue.trim() === "") return [];
+    const scopeKey = `${library?.libraryId ?? "no-library"}:${workspaceTabsState.activeTabId}`;
+    const parsed = parseSearchExpressionDetailed(searchValue);
+    const query = parsed.ok
+      ? { clauses: [], expression: parsed.expression }
+      : lastValidFolderSearchQueryRef.current?.scope === scopeKey
+        ? lastValidFolderSearchQueryRef.current.query
+        : { clauses: [] };
+    if (parsed.ok) lastValidFolderSearchQueryRef.current = { scope: scopeKey, query };
+    return resolveSearchFolderResults({
+      query,
+      folders,
+      linkedFolders,
+    });
+  }, [searchValue, folders, linkedFolders, library?.libraryId, workspaceTabsState.activeTabId]);
+  // Serpent-f74e48: fetch the real FolderBrowseEntry (cover previews + counts)
+  // for search-matched folders so the reused asset-browser folder cards show
+  // the same previews as normal browsing. Enrichment is keyed by the matched
+  // ref set so a slow older response never overwrites a newer search.
+  const searchFolderMatchKey = searchFolderResults.length
+    ? searchFolderResults
+        .map((result) => `${result.locationKind}:${result.folderId}`)
+        .join("|")
+    : null;
+  const [searchFolderRealKey, setSearchFolderRealKey] = useState<string | null>(
+    null,
+  );
+  const [searchFolderRealEntries, setSearchFolderRealEntries] = useState<
+    FolderBrowseEntry[]
+  >([]);
+  const searchFolderEntriesKeyRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!api || !library || searchFolderMatchKey === null) return;
+    searchFolderEntriesKeyRef.current = searchFolderMatchKey;
+    let cancelled = false;
+    void api
+      .listFolderEntriesByRefs({
+        libraryId: library.libraryId,
+        refs: searchFolderResults.map((result) => ({
+          locationKind: result.locationKind,
+          folderId: result.folderId,
+        })),
+      })
+      .then((result) => {
+        if (
+          !cancelled &&
+          result.ok &&
+          searchFolderEntriesKeyRef.current === searchFolderMatchKey
+        ) {
+          setSearchFolderRealKey(searchFolderMatchKey);
+          setSearchFolderRealEntries(result.value);
+        }
+      })
+      .catch(() => {
+        // Enrichment is best-effort: fall back to the lightweight entries.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [searchFolderMatchKey, searchFolderResults, library, api]);
   const beginBrowsePageClearingSimilar = useCallback(
     (...args: Parameters<typeof beginBrowsePage>) => {
       const definition = args[0];
@@ -2393,11 +2443,13 @@ function AppInner() {
   // restoration causes a one-frame flash and can make Chromium paint at the
   // top of the canvas during a rapid open/close.
   const [previewRestoring, setPreviewRestoring] = useState(false);
+  const [previewCanvasReady, setPreviewCanvasReady] = useState(false);
   const previewModalRef = useRef<AssetPreviewModalHandle>(null);
   // REQ-CANVAS-019: read synchronously inside the canvas ResizeObserver
   // callback (which is created once and does not close over fresh state)
   // to skip the reflow-anchor logic while the viewer hides the canvas.
   const previewAssetRef = useRef<AssetSummary | null>(null);
+  const previewOpenedWithEnterRef = useRef(false);
   const previewRestoringRef = useRef(false);
   useLayoutEffect(() => {
     previewAssetRef.current = previewAsset;
@@ -2545,7 +2597,11 @@ function AppInner() {
     canvas.scrollTop = targetTop;
   });
   const reportedVisibleWindowKeyRef = useRef("");
+  const viewportReportCadenceRef = useRef({
+    libraryId: "", intervalMs: VIEWPORT_REPORT_INTERVAL_MS, lastPublishedAt: -Infinity,
+  });
   const visibleWindowAssetIdsRef = useRef<ReadonlySet<string>>(new Set());
+  const replayDeferredThumbnailPatchesRef = useRef<(() => void) | null>(null);
   const viewportScrollTopRef = useRef<number | undefined>(undefined);
   const viewportGenerationRef = useRef(0);
   const interactionGenerationRef = useRef(0);
@@ -2553,6 +2609,43 @@ function AppInner() {
   // through this ref — never through React state (per-frame state re-renders
   // the whole non-memoized grid).
   const marqueeBoxRef = useRef<HTMLDivElement>(null);
+  const previewFocusReturnRef = useRef<string | null>(null);
+  // REQ-VIEW-008: snapshot of the browse scroll position + the previewed
+  // card's on-screen anchor, captured when the viewer opens so the close
+  // path can correct for any reflow that happened while viewing (e.g. the
+  // inspector panel toggled and changed the grid's available width).
+  const previewScrollSnapshotRef = useRef<BrowseViewSnapshot | null>(null);
+  const closingPreviewRef = useRef<string | null>(null);
+  // Incremented whenever a viewer open/close supersedes a pending close. This
+  // prevents a stale rAF/API completion from clearing the restoring state or
+  // focusing the previous card after a rapid reopen of the same asset.
+  const previewCloseGenerationRef = useRef(0);
+  const previewRestoreFrameRef = useRef<number | null>(null);
+  const cancelPreviewViewRestoreRef = useRef<(() => void) | null>(null);
+
+  const beginUserCanvasReflow = useCallback(() => {
+    const allowed = interruptPreviewReturnForReflow({
+      canvas: workspaceCanvasRef.current,
+      viewerOpen: previewAssetRef.current !== null,
+      restoring: previewRestoringRef.current,
+      generationRef: previewCloseGenerationRef,
+      cancelRestoreRef: cancelPreviewViewRestoreRef,
+      focusFrameRef: previewRestoreFrameRef,
+      closingAssetRef: closingPreviewRef,
+      clearHold: clearPreviewScrollHold,
+      onInterrupted: () => flushSync(() => {
+        previewRestoringRef.current = false;
+        setPreviewRestoring(false);
+        setPreviewCanvasReady(false);
+      }),
+    });
+    if (!allowed) return false;
+    cancelWorkspaceViewportRestoreRef.current?.();
+    cancelWorkspaceViewportRestoreRef.current = null;
+    pendingViewportRestoreRef.current = null;
+    return true;
+  }, [clearPreviewScrollHold]);
+
   // REQ-CANVAS-019: rAF handle for the card-size-slider anchor restore.
   const cardSizeRestoreFrameRef = useRef<number | null>(null);
   // REQ-CANVAS-019: rAF handle for the container-width (sidebar/window
@@ -2572,6 +2665,9 @@ function AppInner() {
   }, [panelResizing]);
 
   const capturePanelResizeAnchor = useCallback((lock = true) => {
+    if (!beginUserCanvasReflow()) return;
+    cancelScheduledAnchorRestore(cardSizeRestoreFrameRef, { notify: true });
+    cancelScheduledAnchorRestore(reflowRestoreFrameRef, { notify: true });
     const canvas = workspaceCanvasRef.current;
     if (!canvas) return;
     canvas.classList.remove("is-reflow-restoring");
@@ -2596,7 +2692,7 @@ function AppInner() {
       `${panelReflowFrozenWidthRef.current}px`,
     );
     panelResizeLockRef.current = lock;
-  }, []);
+  }, [beginUserCanvasReflow]);
 
   const restorePanelAfterResize = useCallback(() => {
     panelResizeLockRef.current = false;
@@ -2693,10 +2789,10 @@ function AppInner() {
   useEffect(
     () => () => {
       if (cardSizeRestoreFrameRef.current !== null) {
-        window.cancelAnimationFrame(cardSizeRestoreFrameRef.current);
+        cancelScheduledAnchorRestore(cardSizeRestoreFrameRef, { notify: true });
       }
       if (reflowRestoreFrameRef.current !== null) {
-        window.cancelAnimationFrame(reflowRestoreFrameRef.current);
+        cancelScheduledAnchorRestore(reflowRestoreFrameRef, { notify: true });
       }
       reflowAnchorRef.current = null;
       reflowScrollSnapshotRef.current = null;
@@ -2718,19 +2814,7 @@ function AppInner() {
   const offerPostImportSequencesRef = useRef<
     (assets: readonly AssetSummary[]) => void
   >(() => undefined);
-  const previewFocusReturnRef = useRef<string | null>(null);
-  // REQ-VIEW-008: snapshot of the browse scroll position + the previewed
-  // card's on-screen anchor, captured when the viewer opens so the close
-  // path can correct for any reflow that happened while viewing (e.g. the
-  // inspector panel toggled and changed the grid's available width).
-  const previewScrollSnapshotRef = useRef<BrowseViewSnapshot | null>(null);
-  const closingPreviewRef = useRef<string | null>(null);
-  // Incremented whenever a viewer open/close supersedes a pending close. This
-  // prevents a stale rAF/API completion from clearing the restoring state or
-  // focusing the previous card after a rapid reopen of the same asset.
-  const previewCloseGenerationRef = useRef(0);
-  const previewRestoreFrameRef = useRef<number | null>(null);
-  const cancelPreviewViewRestoreRef = useRef<(() => void) | null>(null);
+
   useEffect(
     () => () => {
       cancelPreviewViewRestoreRef.current?.();
@@ -3037,7 +3121,12 @@ function AppInner() {
       setAiProgressBannerVisible(true);
     });
     // Progress events drive the banner; a status RPC would wait behind the queue.
-  }, [aiConnectionFailureGate.failedJobIds, onAiConnectionFailureRetry]);
+  }, [
+    aiConnectionFailureGate.failedJobIds,
+    aiJobs?.failed,
+    aiJobs?.succeeded,
+    onAiConnectionFailureRetry,
+  ]);
 
 
   const selectedFolderId =
@@ -3167,10 +3256,7 @@ function AppInner() {
     reportedVisibleWindowKeyRef.current = "";
     interactionGenerationRef.current += 1;
     viewportScrollTopRef.current = undefined;
-    let frame: number | undefined;
-    let debounceTimer: number | undefined;
     const report = () => {
-      frame = undefined;
       const intersectingIds = collectIntersectingCanvasAssetIds(
         canvas,
         (assetId) => isGeometryPlaceholder({ assetId }),
@@ -3210,6 +3296,9 @@ function AppInner() {
       reportedVisibleWindowKeyRef.current = key;
       viewportGenerationRef.current += 1;
       visibleWindowAssetIdsRef.current = new Set(bands.visible);
+      if ((window as RendererWindow).serpent?.e2e) {
+        window.dispatchEvent(new CustomEvent("serpent:e2e-visible-window", { detail: bands }));
+      }
       void api.reportVisibleWindow({
         libraryId: library.libraryId,
         assetIds: bands.visible,
@@ -3223,22 +3312,30 @@ function AppInner() {
         scopeWarmAssetIds: bands.scopeWarm,
       });
     };
-    const schedule = () => {
-      if (frame !== undefined) window.cancelAnimationFrame(frame);
-      if (debounceTimer !== undefined) window.clearTimeout(debounceTimer);
-      debounceTimer = window.setTimeout(() => {
-        debounceTimer = undefined;
-        frame = window.requestAnimationFrame(report);
-      }, 50);
-    };
+    // A trailing timer is restarted by summary/dimension reflows, delaying the
+    // very work that fills this viewport. Publish on a fixed frame cadence;
+    // keep its deadline across reflows and bound reports during a long scroll.
+    if (viewportReportCadenceRef.current.libraryId !== library.libraryId) {
+      viewportReportCadenceRef.current = {
+        libraryId: library.libraryId,
+        intervalMs: VIEWPORT_REPORT_INTERVAL_MS,
+        lastPublishedAt: -Infinity,
+      };
+    }
+    const reportOwner = { libraryId: library.libraryId, generation: libraryViewSessionRef.current.generation };
+    const reporting = createCoalescedFrame(report, window, viewportReportCadenceRef.current, () =>
+      libraryRef.current?.libraryId === reportOwner.libraryId
+        && isCurrentLibraryViewSession(libraryViewSessionRef.current, reportOwner));
+    const schedule = () => reporting.request();
     canvas.addEventListener("scroll", schedule, { passive: true });
+    canvas.addEventListener(CANVAS_LAYOUT_COMMITTED_EVENT, schedule);
     schedule();
     return () => {
       canvas.removeEventListener("scroll", schedule);
-      if (frame !== undefined) window.cancelAnimationFrame(frame);
-      if (debounceTimer !== undefined) window.clearTimeout(debounceTimer);
+      canvas.removeEventListener(CANVAS_LAYOUT_COMMITTED_EVENT, schedule);
+      reporting.cancel();
     };
-  }, [api, library, assetViewMode, browseLayout, visibleVirtualBrowseLayout]);
+  }, [api, library, assetViewMode, visibleBrowseLayout, visibleVirtualBrowseLayout]);
 
   // Map the scrollbar to the compact real-asset index. One-frame coalescing
   // avoids request spam without spending 50ms of the 500ms loading budget.
@@ -3466,6 +3563,8 @@ function AppInner() {
       formatFilter,
       excludeFormatFilter,
       tagFilter,
+      tagFilterExpression,
+      tagFilterMode,
       excludeTagFilter,
       excludedTagFilter,
       includeAiTagFilter,
@@ -3502,6 +3601,8 @@ function AppInner() {
     formatFilter,
     excludeFormatFilter,
     tagFilter,
+    tagFilterExpression,
+    tagFilterMode,
     excludeTagFilter,
     excludedTagFilter,
     includeAiTagFilter,
@@ -4027,7 +4128,7 @@ function AppInner() {
         ),
         stops,
       );
-      if (!root || nextSize === assetCardSize) return;
+      if (!root || nextSize === assetCardSize || !beginUserCanvasReflow()) return;
 
       const rootRect = root.getBoundingClientRect();
       const anchorX = clientX ?? rootRect.left + rootRect.width / 2;
@@ -4082,7 +4183,7 @@ function AppInner() {
       // fight the pointer anchor. Cancel an in-flight width restore so its
       // completion callback cannot clear this zoom anchor.
       if (reflowRestoreFrameRef.current !== null) {
-        window.cancelAnimationFrame(reflowRestoreFrameRef.current);
+        cancelScheduledAnchorRestore(reflowRestoreFrameRef);
         reflowRestoreFrameRef.current = null;
       }
       reflowAnchorRef.current = null;
@@ -4106,7 +4207,7 @@ function AppInner() {
         cardResizeScrollSnapshotRef.current ?? undefined,
       );
     },
-    [assetCardSize],
+    [assetCardSize, beginUserCanvasReflow],
   );
 
   // REQ-CANVAS-019: dragging the sidebar or resizing the window changes the
@@ -4209,11 +4310,11 @@ function AppInner() {
   useLayoutEffect(() => {
     if (!previewAsset && !previewRestoring) return;
     if (cardSizeRestoreFrameRef.current !== null) {
-      window.cancelAnimationFrame(cardSizeRestoreFrameRef.current);
+      cancelScheduledAnchorRestore(cardSizeRestoreFrameRef, { notify: true });
       cardSizeRestoreFrameRef.current = null;
     }
     if (reflowRestoreFrameRef.current !== null) {
-      window.cancelAnimationFrame(reflowRestoreFrameRef.current);
+      cancelScheduledAnchorRestore(reflowRestoreFrameRef, { notify: true });
       reflowRestoreFrameRef.current = null;
     }
     cardResizeAnchorRef.current = null;
@@ -4340,9 +4441,10 @@ function AppInner() {
 
   const openAssetPreview = useCallback((
     asset: AssetSummary,
-    options?: { recordHistory?: boolean },
+    options?: { recordHistory?: boolean; openedWithEnter?: boolean },
   ) => {
     if (asset.availability !== "available" || asset.deletedAt) return;
+    previewOpenedWithEnterRef.current = options?.openedWithEnter === true;
     previewAssetRef.current = asset;
     pendingViewportRestoreRef.current = null;
     if (
@@ -4365,6 +4467,7 @@ function AppInner() {
     previewRestoringRef.current = false;
     pendingViewportRestoreRef.current = null;
     setPreviewRestoring(false);
+    setPreviewCanvasReady(false);
     cancelPreviewViewRestoreRef.current?.();
     cancelPreviewViewRestoreRef.current = null;
     clearPreviewScrollHold();
@@ -4372,11 +4475,11 @@ function AppInner() {
     // queued when the user opens the viewer immediately after resizing. That
     // stale callback must not overwrite the viewer-close snapshot later.
     if (cardSizeRestoreFrameRef.current !== null) {
-      window.cancelAnimationFrame(cardSizeRestoreFrameRef.current);
+      cancelScheduledAnchorRestore(cardSizeRestoreFrameRef, { notify: true });
       cardSizeRestoreFrameRef.current = null;
     }
     if (reflowRestoreFrameRef.current !== null) {
-      window.cancelAnimationFrame(reflowRestoreFrameRef.current);
+      cancelScheduledAnchorRestore(reflowRestoreFrameRef, { notify: true });
       reflowRestoreFrameRef.current = null;
     }
     cardResizeAnchorRef.current = null;
@@ -4394,6 +4497,7 @@ function AppInner() {
         card?.getBoundingClientRect() ?? null,
         canvas.scrollLeft,
         canvas.scrollTop,
+        Math.max(0, canvas.scrollHeight - canvas.clientHeight),
       );
       logBrowseScrollWrite("openAssetPreview.capture", canvas, {
         snapshotTop: Math.round(canvas.scrollTop),
@@ -4464,6 +4568,17 @@ function AppInner() {
     }
   }, [navHistoryRef, selectionAnchorRef, setNavHistoryUi, syncActiveWorkspaceTabLocation]);
 
+  const mediaPlayback = useMediaPlayback({
+    api: api ?? null,
+    libraryId: library?.libraryId ?? null,
+    current: previewAsset,
+    shuffleSeed,
+    getOrderedIds: fetchBrowseScopeAssetIds,
+    ensureLoaded: (rank) => ensureBrowseVisibleIndices([rank]),
+    navigate: navigateAssetPreview,
+    setError,
+  });
+
   useEffect(() => {
     const pendingPreview = pendingWorkspacePreviewRef.current;
     if (!pendingPreview) return;
@@ -4506,6 +4621,7 @@ function AppInner() {
     const closingAsset = previewAsset;
     if (!closingAsset) return;
     if (closingPreviewRef.current === closingAsset.assetId) return;
+    previewOpenedWithEnterRef.current = false;
     // Serpent-b7e173：查看器被关闭时（无论 X/Esc 显式关还是导航触发），若当前
     // 历史条目仍是 preview 则硬移除——否则「从预览导航到别处」会残留一个已关闭
     // 的 preview，导致 back 回到它。back()/forward() 已移 index（当前非 preview）
@@ -4521,8 +4637,14 @@ function AppInner() {
     const closeGeneration = ++previewCloseGenerationRef.current;
     closingPreviewRef.current = closingAsset.assetId;
     previewRestoringRef.current = restoreBrowsePosition;
-    setPreviewRestoring(restoreBrowsePosition);
-    setPreviewAsset(null);
+    // Commit the viewer teardown before measuring the browse extent. Measuring
+    // the still-open viewer restores against stale geometry; its next commit
+    // can then clamp a deep scroll back to zero.
+    flushSync(() => {
+      setPreviewRestoring(restoreBrowsePosition);
+      setPreviewCanvasReady(false);
+      setPreviewAsset(null);
+    });
     cancelWorkspaceViewportRestoreRef.current?.();
     cancelWorkspaceViewportRestoreRef.current = null;
     pendingViewportRestoreRef.current = null;
@@ -4608,12 +4730,18 @@ function AppInner() {
           canvas,
           snapshot: scrollSnapshot,
           isCurrent: () => closeGeneration === previewCloseGenerationRef.current,
+          onPositionReady: () => {
+            if (closeGeneration === previewCloseGenerationRef.current) {
+              setPreviewCanvasReady(true);
+            }
+          },
           onComplete: () => {
             if (closeGeneration !== previewCloseGenerationRef.current) return;
             cancelPreviewViewRestoreRef.current = null;
             armPreviewScrollHold(scrollSnapshot.scrollTop);
             previewRestoringRef.current = false;
             setPreviewRestoring(false);
+            setPreviewCanvasReady(false);
             previewRestoreFrameRef.current = window.requestAnimationFrame(() =>
               settleRestoredFocus(12),
             );
@@ -4622,6 +4750,7 @@ function AppInner() {
       } else {
         previewRestoringRef.current = false;
         setPreviewRestoring(false);
+        setPreviewCanvasReady(false);
         previewRestoreFrameRef.current = window.requestAnimationFrame(() =>
           settleRestoredFocus(12),
         );
@@ -4630,6 +4759,7 @@ function AppInner() {
     if (!restoreBrowsePosition) {
       clearPreviewScrollHold();
       setPreviewRestoring(false);
+      setPreviewCanvasReady(false);
     }
     try {
       if (api && library) {
@@ -4702,6 +4832,9 @@ function AppInner() {
             ));
       const viewSession = ensureLibraryView(activeLibrary.libraryId);
       if (!viewSession) return [];
+      const navigationReadTicket = refreshSidebar
+        ? folderMutationProjectionGateRef.current.issueRead(viewSession)
+        : null;
       const libId = { libraryId: activeLibrary.libraryId };
       const generation = ++contentLoadGenerationRef.current;
       navigationHydrationAbortRef.current?.abort();
@@ -4743,13 +4876,25 @@ function AppInner() {
        * sidebar stayed permanently empty ("尚无托管或链接文件夹 / 尚无合集") behind
        * a loading overlay that never cleared.
        *
-       * Scope it to the library/view instead: a summary for the library still on
-       * screen is always safe to apply, and applying the newest one wins.
+       * Scope it to the library/view and the local folder-mutation epoch. This
+       * keeps useful summaries during background catalog activity while a
+       * pre-mutation response cannot erase an immediate folder projection.
        */
       const isCurrentLibraryNavigation = () =>
         isCurrentLibraryView(viewSession)
         && (opts?.navigationIsCurrent?.() ?? true);
+      let navigationSummaryApplied = false;
       const applyNavigationSummary = (summary: LibraryNavigationSummary) => {
+        if (
+          !navigationReadTicket
+          || navigationSummaryApplied
+          || !isCurrentLibraryNavigation()
+          || !folderMutationProjectionGateRef.current.mayApply(
+            navigationReadTicket,
+            viewSession,
+          )
+        ) return false;
+        navigationSummaryApplied = true;
         setAllAssetCount(summary.allAssetCount);
         setRootAssetCount(summary.rootAssetCount);
         setTrashedAssetCount(summary.trashedAssetCount);
@@ -4763,6 +4908,7 @@ function AppInner() {
         folderNavigationCoversRef.current = covers;
         setFolderNavigationCovers(covers);
         setFolderCustomCoverIds(new Set(covers.map((cover) => cover.folderId)));
+        return true;
       };
       const loadNavigationSummary = () => {
         if (!isCurrentLibraryView(viewSession)) return Promise.resolve(undefined);
@@ -4771,7 +4917,7 @@ function AppInner() {
           showIgnored: includeIgnored,
           includeTrashedFolders: trashMode,
         }).then((result) => {
-          if (result.ok && isCurrentLibraryNavigation()) {
+          if (result.ok) {
             applyNavigationSummary(result.value);
           }
           return result;
@@ -5076,6 +5222,17 @@ function AppInner() {
   // MCP events (plus the legacy script-preview bootstrap path) are applied.
   useEffect(() => {
     if (!api) return;
+    const handleLibraryClosed = createLibraryClosedHandler({
+      snapshot: () => ({ libraryId: libraryRef.current?.libraryId ?? null, view: libraryViewSessionRef.current }),
+      pendingCloseGenerations: (id) => pendingLibraryCloseFencesRef.current.get(id),
+      queue: (task) => libraryTransitionLock(task),
+      closePreview: () => closeAssetPreview(false),
+      applyClosedUi: applyClosedLibraryUi,
+      refreshRecentLibraries: () => refreshRecentLibraries(null),
+      setClosing: () => setUiState("closing"),
+      setIdle: () => setUiState("idle"),
+      reportFailure: (caught) => setError(toMessage(caught, t("toast.closeFailed"), locale)),
+    });
     return api.onLifecycle((event) => {
       if (event.type === 'worker.recovering') {
         workerRecoveryStateRef.current = 'recovering';
@@ -5145,42 +5302,7 @@ function AppInner() {
         return;
       }
       if (event.type === "library.closed") {
-        const closedLibraryId = event.libraryId;
-        const pendingGenerations =
-          pendingLibraryCloseFencesRef.current.get(closedLibraryId);
-        if (
-          event.source !== "mcp" &&
-          pendingGenerations !== undefined &&
-          !pendingGenerations.has(libraryViewSessionRef.current.generation)
-        ) {
-          // An ordinary renderer-initiated close has no lifecycle source tag.
-          // If the same library was reopened before its old close event was
-          // delivered, the id alone is ambiguous; the session generation is
-          // what distinguishes that stale event from a real close. Keep all
-          // pending generations until their own requests settle so two rapid
-          // closes of the same library cannot overwrite one another.
-          return;
-        }
-        const applyLibraryClosed = async () => {
-          if (libraryRef.current?.libraryId !== closedLibraryId) return;
-          setUiState("closing");
-          try {
-            await closeAssetPreview(false);
-            if (libraryRef.current?.libraryId !== closedLibraryId) return;
-            applyClosedLibraryUi();
-            await refreshRecentLibraries(null);
-          } catch (caught) {
-            if (libraryRef.current?.libraryId === closedLibraryId) {
-              setError(toMessage(caught, t("toast.closeFailed"), locale));
-            }
-          } finally {
-            if (libraryRef.current === null) setUiState("idle");
-          }
-        };
-        // Main can close the active library on behalf of MCP. Keep the same
-        // serialized boundary as renderer-triggered close; events for the
-        // previous library become no-ops after a replacement is committed.
-        void libraryTransitionLock(applyLibraryClosed);
+        handleLibraryClosed(event);
         return;
       }
       if (event.type !== "library.opened") return;
@@ -5242,8 +5364,10 @@ function AppInner() {
       : null;
     const isEffectLibraryCurrent = () =>
       effectViewSession !== null && isCurrentLibraryView(effectViewSession);
-    const pending = new Map<string, AssetThumbnailPatch>();
+    const pending = new AssetThumbnailPatchQueue();
+    const deferred = new DeferredVersionedThumbnailPatches();
     const pendingLayoutArtifactIds = new Map<string, string | null>();
+    const dimensionPublications = new AssetDimensionPublicationTracker();
     let frame = 0;
     const flush = () => {
       frame = 0;
@@ -5253,10 +5377,13 @@ function AppInner() {
         pendingLayoutArtifactIds.clear();
         return;
       }
-      const batch = new Map(pending);
-      pending.clear();
-      if (batch.size > 0) {
-        setAssets((current) => applyAssetThumbnailPatches(current, batch));
+      const queued = pending.drain();
+      if (queued.size > 0) {
+        const batch = resolveQueuedAssetThumbnailPatches(queued, assetsRef.current);
+        const dimensionsForMembership = dimensionPublications.collect(assetsRef.current, batch);
+        setAssets((current) => applyAssetThumbnailPatches(
+          current, resolveQueuedAssetThumbnailPatches(queued, current),
+        ));
         const geometryPatches = new Map<string, { width: number; height: number }>();
         const previewPatches = new Map<string, {
           previewKind: 'source' | null;
@@ -5286,28 +5413,12 @@ function AppInner() {
         }
         if (geometryPatches.size > 0) {
           applyBrowseGeometryPatchesRef.current(geometryPatches);
-          const measured: Array<{
-            assetId: string;
-            width: number;
-            height: number;
-            mediaType: AssetSummary["mediaType"];
-          }> = [];
-          for (const [assetId, size] of geometryPatches) {
-            const current = assetsRef.current.find((asset) => asset.assetId === assetId);
-            if (!current) continue;
-            measured.push({
-              assetId,
-              width: size.width,
-              height: size.height,
-              mediaType: current.mediaType,
-            });
-          }
-          if (measured.length > 0) {
-            syncBrowseFilterMembershipRef.current({
-              kind: "dimensions",
-              assets: measured,
-            });
-          }
+        }
+        if (dimensionsForMembership.length > 0) {
+          syncBrowseFilterMembershipRef.current({
+            kind: "dimensions",
+            assets: dimensionsForMembership,
+          });
         }
         if (previewPatches.size > 0) {
           applyBrowsePreviewPatchesRef.current(previewPatches);
@@ -5334,11 +5445,18 @@ function AppInner() {
         });
       }
     };
-    const queuePatch = (assetId: string, patch: AssetThumbnailPatch) => {
-      pending.set(assetId, mergeAssetThumbnailPatch(pending.get(assetId), patch));
+    const queuePatch = (assetId: string, patch: AssetThumbnailPatch, expectedRevisionId?: string) => {
+      pending.enqueue(assetId, patch, expectedRevisionId);
       if (frame !== 0) return;
       frame = window.requestAnimationFrame(flush);
     };
+    const replayDeferred = () => {
+      if (!isEffectLibraryCurrent()) return;
+      for (const item of deferred.takeFor(assetsRef.current)) {
+        queuePatch(item.assetId, item.patch, item.expectedRevisionId);
+      }
+    };
+    replayDeferredThumbnailPatchesRef.current = replayDeferred;
     const queueLayoutArtifactPatch = (
       assetId: string,
       artifactId: string | null,
@@ -5379,7 +5497,7 @@ function AppInner() {
           && currentAsset.currentRevisionId !== event.revisionId
         ) return;
         jobStatusCoordinatorRef.current?.noteActivity("media");
-        queuePatch(event.assetId, {
+        const patch: AssetThumbnailPatch = {
           width: event.width,
           height: event.height,
           ...(event.previewKind === undefined
@@ -5391,7 +5509,11 @@ function AppInner() {
           ...(event.durationMs === undefined
             ? {}
             : { durationMs: event.durationMs }),
-        });
+        };
+        if (!currentAsset && event.revisionId !== undefined) {
+          deferred.remember(event.assetId, patch, event.revisionId);
+        }
+        queuePatch(event.assetId, patch, event.revisionId);
         return;
       }
       if (event.type === "asset.derived.ready") {
@@ -5502,6 +5624,10 @@ function AppInner() {
     });
     return () => {
       unsubscribe();
+      deferred.clear();
+      if (replayDeferredThumbnailPatchesRef.current === replayDeferred) {
+        replayDeferredThumbnailPatchesRef.current = null;
+      }
       if (frame !== 0) window.cancelAnimationFrame(frame);
       if (folderBrowseRefreshFrame !== 0) {
         window.cancelAnimationFrame(folderBrowseRefreshFrame);
@@ -5516,6 +5642,7 @@ function AppInner() {
     library?.libraryId,
     t,
   ]);
+  useEffect(() => { replayDeferredThumbnailPatchesRef.current?.(); }, [assets]);
   useEffect(() => {
     if (!api || !library) return;
     const unsubscribeProgress = api.onAiProgress((event) => {
@@ -5615,6 +5742,9 @@ function AppInner() {
         excludeColorFilter,
         colorSimilarity,
         tagFilter,
+        tagFilterExpression,
+        tagFilterMode,
+        tagFilterLastValidExpression,
         excludeTagFilter,
         excludedTagFilter,
         includeAiTagFilter,
@@ -5652,6 +5782,8 @@ function AppInner() {
   function beginWorkspaceNavigationRequest(
     historyMode: WorkspaceNavigationHistoryMode,
   ): WorkspaceNavigationRequest {
+    folderMutationRefreshAbortRef.current?.abort();
+    folderMutationRefreshAbortRef.current = null;
     findSimilarTokenRef.current += 1;
     const token = beginWorkspaceTabNavigation(historyMode);
     const request: WorkspaceNavigationRequest = {
@@ -5826,7 +5958,15 @@ function AppInner() {
     setColorFilter(state.filters.colorFilter);
     setColorSimilarity(state.filters.colorSimilarity ?? DEFAULT_COLOR_SIMILARITY);
     setExcludeColorFilter(state.filters.excludeColorFilter);
+    const restoredTagExpression = resolveWorkspaceTagExpression(state.filters);
     setTagFilter(state.filters.tagFilter);
+    setTagFilterExpression(restoredTagExpression);
+    setTagFilterMode("expression");
+    setTagFilterLastValidExpression(
+      state.filters.tagFilterLastValidExpression?.trim()
+        ? state.filters.tagFilterLastValidExpression
+        : restoredTagExpression,
+    );
     setExcludeTagFilter(state.filters.excludeTagFilter);
     setExcludedTagFilter(state.filters.excludedTagFilter ?? "");
     setIncludeAiTagFilter(state.filters.includeAiTagFilter);
@@ -6204,28 +6344,55 @@ function AppInner() {
   async function runLibraryOperation(kind: "create" | "open") {
     if (!api) return;
     if (kind === "open") {
-      // Pick the location first (dialog only) so the loading overlay and its
-      // timer start with the actual load, never while the picker is open
-      // (Serpent-565785 feedback).
       const chosen = await api.chooseLibraryPath();
       if (!chosen.ok || chosen.value === null) return;
+      const libraryPath = chosen.value;
       await runLibraryOpenPipeline(
         "opening",
-        () => api.open({ libraryPath: chosen.value! }),
+        () => api.open({ libraryPath }),
         t("toast.libraryOpFailed"),
         undefined,
         null,
-        { selectedLibraryPath: chosen.value },
+        { selectedLibraryPath: libraryPath },
       );
       return;
     }
-    await runLibraryOpenPipeline(
-      "creating",
-      () => api.create({ displayName: dialogValue.trim() }),
-      t("toast.libraryOpFailed"),
-      undefined,
-      dialogValue.trim() || null,
-    );
+    if (libraryLocationOperationRef.current) return;
+    libraryLocationOperationRef.current = true;
+    const displayName = dialogValue.trim();
+    try {
+      // Choosing a location does not start a library transition. Keep the
+      // current view intact until the native dialog has actually succeeded.
+      const chosen = await api.chooseCreateLocation();
+      if (!chosen.ok) {
+        if (chosen.error.code !== "CANCELLED") {
+          showBlockingError(
+            t("dialog.blockingError.libraryCreateFailed"),
+            toMessage(chosen.error, t("toast.libraryOpFailed"), locale),
+          );
+        }
+        return;
+      }
+      if (chosen.value === null) return;
+      const selection = chosen.value;
+      await runLibraryOpenPipeline(
+        "creating",
+        () => {
+          setDialog(null);
+          return api.create({ displayName, selectionToken: selection });
+        },
+        t("toast.libraryOpFailed"),
+        undefined,
+        displayName || null,
+      );
+    } catch (caught) {
+      showBlockingError(
+        t("dialog.blockingError.libraryCreateFailed"),
+        toMessage(caught, t("toast.libraryOpFailed"), locale),
+      );
+    } finally {
+      libraryLocationOperationRef.current = false;
+    }
   }
 
   async function runInlineLibraryOpening<T>(
@@ -6547,6 +6714,9 @@ function AppInner() {
     setColorFilter("");
     setExcludeColorFilter(false);
     setTagFilter("");
+    setTagFilterExpression("");
+    setTagFilterLastValidExpression("");
+    setTagFilterMode("expression");
     setExcludeTagFilter(false);
     setExcludedTagFilter("");
     setIncludeAiTagFilter(true);
@@ -6571,9 +6741,9 @@ function AppInner() {
     setExcludeFormatFilter(false);
     setColorFilter("");
     setExcludeColorFilter(false);
-    setTagFilter("");
-    setExcludeTagFilter(false);
-    setExcludedTagFilter("");
+    clearTagDiscoveryFilter({ setTagFilter, setTagFilterExpression,
+      setTagFilterLastValidExpression, setExcludeTagFilter, setExcludedTagFilter, setActiveTagId });
+    setTagFilterMode("expression");
     setIncludeAiTagFilter(true);
     setRatingFilter("");
     setExcludeRatingFilter(false);
@@ -6604,10 +6774,8 @@ function AppInner() {
         setExcludeFormatFilter(false);
         return;
       case "tag":
-        setTagFilter("");
-        setExcludeTagFilter(false);
-        setExcludedTagFilter("");
-        setActiveTagId(null);
+        clearTagDiscoveryFilter({ setTagFilter, setTagFilterExpression,
+          setTagFilterLastValidExpression, setExcludeTagFilter, setExcludedTagFilter, setActiveTagId });
         return;
       case "rating":
         setRatingFilter("");
@@ -6923,10 +7091,23 @@ function AppInner() {
       const tagResult = await api.listTags({ libraryId: library.libraryId });
       if (!tagResult.ok) throw new LibraryOperationError(tagResult.error);
       setTags(tagResult.value);
+      const rename = (metadata: AssetMetadataResult) => ({ ...metadata,
+        tags: metadata.tags.map(tag => tag.id === tagId ? { ...tag, name } : tag),
+      });
+      for (const [id, metadata] of metadataByAssetRef.current) {
+        metadataByAssetRef.current.set(id, rename(metadata));
+      }
+      setAssetMetadata(current => current ? rename(current) : current);
+      if (selectedAssetIds.length >= 2) rebuildAndApplyMultiEdit(selectedAssetIds);
+      if (activeTagId === tagId) {
+        setTagFilter(name);
+        setTagFilterExpression(JSON.stringify(name));
+        setTagFilterLastValidExpression(JSON.stringify(name));
+      }
       setNotice(t("toast.tagRenamed", { name }), result.value.historyEntryId);
       return true;
     } catch (caught) {
-      setError(toMessage(caught, t("toast.renameTagFailed"), locale));
+      setError(tagRenameError(caught, locale));
       return false;
     }
   }
@@ -7084,13 +7265,10 @@ function AppInner() {
     await closeAssetPreview(false);
     if (!request.isCurrent() || !isCurrentLibraryView(viewSession)) return;
     try {
-      const definition = request.browseState
+      const tagExpression = JSON.stringify(tag.name);
+      const definition: SearchDefinition = request.browseState
         ? queryDefinitionForWorkspaceBrowseState(request.browseState)
-        : currentQueryDefinition({
-          tagFilter: tag.name,
-          excludeTagFilter: false,
-          excludedTagFilter: "",
-        });
+        : tagBrowseDefinition(tag.name, currentQueryDefinition());
       const includeIgnored =
         request.browseState?.showIgnoredItems ?? showIgnoredItems;
       const result = await api.openBrowseSession({
@@ -7120,6 +7298,10 @@ function AppInner() {
       setAssetScope("all");
       clearAssetSelection();
       if (!request.browseState) {
+        clearDiscoveryControls();
+        setTagFilterExpression(tagExpression);
+        setTagFilterLastValidExpression(tagExpression);
+        setTagFilterMode("expression");
         setTagFilter(tag.name);
         setExcludeTagFilter(false);
         setExcludedTagFilter("");
@@ -7908,6 +8090,9 @@ function AppInner() {
       formatFilter,
       excludeFormatFilter,
       tagFilter,
+      tagFilterExpression,
+      tagFilterMode,
+      tagFilterLastValidExpression,
       excludeTagFilter,
       excludedTagFilter,
       includeAiTagFilter,
@@ -7956,7 +8141,30 @@ function AppInner() {
         values: formatValues,
         exclude: filtersState.excludeFormatFilter,
       });
-    filters.push(...buildTagFilterClauses(
+    const exactTag = activeTagId ? tags.find(tag => tag.tagId === activeTagId) : undefined;
+    if (exactTag && filtersState.tagFilterMode === "expression"
+      && filtersState.tagFilterExpression === JSON.stringify(exactTag.name)) {
+      filters.push({ field: "tag", values: [exactTag.name], exclude: false,
+        includeAi: filtersState.includeAiTagFilter });
+    } else if (filtersState.tagFilterMode === "expression") {
+      const parsedTags = parseSearchExpressionDetailed(filtersState.tagFilterExpression ?? "", "tags");
+      if (!parsedTags.ok && filtersState.tagFilterLastValidExpression) {
+        const lastValidTags = parseSearchExpressionDetailed(filtersState.tagFilterLastValidExpression, "tags");
+        if (lastValidTags.ok && lastValidTags.expression.root) filters.push({
+          field: "tag_expression", exclude: false as const,
+          expression: lastValidTags.expression,
+          expressionSource: filtersState.tagFilterLastValidExpression,
+          includeAi: filtersState.includeAiTagFilter,
+        });
+      }
+      if (parsedTags.ok && parsedTags.expression.root) filters.push({
+        field: "tag_expression",
+        exclude: false as const,
+        expression: parsedTags.expression,
+        expressionSource: filtersState.tagFilterExpression,
+        includeAi: filtersState.includeAiTagFilter,
+      });
+    } else filters.push(...buildTagFilterClauses(
       resolveTagFilterSets({
         tagFilter: overrides.tagFilter ?? filtersState.tagFilter,
         excludeTagFilter: overrides.excludeTagFilter ?? filtersState.excludeTagFilter,
@@ -8036,16 +8244,24 @@ function AppInner() {
       if (range)
         filters.push({ field, ranges: [range], exclude: input.exclude });
     }
+    const requestedSearch = overrides.searchValue === undefined
+      ? searchValue
+      : overrides.searchValue ?? "";
+    const searchParse = parseSearchExpressionDetailed(requestedSearch);
+    const searchScopeKey = `${library?.libraryId ?? "no-library"}:${workspaceTabsState.activeTabId}`;
+    if (searchParse.ok && overrides.searchValue === undefined) {
+      lastValidSearchQueryRef.current = { scope: searchScopeKey, query: { clauses: [], expression: searchParse.expression, expressionSource: requestedSearch } };
+    }
     return {
       ...((overrides.searchValue === undefined
         ? searchValue
         : overrides.searchValue ?? "").trim()
         ? {
-            search: parseSearchExpression(
-              overrides.searchValue === undefined
-                ? searchValue
-                : overrides.searchValue ?? "",
-            ),
+            search: searchParse.ok
+              ? { clauses: [], expression: searchParse.expression, expressionSource: requestedSearch }
+              : lastValidSearchQueryRef.current?.scope === searchScopeKey
+                ? lastValidSearchQueryRef.current.query
+                : { clauses: [] },
           }
         : {}),
       ...(filters.length > 0 ? { filters } : {}),
@@ -8070,6 +8286,9 @@ function AppInner() {
         formatFilter: state.filters.formatFilter,
         excludeFormatFilter: state.filters.excludeFormatFilter,
         tagFilter: state.filters.tagFilter,
+        tagFilterExpression: state.filters.tagFilterExpression,
+        tagFilterMode: state.filters.tagFilterMode,
+        tagFilterLastValidExpression: state.filters.tagFilterLastValidExpression,
         excludeTagFilter: state.filters.excludeTagFilter,
         excludedTagFilter: state.filters.excludedTagFilter ?? "",
         includeAiTagFilter: state.filters.includeAiTagFilter,
@@ -8652,6 +8871,8 @@ function AppInner() {
     },
   });
 
+  const assetCutState = useAssetCutState(api ?? null, library?.libraryId ?? null);
+
   const {
     handleOpenExternal,
     handleRevealInFolder,
@@ -8665,7 +8886,24 @@ function AppInner() {
     library,
     setError,
     setNotice,
+    onClipboardChanged: assetCutState.refresh,
   });
+
+  const copyClipboardSelection = useCallback((operation: 'copy' | 'cut') => {
+    if (!library || showTrash || previewAsset || busy) return false;
+    const focused = readFocusedNavFolder(document.activeElement);
+    const folderIds = focused
+      ? selectedFolderIds.includes(focused.folderId) ? selectedFolderIds : [focused.folderId]
+      : selectedFolderIds;
+    const managedIds = folderIds.filter(id => folders.some(folder => folder.folderId === id));
+    const assetIds = focused ? [] : clipboardSelectionIds(selectedAssetIds, selectedAssets);
+    if (assetIds.length + managedIds.length === 0) return false;
+    void handleCopyAssetFiles(assetIds, operation, managedIds);
+    return true;
+  }, [busy, folders, handleCopyAssetFiles, library, previewAsset, selectedAssetIds, selectedAssets, selectedFolderIds, showTrash]);
+
+  const copyClipboardSelectionRef = useRef(copyClipboardSelection);
+  copyClipboardSelectionRef.current = copyClipboardSelection;
 
   const browsePasteDestination = resolveBrowsePasteDestination({
     libraryOpen: Boolean(library),
@@ -8705,9 +8943,9 @@ function AppInner() {
       const now = Date.now();
       if (now - osClipboardPasteAtRef.current < 400) return;
       osClipboardPasteAtRef.current = now;
-      void pasteIntoFolder(folderId);
+      void pasteIntoFolder(folderId).finally(assetCutState.refresh);
     },
-    [pasteIntoFolder],
+    [pasteIntoFolder, assetCutState.refresh],
   );
 
   const {
@@ -8837,6 +9075,22 @@ function AppInner() {
     setSelectedAssetIds,
   });
 
+  const folderMutationBridge = useFolderMutationBridge({
+    libraryRef, isLibraryViewCurrent: isCurrentLibraryView,
+    projectionGate: folderMutationProjectionGateRef.current,
+    refreshAbortRef: folderMutationRefreshAbortRef, reloadRef: reloadCurrentContentRef,
+    scopeRef: assetScopeRef, historyRef: navHistoryRef,
+    setFolders, setLinkedFolders, setSelectedFolderIds,
+    setFilteredCountRefreshToken: setFilteredFolderCountRefreshToken,
+    onScopeRemapped: (scope) => {
+      cancelPendingLibraryReads();
+      setAssetScope(scope);
+      managedImportTargetFolderIdRef.current = scope;
+      if (libraryRef.current) api?.setActiveContext(libraryRef.current.libraryId, scope);
+    },
+    onHistoryChanged: syncNavHistoryUi,
+  });
+
   const {
     inlineFolderEdit,
     openInlineFolderCreate,
@@ -8848,20 +9102,19 @@ function AppInner() {
     api: api ?? null,
     library,
     setNotice,
-    reloadCurrentContent,
+    captureLibraryViewToken: ensureLibraryView,
+    isLibraryViewCurrent: isCurrentLibraryView,
+    ...folderMutationBridge,
+    onPostCommitError: (caught, libraryViewToken) => {
+      if (
+        !isCurrentLibraryView(libraryViewToken)
+        || libraryRef.current?.libraryId !== libraryViewToken.libraryId
+      ) return;
+      setError(toMessage(caught, t("toast.readAssetsFailed"), locale));
+    },
     isLinkedFolderId: (folderId) =>
       parseLinkedVirtualFolderId(folderId) !== null ||
       linkedFolders.some((folder) => folder.folderId === folderId),
-    onRenameSuccess: async (newFolderId, previousFolderId) => {
-      if (assetScope !== previousFolderId) return false;
-      // Renaming the folder currently being browsed navigates to the same
-      // scope with the same id.  Folder navigation normally skips the sidebar
-      // query for performance, but here that would immediately put the old
-      // name back after the success notice.  Refresh the folder tree as part
-      // of this mutation so the sidebar settles in the same render cycle.
-      await chooseFolder(newFolderId, { refreshSidebar: true });
-      return true;
-    },
   });
 
   const reloadSmartCollections = useCallback(async () => {
@@ -9081,7 +9334,9 @@ function AppInner() {
     selectedFolderCardIds: selectedFolderIds,
     selectedAssetCount: selectedAssetIds.length,
     resolveManagedFolderName,
+    canCutFolder: (id) => folders.some(folder => folder.folderId === id),
     canRenameFolder: (folderId) =>
+      (parseLinkedVirtualFolderId(folderId) !== null && linkedFolders.some(folder => folder.folderId === parseLinkedVirtualFolderId(folderId)?.linkedFolderId && folder.status === "available")) ||
       folders.some((folder) => folder.folderId === folderId) ||
       linkedFolders.some(
         (folder) => folder.folderId === folderId && folder.status === "available",
@@ -9098,9 +9353,11 @@ function AppInner() {
       void handleOpenFolderInFileManager(folderId);
     },
     createSubfolder: (parentFolderId) => {
+      setLeftOpen(true);
       cancelInlineSmartCollectionEdit();
       openInlineFolderCreate(parentFolderId);
     },
+    cutFolders: (folderIds) => { void handleCopyAssetFiles([], "cut", folderIds); },
     copyFolder: (folderId) => {
       void handleCopyFolder(folderId);
     },
@@ -9528,6 +9785,11 @@ function AppInner() {
   ) {
     event?.preventDefault();
     if (workerRecoveryStateRef.current !== 'ready') return;
+    if (
+      (searchValue.trim() && !parseSearchExpressionDetailed(searchValue).ok) ||
+      (tagFilterMode === "expression" && tagFilterExpression.trim()
+        && !parseSearchExpressionDetailed(tagFilterExpression, "tags").ok)
+    ) return;
     if (event) {
       searchHistoryDismissedUntilInputRef.current = true;
       setSearchHistoryOpen(false);
@@ -9586,11 +9848,19 @@ function AppInner() {
   }
 
   useEffect(() => {
+    const searchIsInvalid = Boolean(searchValue.trim()) && !parseSearchExpressionDetailed(searchValue).ok;
+    const tagExpressionIsInvalid = tagFilterMode === "expression"
+      && Boolean(tagFilterExpression.trim())
+      && !parseSearchExpressionDetailed(tagFilterExpression, "tags").ok;
+    // Keep the current cards in place while the user is typing an incomplete
+    // expression. Do not send the last valid AST as a new Worker request.
+    if (searchIsInvalid || tagExpressionIsInvalid) return;
     const hasDiscoveryInput = Boolean(
       searchValue.trim() ||
       colorFilter.trim() ||
       formatFilter.trim() ||
-      tagFilter.trim() ||
+      (tagFilterMode === "selection" && tagFilter.trim()) ||
+      (tagFilterMode === "expression" && tagFilterExpression.trim()) ||
       ratingFilter.trim() ||
       favoriteFilter !== "any" ||
       sourceUrlFilter !== "any" ||
@@ -9658,6 +9928,9 @@ function AppInner() {
     formatFilter,
     excludeFormatFilter,
     tagFilter,
+    tagFilterExpression,
+    tagFilterMode,
+    tagFilterLastValidExpression,
     excludeTagFilter,
     excludedTagFilter,
     includeAiTagFilter,
@@ -9926,7 +10199,10 @@ function AppInner() {
 
   // --- Existing operations ---
 
-  async function importAssets(kind: "files" | "folder") {
+  async function importAssets(
+    kind: "files" | "folder",
+    targetFolderId: string | null | undefined = managedImportTargetFolderIdRef.current,
+  ) {
     if (!api || !library) return;
     const startedAt = Date.now();
     setUiState("importing");
@@ -9938,12 +10214,12 @@ function AppInner() {
         kind === "files"
           ? api.importFiles({
               libraryId: library.libraryId,
-              targetFolderId: managedImportTargetFolderIdRef.current,
+              targetFolderId: targetFolderId ?? undefined,
               ...sequenceFlags,
             })
           : api.importFolder({
               libraryId: library.libraryId,
-              targetFolderId: managedImportTargetFolderIdRef.current,
+              targetFolderId: targetFolderId ?? undefined,
               ...sequenceFlags,
             }),
       );
@@ -9963,7 +10239,7 @@ function AppInner() {
         },
       });
       if (!completion) return;
-      setNotice(importSummaryMessage(completion, locale));
+      if (shouldNotifyImportCompletion(completion)) setNotice(importSummaryMessage(completion, locale));
       await revealAfterImport(completion);
       offerPostImportImageSequences(completion.assets);
       playTaskCompletionSound(startedAt);
@@ -9996,7 +10272,7 @@ function AppInner() {
         }
         throw new LibraryOperationError(result.error);
       }
-      setNotice(importSummaryMessage(result.value, locale));
+      if (shouldNotifyImportCompletion(result.value)) setNotice(importSummaryMessage(result.value, locale));
       setFolderBrowseRefreshToken((token) => token + 1);
       await reloadCurrentContent({ blockingNavigation: true });
       playTaskCompletionSound(startedAt);
@@ -10028,7 +10304,7 @@ function AppInner() {
         }
         throw new LibraryOperationError(result.error);
       }
-      setNotice(importSummaryMessage(result.value, locale));
+      if (shouldNotifyImportCompletion(result.value)) setNotice(importSummaryMessage(result.value, locale));
       setFolderBrowseRefreshToken((token) => token + 1);
       await reloadCurrentContent({ blockingNavigation: true });
       playTaskCompletionSound(startedAt);
@@ -10136,7 +10412,7 @@ function AppInner() {
         },
       });
       if (!completion) return;
-      setNotice(importSummaryMessage(completion, locale));
+      if (shouldNotifyImportCompletion(completion)) setNotice(importSummaryMessage(completion, locale));
       await revealAfterImport(completion);
       const nextSequenceIndex = input.sequenceIndex + 1;
       if (
@@ -10183,7 +10459,7 @@ function AppInner() {
       clearImportConflictsUi();
       setImportProgress(null);
       setLibraryTransferKind("import");
-      setNotice(importSummaryMessage(result.value, locale));
+      if (shouldNotifyImportCompletion(result.value)) setNotice(importSummaryMessage(result.value, locale));
       await revealAfterImport(result.value);
       playTaskCompletionSound(startedAt);
     } catch (caught) {
@@ -10250,7 +10526,7 @@ function AppInner() {
       clearImportSourceFailureUi();
       setImportProgress(null);
       setLibraryTransferKind("import");
-      setNotice(importSummaryMessage(completion, locale));
+      if (shouldNotifyImportCompletion(completion)) setNotice(importSummaryMessage(completion, locale));
       await revealAfterImport(completion);
       playTaskCompletionSound(startedAt);
     } catch (caught) {
@@ -12424,6 +12700,7 @@ function AppInner() {
     busy,
     selectedAsset: previewAsset ?? selectedAsset,
     selectedAssets: previewAsset ? [previewAsset] : selectedAssets,
+    selectedAssetIds: previewAsset ? [previewAsset.assetId] : selectedAssetIds,
     pasteDestinationFolderId: browsePasteDestination,
     diskDeleteAssetIds: diskDeleteKeyboardTargets.assetIds,
     diskDeleteFolderIds: diskDeleteKeyboardTargets.folderIds,
@@ -12438,6 +12715,8 @@ function AppInner() {
       });
     },
     onRename: openAssetRename,
+    onCutFiles: (assetIds, folderIds) => { void handleCopyAssetFiles(assetIds, "cut", folderIds); },
+    selectedFolderIds: selectedFolderIds.filter(id => folders.some(folder => folder.folderId === id)),
     onCopyFiles: (assetIds) => {
       void handleCopyAssetFiles(assetIds);
     },
@@ -12508,6 +12787,7 @@ function AppInner() {
   useEffect(() => {
     if (!shellApi) return;
     return shellApi.onCopySelection(() => {
+      if (dispatchFocusedTagClipboardCommand("copy")) return;
       const target = document.activeElement;
       if (
         target instanceof HTMLInputElement ||
@@ -12522,13 +12802,7 @@ function AppInner() {
         void shellApi.nativeEditCopy();
         return;
       }
-      const copyIds = selectedAssets
-        .filter(
-          (asset) => asset.availability === "available" && !asset.deletedAt,
-        )
-        .map((asset) => asset.assetId);
-      if (copyIds.length > 0) {
-        void handleCopyAssetFiles(copyIds);
+      if (copyClipboardSelection("copy")) {
         return;
       }
       void shellApi.nativeEditCopy();
@@ -12539,7 +12813,9 @@ function AppInner() {
     showTrash,
     library,
     selectedAssets,
+    selectedAssetIds,
     handleCopyAssetFiles,
+    copyClipboardSelection,
   ]);
 
   // Capture-phase Escape guard: when context menu is open, stop
@@ -12638,6 +12914,9 @@ function AppInner() {
       collectionEditor
     )
       return;
+    const requestViewerClose = () => {
+      void (previewModalRef.current?.requestClose() ?? closeAssetPreview());
+    };
     const onShortcutInput = (shortcutInput: ShortcutEventLike, event: KeyboardEvent | MouseEvent) => {
       const target = event.target;
       const keyboard = shortcutInput.kind === "mouse" ? null : shortcutInput;
@@ -12645,13 +12924,7 @@ function AppInner() {
       if (previewAsset) {
         if (keyboard?.key === "Escape" && !document.fullscreenElement) {
           event.preventDefault();
-          void (async () => {
-            if (previewModalRef.current) {
-              await previewModalRef.current.requestClose();
-            } else {
-              await closeAssetPreview();
-            }
-          })();
+          requestViewerClose();
           return;
         }
         if (
@@ -12661,6 +12934,16 @@ function AppInner() {
           (target instanceof HTMLElement &&
             (target.isContentEditable || target.closest('[role="dialog"]')))
         ) {
+          return;
+        }
+        if (
+          keyboard?.key === "Enter" && previewOpenedWithEnterRef.current &&
+          !keyboard.repeat && !keyboard.ctrlKey && !keyboard.metaKey && !keyboard.altKey && !keyboard.shiftKey &&
+          !event.defaultPrevented && !isImeKeyboardEvent(keyboard) &&
+          !(target instanceof HTMLElement && target.closest('button, a, [role="button"], [role="menuitem"]'))
+        ) {
+          event.preventDefault();
+          requestViewerClose();
           return;
         }
         const previous = matchesRuntimeShortcut("viewer.previous", shortcutInput, SHORTCUT_PLATFORM);
@@ -12699,7 +12982,7 @@ function AppInner() {
       )
         return;
       event.preventDefault();
-      openAssetPreview(selectedAsset);
+      openAssetPreview(selectedAsset, { openedWithEnter: keyboard.key === "Enter" });
     };
     const removeShortcutInputs = listenForShortcutInputs(document, onShortcutInput);
     return removeShortcutInputs;
@@ -13061,12 +13344,20 @@ function AppInner() {
       aiAutoConnectAttemptedRef.current = false;
     }
 
+    const previousActiveProfileId = aiActiveProfileId;
     const refreshed = await api.getAiConfig();
     if (refreshed.ok) {
       setAiProfiles(refreshed.value.profiles);
       updateAiActiveProfileId(refreshed.value.activeProfileId);
       setAiHasKey(refreshed.value.hasKey);
       setAiRequiresApiKey(refreshed.value.requiresApiKey);
+      if (
+        refreshed.value.activeProfileId === savedProfile.value.id
+        && previousActiveProfileId !== savedProfile.value.id
+      ) {
+        setAiConnectionState("idle");
+        aiAutoConnectAttemptedRef.current = false;
+      }
       const saved = refreshed.value.profiles.find((profile) => profile.id === savedProfile.value.id);
       if (saved) setAiDraftHasKey(saved.hasCredential);
     }
@@ -13681,7 +13972,7 @@ function AppInner() {
       },
       onResult: (kind, value) => {
         if (kind === "media") {
-          setMediaJobs((current) => applyMediaJobSummary(current, value as MediaJobSummaryCounts));
+          setMediaJobs((current) => applyMediaJobSummary(current, value as MediaJobSummarySnapshot));
         }
         else if (kind === "ai") setAiJobs(value as AiJobStatus);
         else setPluginJobs(value as PluginJobStatus);
@@ -13844,6 +14135,7 @@ function AppInner() {
         ? undefined
         : t("shell.mainMenuRedoCount", { count: operationHistory.redoTop.affectedCount }),
       hasSelectedAssets: selectedAssetIds.length > 0,
+      hasSelectedFolders: selectedFolderIds.some(id => folders.some(folder => folder.folderId === id)),
       hasPasteTarget: browsePasteDestination !== undefined,
       hasBrowseAssets: browseScopeAssetIds.length > 0,
       showMissingLinkedFiles,
@@ -13891,11 +14183,11 @@ function AppInner() {
       },
       undo: () => void undoLastFileOp(),
       redo: () => void redoLastOperation(),
+      cutSelection: () => {
+        copyClipboardSelection("cut");
+      },
       copySelection: () => {
-        const copyIds = selectedAssets
-          .filter((asset) => asset.availability === "available" && !asset.deletedAt)
-          .map((asset) => asset.assetId);
-        if (copyIds.length > 0) void handleCopyAssetFiles(copyIds);
+        copyClipboardSelection("copy");
       },
       paste: () => {
         if (browsePasteDestination !== undefined) {
@@ -13947,6 +14239,7 @@ function AppInner() {
       return undefined;
     };
     return shellApi.onApplicationMenuCommand(({ command, payload }) => {
+      if (command === "edit.paste" && dispatchFocusedTagClipboardCommand("paste")) return;
       const currentMenuSections = mainMenuSectionsRef.current;
       const globalZoomAction = command === "canvas.zoom-in"
         ? "in"
@@ -13972,6 +14265,15 @@ function AppInner() {
         command === "window.toggle-fullscreen" &&
         (textEditingFocused || hasActiveModalDialog())
       ) return;
+      if (command === 'edit.cut' && !textEditingFocused && readFocusedNavFolder(activeElement)?.locationKind === 'managed' &&
+        !hasActiveModalDialog() && !previewAssetRef.current) {
+        copyClipboardSelectionRef.current('cut');
+        return;
+      }
+      if (textEditingFocused && command === "edit.cut") {
+        void shellApi.nativeEditCommand("cut");
+        return;
+      }
       if (textEditingFocused && command === "edit.paste") {
         void shellApi.nativeEditCommand("paste");
         return;
@@ -14144,8 +14446,14 @@ function AppInner() {
     >
       {folderRowEntries.map((entry) => (
         <FolderCard
+          cut={assetCutState.cutFolderIds.has(entry.folderId)}
           draggable={!showTrash}
           entry={entry}
+          rename={inlineFolderEdit?.kind === 'rename' && inlineFolderEdit.folderId === entry.folderId ? inlineFolderEdit : null}
+          onRenameChange={changeInlineFolderEdit}
+          onRenameCommit={() => void commitInlineFolderEdit()}
+          onRenameCancel={cancelInlineFolderEdit}
+          onRenameRequest={(folderId, currentName) => openInlineFolderRename(folderId, currentName)}
           key={entry.folderId}
           libraryId={library.libraryId}
           trashed={showTrash}
@@ -14532,17 +14840,13 @@ function AppInner() {
                     readVisibleSearchHistoryCount() ?? matches.length,
                   );
                   if (!searchHistoryOpen || visibleCount === 0) return;
-                  if (
-                    event.key === "ArrowDown" ||
-                    event.key === "ArrowUp" ||
-                    event.key === "ArrowRight" ||
-                    event.key === "ArrowLeft"
-                  ) {
+                  if (event.key === "ArrowLeft" || event.key === "ArrowRight") {
+                    setSearchHistoryActiveIndex(-1);
+                    return;
+                  }
+                  const direction = searchHistoryNavigationDirection(event.key);
+                  if (direction) {
                     event.preventDefault();
-                    const direction =
-                      event.key === "ArrowDown" || event.key === "ArrowRight"
-                        ? "next"
-                        : "previous";
                     setSearchHistoryActiveIndex((current) =>
                       moveSearchHistoryIndex(current, visibleCount, direction),
                     );
@@ -14645,6 +14949,14 @@ function AppInner() {
                   <Icon name="close" size={12} />
                 </button>
               )}
+              {searchValue.trim() !== "" && (() => {
+                const result = parseSearchExpressionDetailed(searchValue);
+                return result.ok ? null : (
+                  <span className="search-expression-error" role="alert">
+                    {t("toolbar.searchExpressionError", { position: result.diagnostic.start + 1, reason: t(`toolbar.searchExpressionReasons.${searchExpressionReasonKey(result.diagnostic.code)}`) })}
+                  </span>
+                );
+              })()}
             </div>
           </form>
         </div>
@@ -14667,7 +14979,8 @@ function AppInner() {
           </>
         ) : null}
       </header>
-      <NavigationSidebar
+      <NavigationSidebarBoundary
+        cutFolderIds={assetCutState.cutFolderIds}
         library={library}
         assetScope={assetScope}
         showTrash={showTrash}
@@ -14826,7 +15139,7 @@ function AppInner() {
           cancelInlineFolderEdit();
           openInlineSmartCollectionCreate();
         }}
-        inlineFolderEdit={inlineFolderEdit}
+        inlineFolderEdit={inlineFolderEdit?.kind === 'rename' && folderRowEntries.some(entry => entry.folderId === inlineFolderEdit.folderId) ? null : inlineFolderEdit}
         onInlineFolderEditChange={changeInlineFolderEdit}
         onInlineFolderEditCommit={(onCreateSuccess) =>
           void commitInlineFolderEdit((folderId, parentFolderId) => {
@@ -15168,7 +15481,18 @@ function AppInner() {
               // Explicit filter-bar edits leave the tag-management AND mode.
               setTagFilterMatch("any");
               setTagFilter(value);
+              setTagFilterExpression("");
             }}
+            tagFilterExpression={tagFilterExpression}
+            tagFilterLastValidExpression={tagFilterLastValidExpression}
+            tagFilterMode={tagFilterMode}
+            setTagFilterExpression={(value) => {
+              setTagFilterExpression(value);
+              if (parseSearchExpressionDetailed(value, "tags").ok) setTagFilterLastValidExpression(value);
+            }}
+            setTagFilterMode={setTagFilterMode}
+            tagFilterMatch={tagFilterMatch}
+            setTagFilterMatch={setTagFilterMatch}
             setExcludedTagFilter={setExcludedTagFilter}
             setWidthRange={setWidthRange}
             shuffleActive={shuffleSeed !== null}
@@ -15184,6 +15508,9 @@ function AppInner() {
               formatFilter,
               excludeFormatFilter,
               tagFilter,
+              tagFilterExpression,
+              tagFilterMode,
+              tagFilterLastValidExpression,
               excludeTagFilter,
               excludedTagFilter,
               includeAiTagFilter,
@@ -15278,7 +15605,7 @@ function AppInner() {
         )}
         <div
           aria-busy={workspaceNavigationPending || workerRecoveryState === 'recovering'}
-          className={`workspace-canvas-host${previewAsset || previewRestoring ? " is-viewing" : ""}${previewRestoring ? " is-restoring" : ""}${workspaceNavigationPending ? " is-navigating" : ""}`}
+          className={`workspace-canvas-host${previewAsset || previewRestoring ? " is-viewing" : ""}${previewRestoring ? " is-restoring" : ""}${previewRestoring && previewCanvasReady ? " is-restore-visible" : ""}${workspaceNavigationPending ? " is-navigating" : ""}`}
         >
           {renderedToastStack.length > 0 || workerRecoveryState !== 'ready'
             ? createPortal(
@@ -15358,9 +15685,28 @@ function AppInner() {
             }
             if (!library || previewAsset || showTagManagement || showPluginSidebarView) return;
             event.preventDefault();
+            const createParentId = resolveBrowseCreateFolderParentId({
+              assetScope,
+              showTrash,
+              activeTagId,
+              activeCollectionId,
+              activeSmartCollectionId,
+              folders,
+              linkedFolders,
+              searchActive: Boolean(searchValue.trim() || findSimilarSource),
+              writable: library.readOnly !== true,
+              interactionBlocked: busy || workspaceNavigationPending || previewRestoring,
+            });
+            const folderName = createParentId === null
+              ? t("scope.rootFolder")
+              : folders.find(folder => folder.folderId === createParentId)?.name
+                ?? linkedFolders.find(folder => folder.folderId === createParentId)?.displayName;
             openContextMenu(
               {
                 type: "workspace",
+                ...(createParentId === undefined || folderName === undefined
+                  ? {}
+                  : { folder: { id: createParentId ?? LIBRARY_ROOT_FOLDER_ID, name: folderName } }),
                 ...(selectedAssetIds.length > 0
                   ? { assetIds: [...selectedAssetIds] }
                   : {}),
@@ -15509,7 +15855,7 @@ function AppInner() {
                       aria-label={canvasPrefs.fields.name ? undefined : asset.displayName}
                       data-hover-tip={canvasPrefs.fields.name ? undefined : asset.displayName}
                       aria-pressed={selectedIdSet.has(asset.assetId)}
-                      className={`asset-card${selectedIdSet.has(asset.assetId) ? " is-selected" : ""}${asset.availability === "missing" ? " is-missing" : ""}${corruptAsset ? " is-corrupt" : ""}${asset.deletedAt ? " is-trashed" : ""}${renamingThisAsset ? " is-renaming" : ""}`}
+                      className={`asset-card${assetCutState.cutAssetIds.has(asset.assetId) ? " is-cut" : ""}${selectedIdSet.has(asset.assetId) ? " is-selected" : ""}${asset.availability === "missing" ? " is-missing" : ""}${corruptAsset ? " is-corrupt" : ""}${asset.deletedAt ? " is-trashed" : ""}${renamingThisAsset ? " is-renaming" : ""}`}
                       data-asset-id={asset.assetId}
                       data-asset-name={asset.displayName}
                       data-media-type={asset.mediaType}
@@ -15585,6 +15931,14 @@ function AppInner() {
                         if (draggedMemberId) event.preventDefault();
                       }}
                       onDragStart={(event) => {
+                        // Text selection can emit dragstart even when the
+                        // card itself is not draggable. Never hand an editor
+                        // gesture to the native file or collection drag path.
+                        if (renamingThisAsset) {
+                          event.preventDefault();
+                          event.stopPropagation();
+                          return;
+                        }
                         // Collection member reorder keeps its own drag path.
                         if (activeCollectionId && !collectionRecursive) {
                           setDraggedMemberId(asset.assetId);
@@ -16002,7 +16356,7 @@ function AppInner() {
                                         cancelAssetRename();
                                       }
                                     }}
-                                    onMouseDown={(event) => event.stopPropagation()}
+                                    onMouseDown={beginInlineRenameTextSelection}
                                     value={assetRenameDialog.value}
                                   />
                                   {assetRenameDialog.error ? (
@@ -16012,7 +16366,12 @@ function AppInner() {
                                   ) : null}
                                 </span>
                               ) : (
-                                <strong className="asset-caption-filename" data-hover-tip={asset.displayName}>
+                                <strong className="asset-caption-filename" data-hover-tip={asset.displayName}
+                                  onDoubleClick={event => {
+                                    if (showTrash) return;
+                                    event.stopPropagation();
+                                    openAssetRename(asset.assetId);
+                                  }}>
                                   {renderMiddleEllipsisFilename(asset.displayName, searchValue)}
                                 </strong>
                               )}
@@ -16062,6 +16421,7 @@ function AppInner() {
                             renderLayoutPreview={(entry, renderOptions) =>
                               library ? (
                                 <BrowseLayoutPreview
+                                  cut={assetCutState.cutAssetIds.has(entry.assetId)}
                                   entry={entry}
                                   fields={canvasPrefs.fields}
                                   libraryId={library.libraryId}
@@ -16099,6 +16459,7 @@ function AppInner() {
                             renderLayoutPreview={(entry, renderOptions) =>
                               library ? (
                                 <BrowseLayoutPreview
+                                  cut={assetCutState.cutAssetIds.has(entry.assetId)}
                                   entry={entry}
                                   fields={canvasPrefs.fields}
                                   libraryId={library.libraryId}
@@ -16203,6 +16564,9 @@ function AppInner() {
         {previewAsset && library && api && (
           <>
           <AssetPreviewModal
+            mediaPlaybackMode={mediaPlayback.mode}
+            onMediaPlaybackModeChange={mediaPlayback.changeMode}
+            onMediaEnded={(assetId) => void mediaPlayback.ended(assetId)}
             ref={previewModalRef}
             api={api}
             asset={previewAsset}
@@ -16321,8 +16685,11 @@ function AppInner() {
             setError(t("toast.colorCopyUnavailable"));
           }
         }}
-        onRemoveTagFromAsset={(tagId) => void handleInspectorRemoveTag(tagId)}
+        onRemoveTagFromAsset={handleInspectorRemoveTag}
+        onFilterTag={(tagId) => void chooseTag(tagId)}
+        onRenameTag={handleRenameTagInManagement}
         selectedAsset={selectedAsset}
+        selectedAssetIds={selectedAssetIds}
         selectedAssets={selectedAssets}
         multiEdit={multiEdit}
         versionConflict={versionConflict}
@@ -16961,7 +17328,6 @@ function AppInner() {
             void submitBillfishLibraryName();
             return;
           }
-          setDialog(null);
           void runLibraryOperation("create");
         }}
         onCancel={() => {
@@ -17180,6 +17546,7 @@ function AppInner() {
           requestDeleteCollection(id, name);
         }}
         onCreateSubfolder={(folderId) => {
+          setLeftOpen(true);
           cancelInlineSmartCollectionEdit();
           openInlineFolderCreate(isLibraryRootFolderId(folderId) ? null : folderId);
         }}
@@ -17216,6 +17583,9 @@ function AppInner() {
           // Serpent-316493 follow-up: the root sentinel means "the library
           // root", which paste/import APIs express as null.
           dispatchClipboardPaste(isLibraryRootFolderId(folderId) ? null : folderId);
+        }}
+        onImportIntoFolder={(kind, folderId) => {
+          void importAssets(kind, isLibraryRootFolderId(folderId) ? null : folderId);
         }}
         onCloneFolder={(folderId) => {
           void cloneFolder(folderId);
@@ -17352,6 +17722,8 @@ function AppInner() {
           void runFindSimilar(assetId);
         }}
         onCopyFilePath={(assetId) => { void handleCopyFilePath(assetId); }}
+        onCutAssetFiles={(assetIds, folderIds) => { void handleCopyAssetFiles(assetIds, "cut", folderIds); }}
+        onCutFolders={(folderIds) => { void handleCopyAssetFiles([], "cut", folderIds); }}
         onCopyAssetFiles={(assetIds) => {
           void handleCopyAssetFiles(assetIds);
         }}
@@ -17378,8 +17750,7 @@ function AppInner() {
         <div
           aria-label={t("shell.resizeNav")}
           aria-orientation="vertical"
-          className={`panel-resizer${panelResizing === "nav" ? " is-active" : ""}`}
-          data-hover-tip={t("shell.resizeNav")}
+          className={`panel-resizer panel-resizer-nav${panelResizing === "nav" ? " is-active" : ""}`}
           onDoubleClick={() => {
             capturePanelResizeAnchor(false);
             resetPanelWidth("nav");
@@ -17398,7 +17769,6 @@ function AppInner() {
           aria-label={t("shell.restoreNavEdge")}
           aria-orientation="vertical"
           className={`panel-resizer panel-resizer-edge${panelResizing === "nav" ? " is-active" : ""}`}
-          data-hover-tip={t("shell.restoreNavEdge")}
           onPointerDown={(event) => {
             event.preventDefault();
             capturePanelResizeAnchor();
@@ -17413,8 +17783,7 @@ function AppInner() {
         <div
           aria-label={t("shell.resizeInspector")}
           aria-orientation="vertical"
-          className={`panel-resizer${panelResizing === "inspector" ? " is-active" : ""}`}
-          data-hover-tip={t("shell.resizeInspector")}
+          className={`panel-resizer panel-resizer-inspector${panelResizing === "inspector" ? " is-active" : ""}`}
           onDoubleClick={() => {
             capturePanelResizeAnchor(false);
             resetPanelWidth("inspector");
@@ -17433,7 +17802,6 @@ function AppInner() {
           aria-label={t("shell.restoreInspectorEdge")}
           aria-orientation="vertical"
           className={`panel-resizer panel-resizer-edge${panelResizing === "inspector" ? " is-active" : ""}`}
-          data-hover-tip={t("shell.restoreInspectorEdge")}
           onPointerDown={(event) => {
             event.preventDefault();
             capturePanelResizeAnchor();

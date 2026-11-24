@@ -1,3 +1,4 @@
+import type { MediaPlaybackMode } from './media-playback-mode';
 import {
   forwardRef,
   useCallback,
@@ -21,6 +22,7 @@ import type { SerpentPluginManagerApi } from "../shared/plugin-manager-api";
 import { createPluginMenuContributionContext } from "./plugin-contribution-context";
 import { buildPluginViewerState } from "./plugin-context-state";
 import { useT, type TranslateFn } from "./i18n";
+import { ViewerLoadingStatus } from "./viewer-loading-status";
 import {
   nextDirectApprovedState,
   samePreviewPlayback,
@@ -60,6 +62,7 @@ import { ZoomableImage } from "./zoomable-preview-image";
 import { imageFormatMayCarryAlpha } from "./mirage-texture";
 import { useViewerChromeContrast } from "./use-viewer-chrome-contrast";
 import { VIEWER_CHROME_TAB_INDEX } from "./viewer-focus-policy";
+import { viewerNavigationSide } from "./viewer-navigation-hit-zone";
 import { ImageSequencePlayer } from "./ImageSequencePlayer";
 import { GifViewerPlayer } from "./GifViewerPlayer";
 import { isGifDisplayName } from "./gif-player-controls";
@@ -97,6 +100,9 @@ import { isMacPlatform } from "./commands/command-types";
 import { isBakeableStillImageFile } from "../shared/bakeable-still-image";
 
 interface AssetPreviewModalProps {
+  mediaPlaybackMode?: MediaPlaybackMode;
+  onMediaPlaybackModeChange?: (mode: MediaPlaybackMode) => void;
+  onMediaEnded?: (assetId: string) => void;
   api: SerpentLibraryApi;
   asset: AssetSummary;
   /** When on, quarter-turns of bakeable stills are written into the file. */
@@ -138,24 +144,6 @@ interface AssetPreviewModalProps {
   onDiskDeleteAsset?: () => void;
   onRemoveFromCollection?: () => void;
   onPermanentDelete?: () => void;
-}
-
-const NAV_APPROACH_EDGE_RATIO = 0.22;
-const NAV_APPROACH_EDGE_MAX_PX = 320;
-const NAV_APPROACH_BOTTOM_PX = 64;
-
-function navApproachSide(
-  bounds: DOMRect,
-  clientX: number,
-  clientY: number,
-): "prev" | "next" | null {
-  const x = clientX - bounds.left;
-  const y = clientY - bounds.top;
-  const edge = Math.min(bounds.width * NAV_APPROACH_EDGE_RATIO, NAV_APPROACH_EDGE_MAX_PX);
-  if (y > bounds.height - NAV_APPROACH_BOTTOM_PX) return null;
-  if (x <= edge) return "prev";
-  if (bounds.width - x <= edge) return "next";
-  return null;
 }
 
 export type AssetPreviewModalHandle = {
@@ -237,6 +225,9 @@ const AssetPreviewModalContent = forwardRef<
 >(function AssetPreviewModal(
   {
     api,
+    mediaPlaybackMode = 'repeat-one',
+    onMediaPlaybackModeChange,
+    onMediaEnded,
     asset,
     bakeImageRotation = false,
     chromeIdle,
@@ -270,18 +261,27 @@ const AssetPreviewModalContent = forwardRef<
 ) {
   const t = useT();
   const modalRef = useRef<HTMLElement>(null);
-  const fullscreenElement = (): Element | null =>
-    fullscreenRootRef?.current ?? modalRef.current;
+  const fullscreenElement = useCallback(
+    (): Element | null => fullscreenRootRef?.current ?? modalRef.current,
+    [fullscreenRootRef],
+  );
   const viewerSessionControllerRef = useRef<ViewerSessionController | null>(null);
   if (viewerSessionControllerRef.current === null) {
     viewerSessionControllerRef.current = new ViewerSessionController();
   }
   const viewerSessionController = viewerSessionControllerRef.current;
   const presentationReadyRef = useRef(false);
+  const presentationCallbackRef = useRef(onPresentationReady);
+  presentationCallbackRef.current = onPresentationReady;
   const notifyPresentationReady = useCallback(() => {
     if (presentationReadyRef.current) return;
     presentationReadyRef.current = true;
-    onPresentationReady?.();
+    presentationCallbackRef.current?.();
+  }, []);
+  useEffect(() => {
+    // The old surface can finish loading while another target preloads.
+    // Report its existing readiness if navigation returns to it.
+    if (presentationReadyRef.current) onPresentationReady?.();
   }, [onPresentationReady]);
   const viewerIdentity = useMemo<ViewerSessionIdentity>(() => ({
     libraryId,
@@ -647,6 +647,7 @@ const AssetPreviewModalContent = forwardRef<
   }, [
     asset.assetId,
     asset.currentRevisionId,
+    fullscreenElement,
     libraryId,
     resolvePreview,
     viewerSessionController,
@@ -839,7 +840,7 @@ const AssetPreviewModalContent = forwardRef<
     return () => {
       document.removeEventListener("fullscreenchange", onFullscreenChange);
     };
-  }, []);
+  }, [fullscreenElement]);
 
   function handlePlaybackError(event: SyntheticEvent<HTMLMediaElement>) {
     const mediaError = event.currentTarget.error;
@@ -1000,19 +1001,16 @@ const AssetPreviewModalContent = forwardRef<
   const copyShortcut = shortcutPlatform === "mac" ? "⌘C" : "Ctrl+C";
   const copyPathShortcut = formatRuntimeShortcut("asset.copy-file-path", shortcutPlatform);
 
-  // A preloading viewer must not leave the old viewer waiting forever when
-  // the target is unsupported or its preview request has failed. In those
-  // cases the error surface is the honest presentation to swap to.
+  // A terminal error or unsupported format is also a presentable result.
+  // ZIP has its own viewer and reports readiness independently.
   useEffect(() => {
-    if (!preloadOnly) return;
-    if (unsupported || viewerError || primarySurface === "unavailable" || illustratorPdfPreview) {
+    if (viewerError || (!isZipArchive && (unsupported || primarySurface === "unavailable"))) {
       notifyPresentationReady();
     }
   }, [
+    isZipArchive,
     notifyPresentationReady,
-    preloadOnly,
     primarySurface,
-    illustratorPdfPreview,
     unsupported,
     viewerError,
   ]);
@@ -1226,14 +1224,7 @@ const AssetPreviewModalContent = forwardRef<
       <ShellSurface className="preview-modal">
         {/* REQ-VIEW-006: no top filename/toolbar bar; nav sits on the edges. */}
         <div className={`preview-content${isTextViewer ? " is-text-mode" : ""}${isDocumentViewer ? " is-document-mode" : ""}${isZipArchive ? " is-archive-mode" : ""}`}>
-          {primarySurface === "loading" && !placeholderUrl && !isZipArchive ? (
-            <div
-              aria-busy="true"
-              aria-label={t("preview.resolving")}
-              className="preview-state is-silent"
-              role="status"
-            />
-          ) : isZipArchive ? (
+          {primarySurface === "loading" && !placeholderUrl && !isZipArchive ? null : isZipArchive ? (
             <ZipArchiveViewer
               api={api}
               assetId={asset.assetId}
@@ -1261,6 +1252,9 @@ const AssetPreviewModalContent = forwardRef<
             />
           ) : ready && resolution?.mediaType === "video" && resolution.url ? (
             <VideoPlayerControls
+              playbackMode={mediaPlaybackMode}
+              onPlaybackModeChange={onMediaPlaybackModeChange}
+              onEnded={() => { if (!preloadOnly) onMediaEnded?.(asset.assetId); }}
               autoPlay={!preloadOnly}
               playbackHandleRef={playbackHandleRef}
               key={`${asset.assetId}:${resolution.url}:${playbackRetryGeneration}`}
@@ -1320,6 +1314,9 @@ const AssetPreviewModalContent = forwardRef<
             />
           ) : ready && resolution?.mediaType === "audio" && resolution.url ? (
             <AudioPlayerControls
+              playbackMode={mediaPlaybackMode}
+              onPlaybackModeChange={onMediaPlaybackModeChange}
+              onEnded={() => { if (!preloadOnly) onMediaEnded?.(asset.assetId); }}
               key={resolution.url}
               autoPlay={!preloadOnly}
               keyboardShortcutsDisabled={preloadOnly}
@@ -1498,7 +1495,8 @@ const AssetPreviewModalContent = forwardRef<
               preloadOnly={preloadOnly}
               src={imageSrc}
             />
-          ) : unsupported ? (            <div className="preview-state" role="status">
+          ) : unsupported ? (
+            <div className="preview-state" role="status">
               <strong>{t("preview.unsupportedTitle")}</strong>
               <p>
                 {t("preview.unsupportedFormat")} {t("preview.openWithSystem")}
@@ -1722,6 +1720,7 @@ export const AssetPreviewModal = forwardRef<
   AssetPreviewModalProps
 >(function AssetPreviewModal(props, ref) {
   const { asset, ...contentProps } = props;
+  const t = useT();
   const videoTransportOnApproach = props.videoTransportOnApproach ?? false;
   const chromeIdle = props.chromeIdle;
   const navArrowsOnApproach = props.navArrowsOnApproach ?? true;
@@ -1745,7 +1744,7 @@ export const AssetPreviewModal = forwardRef<
     if (!navArrowsOnApproach) return null;
     const host = fullscreenRootRef.current;
     if (!host) return null;
-    return navApproachSide(host.getBoundingClientRect(), clientX, clientY);
+    return viewerNavigationSide(host.getBoundingClientRect(), clientX, clientY);
   }, [navArrowsOnApproach]);
 
   const readPointerBands = useCallback((clientX: number, clientY: number) => {
@@ -1857,11 +1856,14 @@ export const AssetPreviewModal = forwardRef<
           fullscreenRootRef={fullscreenRootRef}
           key={asset.assetId}
           navNear={navNear}
-          onPresentationReady={targetIsCurrent || targetWasPromoted ? undefined : promoteTarget}
+          onPresentationReady={promoteTarget}
           preloadOnly={!targetIsCurrent && !targetWasPromoted}
           ref={targetIsCurrent || targetWasPromoted ? ref : undefined}
         />
       }
+      {promotedTargetId !== asset.assetId && (
+        <ViewerLoadingStatus key={`loading:${asset.assetId}`} label={t("preview.resolving")} />
+      )}
     </div>
   );
 });

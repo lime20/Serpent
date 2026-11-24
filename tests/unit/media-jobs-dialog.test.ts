@@ -47,7 +47,7 @@ it.each(["PRESENTATION_THUMBNAIL_UNAVAILABLE", "LIBREOFFICE_REQUIRED"])("explain
   expect(html).toContain("embedded thumbnail");
 });
 
-describe("MediaJobsDialog asset labels", () => {
+describe("MediaJobsDialog", () => {
   it("shows the associated asset filename instead of only the job kind", () => {
     const dialog = createElement(MediaJobsDialog, {
       open: true,
@@ -193,5 +193,46 @@ describe("MediaJobsDialog asset labels", () => {
       createElement(LocaleProvider, { initialPreference: "en", children: ready }),
     );
     expect(readyHtml).not.toContain("media-jobs-embedding-section");
+  });
+
+  it("enables queue pause on an empty queue and resumes a globally paused queue", () => {
+    const render = (queuePaused?: boolean) => {
+      const dialog = createElement(MediaJobsDialog, {
+        open: true,
+        mediaJobsLoading: false,
+        mediaJobs: {
+          queued: 0,
+          running: 0,
+          succeeded: 0,
+          failed: 0,
+          paused: 0,
+          cancelled: 0,
+          ...(queuePaused === undefined ? {} : { queuePaused }),
+          jobs: [],
+        },
+        aiJobs: null,
+        pluginJobs: null,
+        onClose: () => undefined,
+        onControlMediaJobs: () => undefined,
+        onControlAiJobs: () => undefined,
+      });
+      return renderToStaticMarkup(
+        createElement(LocaleProvider, { initialPreference: "en", children: dialog }),
+      );
+    };
+    const button = (html: string, label: string) => {
+      const match = html.match(new RegExp(`<button\\b[^>]*>\\s*${label}\\s*</button>`))?.[0];
+      expect(match).toBeDefined();
+      return match ?? "";
+    };
+
+    const runningQueue = render();
+    expect(button(runningQueue, "Pause all")).not.toContain("disabled");
+    expect(button(runningQueue, "Resume paused")).toContain("disabled");
+    expect(button(runningQueue, "Cancel incomplete")).toContain("disabled");
+
+    const pausedQueue = render(true);
+    expect(button(pausedQueue, "Pause all")).toContain("disabled");
+    expect(button(pausedQueue, "Resume paused")).not.toContain("disabled");
   });
 });

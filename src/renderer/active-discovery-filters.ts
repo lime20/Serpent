@@ -1,8 +1,8 @@
 // REQ-FILTER-002: describe active discovery filters as removable toolbar chips.
-// Pure helpers — DimensionFilterBar / App stay thin.
+// Shared filter descriptors and clearing — DimensionFilterBar / App stay thin.
 
 export type ActiveFilterChip = {
-  id: string;
+  id: Exclude<ClearableFilterId, "all">;
   /** i18n key under filter.* or a preformatted label via `label` */
   labelKey?: string;
   label?: string;
@@ -16,6 +16,9 @@ export type DiscoveryFilterSnapshot = {
   formatFilter: string;
   excludeFormatFilter: boolean;
   tagFilter: string;
+  tagFilterExpression?: string;
+  tagFilterLastValidExpression?: string;
+  tagFilterMode?: "selection" | "expression";
   excludeTagFilter: boolean;
   /** Separate exclude list. When set, include and exclude apply together. */
   excludedTagFilter?: string;
@@ -93,7 +96,7 @@ export function buildActiveFilterChips(
     });
   }
 
-  const tags = snapshot.tagFilter
+  const tags = snapshot.tagFilterMode === "expression" ? [] : snapshot.tagFilter
     .split(",")
     .map((value) => value.trim())
     .filter(Boolean);
@@ -108,7 +111,9 @@ export function buildActiveFilterChips(
     ...includedDetail,
     ...excludedDetail.map((name) => `−${name}`),
   ].join(", ");
-  if (tagDetail.length > 0) {
+  if (snapshot.tagFilterMode === "expression" && snapshot.tagFilterExpression?.trim()) {
+    chips.push({ id: "tag", labelKey: "filter.tagField", detail: snapshot.tagFilterExpression });
+  } else if (snapshot.tagFilterMode !== "expression" && tagDetail.length > 0) {
     chips.push({
       id: "tag",
       labelKey: "filter.tagField",
@@ -220,3 +225,20 @@ export type ClearableFilterId =
   | "height"
   | "duration"
   | "all";
+
+/** Both expression and selection modes own the same removable tag dimension. */
+export function clearTagDiscoveryFilter(actions: {
+  setTagFilter: (value: string) => void;
+  setTagFilterExpression: (value: string) => void;
+  setTagFilterLastValidExpression: (value: string) => void;
+  setExcludeTagFilter: (value: boolean) => void;
+  setExcludedTagFilter: (value: string) => void;
+  setActiveTagId: (value: null) => void;
+}): void {
+  actions.setTagFilter("");
+  actions.setTagFilterExpression("");
+  actions.setTagFilterLastValidExpression("");
+  actions.setExcludeTagFilter(false);
+  actions.setExcludedTagFilter("");
+  actions.setActiveTagId(null);
+}
